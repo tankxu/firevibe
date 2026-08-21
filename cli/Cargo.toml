@@ -1,0 +1,9 @@
+[package]
+name = "firevibe-cli"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+firevibe-core = { path = "../core" }
+anyhow.workspace = true
+libc = "0.2.189"

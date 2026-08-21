@@ -1,0 +1,12 @@
+# Rust 构建产物（15G，绝对不能进仓库）
+/target/
+
+# 驱动构建时从上游 clone 的 BlackHole 源码 + 中间产物
+/driver/.build/
+/driver/out/
+
+# 图标渲染的中间产物（gen.py + package.sh 会重新生成）
+/design/icon/*.iconset/
+
+# macOS
+.DS_Store

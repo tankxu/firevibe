@@ -1,0 +1,270 @@
+{
+  "schema": 1,
+  "voice": {
+    "enabled": true,
+    "mode": "gate",
+    "device": "BlackHole 2ch",
+    "gain": 1.0
+  },
+  "exclusive": false,
+  "slots": [
+    {
+      "slot": "power",
+      "key": {
+        "page": 7,
+        "usage": 102
+      }
+    },
+    {
+      "slot": "mic",
+      "key": {
+        "page": 12,
+        "usage": 545
+      }
+    },
+    {
+      "slot": "up",
+      "key": {
+        "page": 7,
+        "usage": 82
+      }
+    },
+    {
+      "slot": "left",
+      "key": {
+        "page": 7,
+        "usage": 80
+      }
+    },
+    {
+      "slot": "ok",
+      "key": {
+        "page": 7,
+        "usage": 88
+      }
+    },
+    {
+      "slot": "right",
+      "key": {
+        "page": 7,
+        "usage": 79
+      }
+    },
+    {
+      "slot": "down",
+      "key": {
+        "page": 7,
+        "usage": 81
+      }
+    },
+    {
+      "slot": "back",
+      "key": {
+        "page": 7,
+        "usage": 241
+      }
+    },
+    {
+      "slot": "home",
+      "key": {
+        "page": 12,
+        "usage": 547
+      }
+    },
+    {
+      "slot": "menu",
+      "key": {
+        "page": 12,
+        "usage": 64
+      }
+    },
+    {
+      "slot": "rewind",
+      "key": {
+        "page": 12,
+        "usage": 180
+      }
+    },
+    {
+      "slot": "play",
+      "key": {
+        "page": 12,
+        "usage": 205
+      }
+    },
+    {
+      "slot": "forward",
+      "key": {
+        "page": 12,
+        "usage": 179
+      }
+    },
+    {
+      "slot": "mute",
+      "key": {
+        "page": 12,
+        "usage": 226
+      }
+    },
+    {
+      "slot": "vol_up",
+      "key": {
+        "page": 12,
+        "usage": 233
+      }
+    },
+    {
+      "slot": "vol_down",
+      "key": {
+        "page": 12,
+        "usage": 234
+      }
+    },
+    {
+      "slot": "tv",
+      "key": {
+        "page": 12,
+        "usage": 141
+      }
+    },
+    {
+      "slot": "app1",
+      "key": {
+        "page": 65280,
+        "usage": 161
+      }
+    },
+    {
+      "slot": "app2",
+      "key": {
+        "page": 65280,
+        "usage": 162
+      }
+    },
+    {
+      "slot": "app3",
+      "key": {
+        "page": 65280,
+        "usage": 163
+      }
+    },
+    {
+      "slot": "app4",
+      "key": {
+        "page": 65280,
+        "usage": 164
+      }
+    }
+  ],
+  "profiles": [
+    {
+      "name": "默认",
+      "actions": [
+        {
+          "slot": "mic",
+          "short": {
+            "type": "voice_toggle"
+          },
+          "long": {
+            "type": "voice_ptt"
+          },
+          "disabled": false
+        },
+        {
+          "slot": "home",
+          "short": {
+            "type": "none"
+          },
+          "long": {
+            "type": "none"
+          },
+          "disabled": false
+        },
+        {
+          "slot": "menu",
+          "short": {
+            "type": "none"
+          },
+          "long": {
+            "type": "none"
+          },
+          "disabled": false
+        },
+        {
+          "slot": "tv",
+          "short": {
+            "type": "none"
+          },
+          "long": {
+            "type": "none"
+          },
+          "disabled": false
+        },
+        {
+          "slot": "app1",
+          "short": {
+            "type": "open_app",
+            "arg": "com.anthropic.claudefordesktop"
+          },
+          "long": {
+            "type": "apple_script",
+            "arg": "tell application \"System Events\" to keystroke \"q\" using {control down, command down}"
+          },
+          "disabled": false
+        },
+        {
+          "slot": "app2",
+          "short": {
+            "type": "open_app",
+            "arg": "com.openai.codex"
+          },
+          "long": {
+            "type": "none"
+          },
+          "disabled": false
+        },
+        {
+          "slot": "app3",
+          "short": {
+            "type": "key",
+            "key": "tab",
+            "mods": [
+              "cmd"
+            ]
+          },
+          "long": {
+            "type": "none"
+          },
+          "disabled": true
+        },
+        {
+          "slot": "app4",
+          "short": {
+            "type": "open_app",
+            "arg": "com.tankxu.firevibe"
+          },
+          "long": {
+            "type": "shell",
+            "arg": "open -a Terminal"
+          },
+          "disabled": false
+        }
+      ]
+    },
+    {
+      "name": "工作",
+      "actions": []
+    },
+    {
+      "name": "看片",
+      "actions": []
+    }
+  ],
+  "active": 0,
+  "settings": {
+    "launch_at_login": false,
+    "lang": "zh",
+    "long_press_ms": 350,
+    "update_endpoint": ""
+  }
+}

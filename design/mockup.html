@@ -1,0 +1,598 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>FireVibe — 设计稿</title>
+<!-- 实现说明：窗口用系统透明标题栏（appears_transparent），顶部另留 40px
+     可拖拽条给红绿灯浮着 —— 这里 .app 的 padding-top 40px 就是那条的等效高度。
+     页内保留品牌标题栏，设置按钮在它最右端。 --><style>
+:root{
+  --bg:#fbfbfc; --surface:#ffffff;
+  --line:#ececf0; --line-strong:#dcdce3;
+  --ink:#0f1115; --ink-2:#5b6070; --ink-3:#9aa0b0;
+  --accent:#00a8e1; --accent-soft:#e4f5fd; --accent-ink:#0080ad;
+  --alexa:#12c2f5; --alexa-deep:#0284c7;
+  --ok:#12a150; --ok-soft:#e8f6ee;
+  --warn:#b4690e; --warn-soft:#fdf3e3;
+  --err:#d0342c; --err-soft:#fdeceb;
+  --r-sm:8px; --r:12px; --r-lg:16px;
+  --sh-1:0 1px 2px rgba(16,18,28,.05),0 1px 1px rgba(16,18,28,.04);
+  --sh-2:0 4px 12px -2px rgba(16,18,28,.08),0 2px 4px -2px rgba(16,18,28,.06);
+  --sh-3:0 18px 40px -12px rgba(16,18,28,.22),0 6px 14px -6px rgba(16,18,28,.12);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{background:var(--bg)}
+body{font:14px/1.5 -apple-system,"SF Pro Text","PingFang SC",system-ui,sans-serif;
+  background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased}
+.app{max-width:1280px;margin:0 auto;padding:40px 32px 48px}
+svg{display:block}
+.spacer{flex:1}
+
+/* 顶栏 */
+.top{display:flex;align-items:center;gap:12px;margin-bottom:24px}
+.brand{display:flex;flex-direction:column;gap:2px}
+.brand h1{font-size:19px;font-weight:640;letter-spacing:-.02em}
+.brand p{font-size:12px;color:var(--ink-3);margin-top:1px}
+.icon-btn{width:34px;height:34px;border-radius:var(--r-sm);border:1px solid var(--line);
+  background:var(--surface);display:flex;align-items:center;justify-content:center;
+  color:var(--ink-2);cursor:pointer;box-shadow:var(--sh-1)}
+.icon-btn:hover{border-color:var(--line-strong);color:var(--ink)}
+
+.grid{display:flex;gap:32px;align-items:flex-start}
+/* 实现里左栏是固定不滚的（只有右栏滚），装不下时左栏自己滚一点 */
+.col-left{width:300px;flex:none;display:flex;flex-direction:column;align-items:center;gap:12px;
+  padding-top:14px;overflow-y:auto}
+.col-right{overflow-y:auto}
+.col-right{flex:1;min-width:0;display:flex;flex-direction:column;gap:22px}
+
+/* 状态条：fit-content，不占满 */
+/* align-items 默认 stretch：配对卡一行、声卡卡两行，要一样高 */
+.status-row{display:flex;gap:10px;align-items:stretch;margin-bottom:22px}
+.card-lb{padding:9px 12px}
+.lb-txt{line-height:1.25}
+.lb-name{font-size:12.5px;font-weight:580}
+.lb-sub{font-size:11px;color:var(--ink-3);margin-top:1px}
+.card-lb.warn{border-color:#f0dcae;background:#fffdf6}
+.warn-sub{color:var(--warn)!important}
+.install-btn{font:inherit;font-size:11.5px;font-weight:560;padding:4px 11px;border-radius:7px;
+  border:0;cursor:pointer;background:var(--accent);color:#fff;margin-left:6px}
+.install-btn:hover{background:#0093c6}
+.status{display:inline-flex;align-items:center;gap:18px;flex:none;
+  background:var(--surface);border:1px solid var(--line);border-radius:var(--r);
+  padding:9px 14px;box-shadow:var(--sh-1)}
+.st-seg{display:flex;align-items:center;gap:7px;font-size:12.5px}
+.st-seg + .st-seg{padding-left:18px;border-left:1px solid var(--line)}
+.dot{width:7px;height:7px;border-radius:50%;flex:none}
+/* 实现里用「外圈浅色 div 套内圈纯色 div」而不是 box-shadow：
+   gpui 的 border 是往元素内收的（7px 的点加 3px 边框只剩 1px 本色），
+   shadow 的 spread 又会盖住本体。CSS 这边写 box-shadow 是等价意图。 */
+.dot.on{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+.st-name{font-weight:560}
+.batt-ico{color:var(--ink-2)}
+.batt-num{font-weight:590;font-variant-numeric:tabular-nums}
+.ghost-btn{font:inherit;font-size:11.5px;padding:3px 9px;border-radius:6px;cursor:pointer;
+  border:1px solid var(--line-strong);background:var(--surface);color:var(--ink-2)}
+.ghost-btn:hover{color:var(--ink);border-color:var(--ink-3)}
+
+
+/* ── 遥控器 ── */
+.remote{position:relative;width:146.2px;height:484.5px}
+.body-svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+/* 顶部麦克风：竖着的两端圆角矩形 */
+.mic-slit{position:absolute;left:50%;top:9.3px;width:3px;height:7.6px;margin-left:-1.5px;
+  border-radius:2px;background:#4d515c;box-shadow:inset 0 0 2px rgba(0,0,0,.8)}
+.well{position:absolute;border-radius:50%;background:#0b0c10;
+  box-shadow:inset 0 2px 5px rgba(0,0,0,.6)}
+.btn{position:absolute;display:flex;align-items:center;justify-content:center;
+  background:linear-gradient(180deg,#3b3e49,#272a33);color:#dcdee5;
+  font-size:8.5px;font-weight:800;letter-spacing:.01em;cursor:pointer;
+  box-shadow:0 1px 0 rgba(255,255,255,.06) inset,0 2px 4px rgba(0,0,0,.35)}
+.btn.round{border-radius:50%}
+.btn.pill{border-radius:9px}
+.btn:hover{background:linear-gradient(180deg,#474b58,#31343e)}
+/* 鼠标按住 = 凹下去：压暗到 55%、撤掉投影、四周各收 1px。
+   实体遥控器按下则相反 —— 提亮一档，用来指示「刚按的是哪个键」 */
+.btn:active{filter:brightness(.55);box-shadow:none;inset:1px;border:1px solid rgba(0,0,0,.45)}
+.volrocker{position:absolute;display:flex;flex-direction:column;overflow:hidden;
+  background:linear-gradient(180deg,#3b3e49,#272a33);
+  box-shadow:0 1px 0 rgba(255,255,255,.06) inset,0 2px 4px rgba(0,0,0,.35)}
+.vhalf{flex:1;display:flex;align-items:center;justify-content:center;color:#dcdee5;cursor:pointer}
+.vhalf:hover{background:rgba(255,255,255,.07)}
+.vdiv{height:1px;background:rgba(0,0,0,.45);box-shadow:0 1px 0 rgba(255,255,255,.05)}
+.btn.dpad{background:transparent;box-shadow:none;color:#9aa0ad}
+.btn.dpad:hover{background:rgba(255,255,255,.05)}
+.btn.ok{background:linear-gradient(180deg,#2a2d36,#15171c);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.05),0 3px 8px rgba(0,0,0,.5)}
+.btn.mic{color:#eaf9ff;background:radial-gradient(circle at 50% 38%,#4fc9ef 0%,#1aa9dd 48%,#0b78ad 100%);
+  box-shadow:0 0 0 2px rgba(26,169,221,.16),0 0 10px 1px rgba(26,169,221,.22),0 2px 5px rgba(0,0,0,.38)}
+.btn.appkey{color:#fff;font-size:9.5px;font-weight:800;letter-spacing:0}
+.a1{background:linear-gradient(180deg,#2f7fd4,#1d5aa8)}
+.a2{background:linear-gradient(180deg,#e5312b,#c01f1a)}
+.a3{background:linear-gradient(180deg,#2b3a8f,#1b2568)}
+.a4{background:linear-gradient(180deg,#2fe38f,#16bb70);color:#08301d}
+.hint{width:220px;font-size:11px;line-height:1.55;color:var(--ink-3);text-align:center}
+
+/* profile：无框 */
+.section-lab{font-size:11.5px;font-weight:600;color:var(--ink-3);letter-spacing:.05em;
+  text-transform:uppercase;margin-bottom:5px}
+.profile-pick{display:inline-flex;align-items:center;gap:7px;cursor:pointer;
+  padding:2px 4px 3px;border-radius:7px;margin-left:-4px}
+.profile-pick:hover{background:#f1f2f6}
+.profile-pick h2{font-size:23px;font-weight:640;letter-spacing:-.022em}
+.profile-pick svg{color:var(--ink-3);margin-top:4px}
+.profile-meta{font-size:12px;color:var(--ink-3);margin-top:3px}
+
+/* 操作卡片 */
+.act-head{display:flex;align-items:center;margin-bottom:12px}
+.add-btn{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:12.5px;
+  font-weight:560;padding:7px 13px;border-radius:9px;border:0;cursor:pointer;
+  background:var(--accent);color:#fff;box-shadow:0 1px 2px rgba(0,168,225,.35)}
+.add-btn:hover{background:#0093c6}
+.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;align-items:stretch}
+.card{min-width:0;display:flex;flex-direction:column;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);
+  box-shadow:var(--sh-1);overflow:hidden;
+  /* gpui 没有 transition，实现里是按帧插值 border-color / box-shadow / 按钮 opacity，
+     时长 140ms、缓出；这里写 transition 只是把意图记在设计稿上 */
+  transition:border-color .14s ease-out, box-shadow .14s ease-out}
+.card:hover{border-color:var(--line-strong);box-shadow:var(--sh-2)}
+.card-head{display:flex;align-items:center;gap:11px;padding:13px 14px 11px}
+.key-badge{width:36px;height:36px;border-radius:10px;flex:none;display:flex;
+  align-items:center;justify-content:center;color:#fff;
+  background:linear-gradient(160deg,#2b2d36,#14161c);box-shadow:var(--sh-1)}
+.key-badge.k1{background:linear-gradient(160deg,#2f7fd4,#1d5aa8)}
+.key-badge.k2{background:linear-gradient(160deg,#e5312b,#b91c1c)}
+.key-badge.k3{background:linear-gradient(160deg,#22c9f8,#0284c7)}
+.key-badge.k4{background:linear-gradient(160deg,#2fe38f,#0f8a45);color:#06301b}
+.key-title{font-size:13.5px;font-weight:590;letter-spacing:-.01em}
+.key-sub{font-size:11px;color:var(--ink-3);margin-top:2px;font-variant-numeric:tabular-nums}
+.card-body{flex:1;border-top:1px solid var(--line);padding:4px 14px 8px;
+  display:flex;flex-direction:column;justify-content:center}
+.trig{display:flex;align-items:center;gap:10px;padding:9px 0}
+.trig + .trig{border-top:1px dashed var(--line)}
+.trig-tag{font-size:10.5px;font-weight:680;color:var(--ink-3);width:32px;flex:none;letter-spacing:.02em}
+.trig-body{flex:1;min-width:0;min-height:36px;display:flex;flex-direction:column;justify-content:center}
+.trig-val{font-size:12.5px;font-weight:520;display:flex;align-items:center;gap:6px}
+.trig-val .ic{color:var(--ink-3);flex:none}
+.trig-val.empty{color:var(--ink-3);font-weight:450}
+.trig-note{font-size:11px;color:var(--ink-3);margin-top:2px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.trig-acts{display:flex;gap:2px;flex:none;opacity:0;pointer-events:none;transition:opacity .14s ease-out}
+.card:hover .trig-acts{opacity:1;pointer-events:auto}
+.trig-test{font-size:11.5px;color:var(--ink-2);cursor:pointer;padding:3px 7px;border-radius:6px}
+.trig-test:hover{background:#f1f2f6;color:var(--ink)}
+.trig-edit{font-size:11.5px;color:var(--accent);cursor:pointer;padding:3px 7px;
+  border-radius:6px;flex:none;opacity:0;pointer-events:none}
+.card:hover .trig-acts{display:flex;gap:2px;flex:none;opacity:0;pointer-events:none;transition:opacity .14s ease-out}
+.card:hover .trig-acts{opacity:1;pointer-events:auto}
+.trig-test{font-size:11.5px;color:var(--ink-2);cursor:pointer;padding:3px 7px;border-radius:6px}
+.trig-test:hover{background:#f1f2f6;color:var(--ink)}
+.trig-edit{opacity:1;pointer-events:auto}
+.card:hover .more-btn{color:var(--ink-2)}
+.trig-edit:hover{background:var(--accent-soft)}
+.key-title{display:flex;align-items:center;gap:7px}
+.tag-off{font-size:10px;font-weight:650;color:var(--ink-3);background:#f0f0f4;
+  border:1px solid var(--line);padding:1px 6px;border-radius:99px;letter-spacing:.02em}
+.card.off{background:#fcfcfd}
+.card.off .key-badge{filter:grayscale(1);opacity:.5}
+.card.off .card-body,.card.off .more-wrap{position:relative;flex:none}
+/* 必须 relative：.menu 是 absolute right:0，没有定位祖先就会挂到初始包含块上，
+   页面不居中时恰好落在卡片旁边看不出来，一居中就飞到页面右上角 */
+.more-wrap{position:relative;flex:none}
+.more-btn{width:26px;height:26px;border-radius:7px;display:flex;align-items:center;
+  justify-content:center;color:#c9ccd6;cursor:pointer}
+.more-btn:hover{background:#f1f2f6;color:var(--ink)}
+.menu{position:absolute;right:0;top:30px;min-width:152px;z-index:20;
+  background:var(--surface);border:1px solid var(--line-strong);border-radius:10px;
+  box-shadow:var(--sh-3);padding:5px}
+.menu-item{display:flex;align-items:center;gap:8px;font-size:12.5px;padding:7px 9px;
+  border-radius:7px;cursor:pointer;color:var(--ink)}
+.menu-item:hover{background:#f2f3f7}
+.menu-item.danger{color:var(--err)}
+.menu-item.danger:hover{background:var(--err-soft)}
+.menu-sep{height:1px;background:var(--line);margin:4px 2px}
+.key-badge.k3d{background:linear-gradient(160deg,#3b4bb5,#1b2568)}
+.card{overflow:visible}
+.mini{font:inherit;font-size:11.5px;padding:5px 10px;border-radius:7px;cursor:pointer;
+  border:1px solid var(--line-strong);background:var(--surface);color:var(--ink-2)}
+.mini:hover{color:var(--ink);border-color:var(--ink-3)}
+.mini.danger{color:var(--err);border-color:#f0c3c0}
+.mini.danger:hover{background:var(--err-soft)}
+
+.screen-label{margin:46px 0 12px;font-size:11.5px;font-weight:650;color:var(--ink-3);
+  letter-spacing:.08em;text-transform:uppercase;display:flex;align-items:center;gap:10px}
+.screen-label:before,.screen-label:after{content:"";height:1px;background:var(--line);flex:1}
+.icon-btn.sm{width:28px;height:28px;border-radius:7px}
+.primary-btn{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:12.5px;
+  font-weight:560;padding:7px 15px;border-radius:8px;border:0;cursor:pointer;
+  background:var(--accent);color:#fff;box-shadow:0 1px 2px rgba(0,168,225,.35)}
+.primary-btn:hover{background:#0093c6}
+.primary-btn.sm{padding:5px 11px;font-size:11.5px}
+.mini2{display:inline-flex;align-items:center;gap:5px;font:inherit;font-size:12px;
+  padding:6px 11px;border-radius:8px;cursor:pointer;
+  border:1px solid var(--line-strong);background:var(--surface);color:var(--ink-2)}
+.mini2:hover{color:var(--ink);border-color:var(--ink-3)}
+.modal-stage{background:#e9ebef;border:1px solid var(--line);border-radius:var(--r-lg);
+  padding:36px;display:flex;justify-content:center}
+.modal{width:520px;background:var(--surface);border-radius:14px;box-shadow:var(--sh-3);
+  border:1px solid var(--line);overflow:hidden}
+.modal-head{display:flex;align-items:flex-start;gap:12px;padding:16px 18px 14px}
+.modal-title{font-size:15px;font-weight:620;letter-spacing:-.01em}
+.modal-sub{font-size:11.5px;color:var(--ink-3);margin-top:3px;font-variant-numeric:tabular-nums}
+.modal-body{padding:2px 18px 18px;display:flex;flex-direction:column;gap:16px}
+.field-lab{font-size:11.5px;font-weight:600;color:var(--ink-3);letter-spacing:.04em;
+  text-transform:uppercase;margin-bottom:7px}
+.field-lab.up{margin:26px 0 8px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{font-size:12px;padding:5px 11px;border-radius:8px;cursor:pointer;
+  border:1px solid var(--line-strong);color:var(--ink-2);background:var(--surface)}
+.chip:hover{border-color:var(--ink-3);color:var(--ink)}
+.chip.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:550}
+.chip.sm{font-size:11.5px;padding:4px 9px}
+.code-input{font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink);
+  background:#fafbfc;border:1px solid var(--control-border);border-radius:9px;
+  padding:10px 12px;min-height:62px;word-break:break-all}
+.caret{display:inline-block;width:1.5px;height:14px;background:var(--accent);
+  vertical-align:-2px;margin-left:1px}
+.modal-foot{display:flex;align-items:center;gap:8px;padding:13px 18px;
+  border-top:1px solid var(--line);background:#fbfbfc}
+.settings{max-width:620px}
+.set-head{display:flex;align-items:center;gap:11px;margin-bottom:4px}
+.set-head h2{font-size:22px;font-weight:640;letter-spacing:-.02em}
+.group{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);
+  box-shadow:var(--sh-1);overflow:hidden}
+.grow{display:flex;align-items:center;gap:12px;padding:13px 15px}
+.grow + .grow{border-top:1px solid var(--line)}
+.gi{color:var(--ink-3);flex:none;display:flex}
+.gt{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.gt b{font-size:13px;font-weight:560}
+.gt i{font-size:11.5px;color:var(--ink-3);font-style:normal}
+.switch{width:38px;height:22px;border-radius:99px;background:#dcdce3;flex:none;
+  display:flex;align-items:center;padding:2px;cursor:pointer}
+.switch i{width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.2)}
+.switch.on{background:var(--accent);justify-content:flex-end}
+.seg{display:flex;background:#f1f2f6;border-radius:8px;padding:2px;flex:none}
+.seg span{font-size:11.5px;padding:4px 11px;border-radius:6px;cursor:pointer;color:var(--ink-2)}
+.seg span.on{background:var(--surface);color:var(--ink);font-weight:560;box-shadow:var(--sh-1)}
+.stepper{display:flex;align-items:center;gap:2px;background:#f1f2f6;border-radius:8px;padding:2px 4px;flex:none}
+.stepper span{width:20px;text-align:center;cursor:pointer;color:var(--ink-2);font-size:13px}
+.stepper b{min-width:34px;text-align:center;font-size:12.5px;font-variant-numeric:tabular-nums}
+.stepper em{font-size:11px;color:var(--ink-3);font-style:normal;margin-left:2px}
+.grow.about{padding:15px}
+.app-mark{width:38px;height:38px;border-radius:10px;flex:none;display:flex;align-items:center;
+  justify-content:center;color:#fff;background:linear-gradient(160deg,#22c9f8,#0284c7);box-shadow:var(--sh-1)}
+.ver-state{display:flex;align-items:center;gap:5px;font-size:11.5px;flex:none}
+.ver-state.ok{color:var(--ink-3)}
+.ver-state.new-s{color:var(--accent);font-weight:560}
+.new{color:var(--accent);font-weight:600}
+.grow.about.alt{background:#f7fcff}
+.foot-note{margin-top:10px;font-size:11px;color:var(--ink-3)}
+</style></head><body><div class="app">
+
+  <div class="top">
+    <div class="brand">
+      <div><h1>FireVibe</h1><p>Fire TV 遥控器控制台</p></div>
+    </div>
+    <div class="spacer"></div>
+    <div class="icon-btn" title="设置"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" /><circle cx="12" cy="12" r="3" /></svg></div>
+  </div>
+
+  <div class="status-row">
+  <div class="status">
+  <div class="st-seg">
+  <span class="dot on"></span><span class="st-name">已配对</span>
+  <button class="ghost-btn" style="margin-left:8px">断开</button>
+  </div>
+  <div class="st-seg">
+  <span class="batt-ico"><svg width="22" height="14" viewBox="0 0 26 16" fill="none"><rect x="1" y="2.5" width="20" height="11" rx="3" stroke="currentColor" stroke-width="1.6"/><path d="M23 6.5v3" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><rect x="3.2" y="4.7" width="11.09" height="6.6" rx="1.6" fill="currentColor"/></svg></span><span class="batt-num">63%</span>
+  </div>
+  </div>
+
+  <div class="status card-lb">
+  <div class="st-seg">
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--ink-2)"><circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/></svg>
+  <div class="lb-txt">
+  <div class="lb-name">BlackHole 2ch</div>
+  <div class="lb-sub">虚拟声卡 · 已就绪</div>
+  </div>
+  </div>
+  </div>
+
+  <div class="status card-lb warn" title="未安装时的样子">
+  <div class="st-seg">
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--warn)"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+  <div class="lb-txt">
+  <div class="lb-name">BlackHole 2ch</div>
+  <div class="lb-sub warn-sub">虚拟声卡 · 未安装</div>
+  </div>
+  <button class="install-btn">安装</button>
+  </div>
+  </div>
+  </div>
+
+  <div class="grid">
+    <div class="col-left">
+      <div class="remote">
+          <svg class="body-svg" viewBox="0 0 316 1047" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="shell" x1="0" y1="0" x2="0.45" y2="1">
+                <stop offset="0%"   stop-color="#3a3d47"/>
+                <stop offset="18%"  stop-color="#22242b"/>
+                <stop offset="62%"  stop-color="#101216"/>
+                <stop offset="100%" stop-color="#1c1e25"/>
+              </linearGradient>
+              <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%"   stop-color="#ffffff" stop-opacity=".26"/>
+                <stop offset="6%"   stop-color="#ffffff" stop-opacity=".05"/>
+                <stop offset="92%"  stop-color="#ffffff" stop-opacity="0"/>
+                <stop offset="100%" stop-color="#ffffff" stop-opacity=".10"/>
+              </linearGradient>
+            </defs>
+            <path d="M 0,60 C 0,27.0 41.1,0 158,0 C 274.9,0 316,27.0 316,60 L 316,987 C 316,1020.0 274.9,1047 158,1047 C 41.1,1047 0,1020.0 0,987 Z" fill="url(#shell)"/>
+            <path d="M 0,60 C 0,27.0 41.1,0 158,0 C 274.9,0 316,27.0 316,60 L 316,987 C 316,1020.0 274.9,1047 158,1047 C 41.1,1047 0,1020.0 0,987 Z" fill="none" stroke="url(#rim)" stroke-width="2.4"/>
+          </svg>
+        <div class="mic-slit"></div>
+        <div class="well" style="left:10.2px;top:89.2px;width:125.8px;height:125.8px"></div>
+        <div class="well" style="left:60.4px;top:307.7px;width:25.5px;height:57.8px;border-radius:12.8px"></div>
+          <div class="btn round" style="left:16.1px;top:20.4px;width:25.5px;height:25.5px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v10" /> <path d="M18.4 6.6a9 9 0 1 1-12.77.04" /></svg></div>
+          <div class="btn round mic" style="left:55.2px;top:39.9px;width:35.7px;height:35.7px"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19v3" /> <path d="M19 10v2a7 7 0 0 1-14 0v-2" /> <rect x="9" y="2" width="6" height="13" rx="3" /></svg></div>
+          <div class="btn round ok" style="left:39.9px;top:119.0px;width:66.3px;height:66.3px"></div>
+          <div class="btn pill dpad" style="left:58.6px;top:93.1px;width:28.9px;height:22.1px"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg></div>
+          <div class="btn pill dpad" style="left:14.0px;top:135.2px;width:22.1px;height:34.0px"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></div>
+          <div class="btn pill dpad" style="left:110.1px;top:135.2px;width:22.1px;height:34.0px"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></div>
+          <div class="btn pill dpad" style="left:58.6px;top:189.1px;width:28.9px;height:22.1px"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></div>
+          <div class="btn round" style="left:17.8px;top:226.9px;width:25.5px;height:25.5px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5" /><path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5a5.5 5.5 0 0 1-5.5 5.5H11" /></svg></div>
+          <div class="btn round" style="left:60.4px;top:226.9px;width:25.5px;height:25.5px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8" /> <path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></svg></div>
+          <div class="btn round" style="left:102.8px;top:226.9px;width:25.5px;height:25.5px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/></svg></div>
+          <div class="btn round" style="left:17.8px;top:267.8px;width:25.5px;height:25.5px"><svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="currentColor"><path d="M11 5.5v13L2.5 12z"/><path d="M21.5 5.5v13L13 12z"/></svg></div>
+          <div class="btn round" style="left:60.4px;top:267.8px;width:25.5px;height:25.5px"><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M3 4.5v15l11-7.5z"/><rect x="16.5" y="4.5" width="2.6" height="15" rx="1"/><rect x="20.4" y="4.5" width="2.6" height="15" rx="1"/></svg></div>
+          <div class="btn round" style="left:102.8px;top:267.8px;width:25.5px;height:25.5px"><svg width="14.5" height="14.5" viewBox="0 0 24 24" fill="currentColor"><path d="M2.5 5.5v13L11 12z"/><path d="M13 5.5v13l8.5-6.5z"/></svg></div>
+          <div class="btn round" style="left:17.8px;top:309.4px;width:25.5px;height:25.5px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z" /> <line x1="22" x2="16" y1="9" y2="15" /> <line x1="16" x2="22" y1="9" y2="15" /></svg></div>
+          <div class="btn round" style="left:102.8px;top:309.4px;width:25.5px;height:25.5px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2-5 5-5-5" /> <rect width="20" height="15" x="2" y="7" rx="2" /></svg></div>
+          <div class="volrocker" style="left:60.4px;top:307.7px;width:25.5px;height:57.8px;border-radius:12.8px">
+            <div class="vhalf"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg></div>
+            <div class="vdiv"></div>
+            <div class="vhalf"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/></svg></div>
+          </div>
+          <div class="btn pill appkey a1" style="left:11.0px;top:377.4px;width:59.5px;height:26.3px">prime</div>
+          <div class="btn pill appkey a2" style="left:75.6px;top:377.4px;width:59.5px;height:26.3px">NETFLIX</div>
+          <div class="btn pill appkey a3" style="left:11.0px;top:411.4px;width:59.5px;height:26.3px">Disney+</div>
+          <div class="btn pill appkey a4" style="left:75.6px;top:411.4px;width:59.5px;height:26.3px">hulu</div>
+      </div>
+      <p class="hint">点击按键即执行它配的操作<br>实体遥控器按下时这里同步高亮</p>
+    </div>
+
+    <div class="col-right">
+
+      <div>
+        <div class="section-lab">方案</div>
+        <div class="profile-pick"><h2>默认</h2><svg class="" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></div>
+        <div class="profile-meta">8 个按键已配置 · 共 3 套方案</div>
+      </div>
+
+      <div>
+        <div class="act-head">
+          <div class="section-lab" style="margin:0">自定义操作</div>
+          <div class="spacer"></div>
+          <button class="add-btn"><svg class="" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>添加按键</button>
+        </div>
+        <div class="cards">
+
+          <div class="card">
+            <div class="card-head">
+              <div class="key-badge k3"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19v3" /> <path d="M19 10v2a7 7 0 0 1-14 0v-2" /> <rect x="9" y="2" width="6" height="13" rx="3" /></svg></div>
+              <div style="flex:1;min-width:0">
+                <div class="key-title">麦克风</div>
+                <div class="key-sub">0c:0221</div>
+              </div>
+              <div class="more-wrap">
+                <div class="more-btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg></div>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="trig"><span class="trig-tag">短按</span>
+                <div class="trig-body"><div class="trig-val"><svg class="ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19v3" /> <path d="M19 10v2a7 7 0 0 1-14 0v-2" /> <rect x="9" y="2" width="6" height="13" rx="3" /></svg>开始 / 停止说话</div><div class="trig-note">点一下开始，再点一下停止</div></div>
+                <div class="trig-acts"><span class="trig-test">测试</span><span class="trig-edit">编辑</span></div></div>
+              <div class="trig"><span class="trig-tag">长按</span>
+                <div class="trig-body"><div class="trig-val"><svg class="ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19v3" /> <path d="M19 10v2a7 7 0 0 1-14 0v-2" /> <rect x="9" y="2" width="6" height="13" rx="3" /></svg>按住说话</div><div class="trig-note">按住送流，松手停止</div></div>
+                <div class="trig-acts"><span class="trig-test">测试</span><span class="trig-edit">编辑</span></div></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <div class="key-badge "><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8" /> <path d="M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /></svg></div>
+              <div style="flex:1;min-width:0">
+                <div class="key-title">主页</div>
+                <div class="key-sub">0c:0223</div>
+              </div>
+              <div class="more-wrap">
+                <div class="more-btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg></div>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="trig"><span class="trig-tag">短按</span>
+                <div class="trig-body"><div class="trig-val empty">未设置</div></div>
+                <div class="trig-acts"><span class="trig-edit">设置</span></div></div>
+              <div class="trig"><span class="trig-tag">长按</span>
+                <div class="trig-body"><div class="trig-val empty">未设置</div></div>
+                <div class="trig-acts"><span class="trig-edit">设置</span></div></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <div class="key-badge "><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="18" y2="18"/></svg></div>
+              <div style="flex:1;min-width:0">
+                <div class="key-title">菜单</div>
+                <div class="key-sub">0c:0040</div>
+              </div>
+              <div class="more-wrap">
+                <div class="more-btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg></div>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="trig"><span class="trig-tag">短按</span>
+                <div class="trig-body"><div class="trig-val empty">未设置</div></div>
+                <div class="trig-acts"><span class="trig-edit">设置</span></div></div>
+              <div class="trig"><span class="trig-tag">长按</span>
+                <div class="trig-body"><div class="trig-val empty">未设置</div></div>
+                <div class="trig-acts"><span class="trig-edit">设置</span></div></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <div class="key-badge "><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2-5 5-5-5" /> <rect width="20" height="15" x="2" y="7" rx="2" /></svg></div>
+              <div style="flex:1;min-width:0">
+                <div class="key-title">TV</div>
+                <div class="key-sub">0c:008d</div>
+              </div>
+              <div class="more-wrap">
+                <div class="more-btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg></div>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="trig"><span class="trig-tag">短按</span>
+                <div class="trig-body"><div class="trig-val"><svg class="ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6" /><path d="M10 14 21 3" /><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /></svg>打开 Chrome</div><div class="trig-note">com.google.Chrome</div></div>
+                <div class="trig-acts"><span class="trig-test">测试</span><span class="trig-edit">编辑</span></div></div>
+              <div class="trig"><span class="trig-tag">长按</span>
+                <div class="trig-body"><div class="trig-val empty">未设置</div></div>
+                <div class="trig-acts"><span class="trig-edit">设置</span></div></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <div class="key-badge k1">P</div>
+              <div style="flex:1;min-width:0">
+                <div class="key-title">Prime Video 键</div>
+                <div class="key-sub">ff00:00a1</div>
+              </div>
+              <div class="more-wrap">
+                <div class="more-btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg></div>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="trig"><span class="trig-tag">短按</span>
+                <div class="trig-body"><div class="trig-val"><svg class="ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6" /><path d="M10 14 21 3" /><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /></svg>打开 Claude</div><div class="trig-note">com.anthropic.claudefordesktop</div></div>
+                <div class="trig-acts"><span class="trig-test">测试</span><span class="trig-edit">编辑</span></div></div>
+              <div class="trig"><span class="trig-tag">长按</span>
+                <div class="trig-body"><div class="trig-val"><svg class="ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.914 4a1.5 1.5 0 00-2.474-1.561l-9 9A1.5 1.5 0 005.5 14h4.002a.5.5 0 01.471.666L8.086 20a1.5 1.5 0 002.475 1.56l9-9A1.5 1.5 0 0018.5 10h-3.997a.5.5 0 01-.472-.667z" /></svg>AppleScript · 锁屏</div><div class="trig-note">tell application "System Events" to keystroke "q" using {control down, command down}</div></div>
+                <div class="trig-acts"><span class="trig-test">测试</span><span class="trig-edit">编辑</span></div></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <div class="key-badge k2">N</div>
+              <div style="flex:1;min-width:0">
+                <div class="key-title">NETFLIX 键</div>
+                <div class="key-sub">ff00:00a2</div>
+              </div>
+              <div class="more-wrap">
+                <div class="more-btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg></div>
+                <div class="menu">
+                  <div class="menu-item"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49"/> <path d="M14.084 14.158a3 3 0 0 1-4.242-4.242"/> <path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143"/> <path d="m2 2 20 20"/></svg>禁用此按键</div>
+                  <div class="menu-sep"></div>
+                  <div class="menu-item danger"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 5H9l-7 7 7 7h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2Z"/><line x1="18" x2="12" y1="9" y2="15"/><line x1="12" x2="18" y1="9" y2="15"/></svg>移除</div>
+                </div>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="trig"><span class="trig-tag">短按</span>
+                <div class="trig-body"><div class="trig-val"><svg class="ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6" /><path d="M10 14 21 3" /><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /></svg>打开 ChatGPT</div><div class="trig-note">com.openai.codex</div></div>
+                <div class="trig-acts"><span class="trig-test">测试</span><span class="trig-edit">编辑</span></div></div>
+              <div class="trig"><span class="trig-tag">长按</span>
+                <div class="trig-body"><div class="trig-val empty">未设置</div></div>
+                <div class="trig-acts"><span class="trig-edit">设置</span></div></div>
+            </div>
+          </div>
+          <div class="card off">
+            <div class="card-head">
+              <div class="key-badge k3d">D</div>
+              <div style="flex:1;min-width:0">
+                <div class="key-title">Disney+ 键<span class="tag-off">已禁用</span></div>
+                <div class="key-sub">ff00:00a3</div>
+              </div>
+              <div class="more-wrap">
+                <div class="more-btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg></div>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="trig"><span class="trig-tag">短按</span>
+                <div class="trig-body"><div class="trig-val"><svg class="ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 8h.01" /> <path d="M12 12h.01" /> <path d="M14 8h.01" /> <path d="M16 12h.01" /> <path d="M18 8h.01" /> <path d="M6 8h.01" /> <path d="M7 16h10" /> <path d="M8 12h.01" /> <rect width="20" height="16" x="2" y="4" rx="2" /></svg>映射按键 · cmd+tab</div><div class="trig-note">切换应用</div></div>
+                <div class="trig-acts"><span class="trig-test">测试</span><span class="trig-edit">编辑</span></div></div>
+              <div class="trig"><span class="trig-tag">长按</span>
+                <div class="trig-body"><div class="trig-val empty">未设置</div></div>
+                <div class="trig-acts"><span class="trig-edit">设置</span></div></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <div class="key-badge k4">h</div>
+              <div style="flex:1;min-width:0">
+                <div class="key-title">hulu 键</div>
+                <div class="key-sub">ff00:00a4</div>
+              </div>
+              <div class="more-wrap">
+                <div class="more-btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg></div>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="trig"><span class="trig-tag">短按</span>
+                <div class="trig-body"><div class="trig-val"><svg class="ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6" /><path d="M10 14 21 3" /><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /></svg>打开 firevibe</div><div class="trig-note">com.tankxu.firevibe</div></div>
+                <div class="trig-acts"><span class="trig-test">测试</span><span class="trig-edit">编辑</span></div></div>
+              <div class="trig"><span class="trig-tag">长按</span>
+                <div class="trig-body"><div class="trig-val"><svg class="ic" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 11 2-2-2-2" /><path d="M11 13h4" /><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /></svg>执行命令</div><div class="trig-note">open -a Terminal</div></div>
+                <div class="trig-acts"><span class="trig-test">测试</span><span class="trig-edit">编辑</span></div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="screen-label">编辑弹窗</div>
+  <div class="modal-stage"><div class="modal">
+    <div class="modal-head">
+      <div style="flex:1">
+        <div class="modal-title">编辑操作</div>
+        <div class="modal-sub">Prime Video 键 · 长按 · ff00:00a1</div>
+      </div>
+      <div class="icon-btn sm"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18" /> <path d="m6 6 12 12" /></svg></div>
+    </div>
+    <div class="modal-body">
+      <div><div class="field-lab">动作类型</div><div class="chips"><span class="chip">无</span><span class="chip">映射按键</span><span class="chip">输入文字</span><span class="chip">打开应用</span><span class="chip on">AppleScript</span><span class="chip">执行命令</span><span class="chip">开始 / 停止说话</span><span class="chip">按住说话</span></div></div>
+      <div><div class="field-lab">AppleScript 代码</div>
+        <div class="code-input">tell application "System Events" to keystroke "q" using {control down, command down}<span class="caret"></span></div></div>
+      <div><div class="field-lab">预设</div><div class="chips"><span class="chip sm on">锁屏</span><span class="chip sm">睡眠</span><span class="chip sm">显示桌面</span><span class="chip sm">静音切换</span><span class="chip sm">Music 播放/暂停</span><span class="chip sm">复制 Safari URL</span><span class="chip sm">新建 Chrome 窗口</span><span class="chip sm">截图到剪贴板</span></div></div>
+    </div>
+    <div class="modal-foot">
+      <button class="mini2"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.914 4a1.5 1.5 0 00-2.474-1.561l-9 9A1.5 1.5 0 005.5 14h4.002a.5.5 0 01.471.666L8.086 20a1.5 1.5 0 002.475 1.56l9-9A1.5 1.5 0 0018.5 10h-3.997a.5.5 0 01-.472-.667z" /></svg>测试一次</button>
+      <div class="spacer"></div>
+      <button class="mini2">取消</button>
+      <button class="primary-btn">保存</button>
+    </div>
+  </div></div>
+
+  <div class="screen-label">设置页</div>
+  <div class="settings">
+    <div class="set-head"><div class="icon-btn sm"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></div><h2>设置</h2></div>
+    <div class="field-lab up">通用</div>
+    <div class="group">
+      <div class="grow"><span class="gi"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5" /> <path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09" /> <path d="M9 12a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.4 22.4 0 0 1-4 2z" /> <path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 .05 5 .05" /></svg></span>
+        <div class="gt"><b>开机启动</b><i>登录时自动在后台启动</i></div><div class="switch on"><i></i></div></div>
+      <div class="grow"><span class="gi"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/></svg></span>
+        <div class="gt"><b>语言</b></div>
+        <div class="seg"><span class="on">中文</span><span>English</span></div></div>
+      <div class="grow"><span class="gi"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="10" x2="14" y1="2" y2="2" /> <line x1="12" x2="15" y1="14" y2="11" /> <circle cx="12" cy="14" r="8" /></svg></span>
+        <div class="gt"><b>长按判定阈值</b><i>按住超过这个时间算长按</i></div>
+        <div class="stepper"><span>−</span><b>350</b><span>+</span><em>ms</em></div></div>
+    </div>
+    <div class="field-lab up">关于</div>
+    <div class="group">
+      <div class="grow about"><div class="app-mark"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19v3" /> <path d="M19 10v2a7 7 0 0 1-14 0v-2" /> <rect x="9" y="2" width="6" height="13" rx="3" /></svg></div>
+        <div class="gt"><b>FireVibe</b><i>0.1.0 (build 1) · Rust + GPUI</i></div>
+        <div class="ver-state ok"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.85 8.62a4 4 0 0 1 4.78-4.77 4 4 0 0 1 6.74 0 4 4 0 0 1 4.78 4.78 4 4 0 0 1 0 6.74 4 4 0 0 1-4.77 4.78 4 4 0 0 1-6.75 0 4 4 0 0 1-4.78-4.77 4 4 0 0 1 0-6.76Z" /> <path d="m9 12 2 2 4-4" /></svg>已是最新</div>
+        <button class="mini2"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" /> <path d="M21 3v5h-5" /> <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" /> <path d="M8 16H3v5" /></svg>检查更新</button></div>
+      <div class="grow about alt"><div class="app-mark"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19v3" /> <path d="M19 10v2a7 7 0 0 1-14 0v-2" /> <rect x="9" y="2" width="6" height="13" rx="3" /></svg></div>
+        <div class="gt"><b>FireVibe</b><i>0.1.0 → <span class="new">0.2.0</span> 可更新</i></div>
+        <div class="ver-state new-s"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z" /> <path d="M20 2v4" /> <path d="M22 4h-4" /> <circle cx="4" cy="20" r="2" /></svg>有新版本</div>
+        <button class="primary-btn sm"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3" /> <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /> <path d="m7 10 5 5 5-5" /></svg>更新</button></div>
+    </div>
+    <p class="foot-note">上面两行是「已最新 / 有新版」两种状态示意，实际只显示其中一个。</p>
+  </div>
+
+</div></body></html>

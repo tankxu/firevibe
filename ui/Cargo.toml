@@ -1,0 +1,11 @@
+[package]
+name = "firevibe-ui"
+edition = "2021"
+version = "0.1.0"
+
+[dependencies]
+firevibe-core = { path = "../core" }
+anyhow = "1"
+gpui = "0.2"
+gpui-component = "0.5"
+include_dir = "0.7"

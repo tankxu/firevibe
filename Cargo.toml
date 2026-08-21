@@ -1,0 +1,28 @@
+[workspace]
+members = ["core", "cli", "ui"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+tracing = "0.1"
+
+# arrayref 0.3.10 在 crates.io 索引里声明了一个不存在的依赖 proc-macro1（^1.0.107），
+# 而它更早的版本全被 yank —— 任何需要 arrayref 的依赖图都解不开。
+# 源码本体已审计：504 行纯宏，无 build.rs、无 proc-macro、无进程/网络调用，
+# 全文不引用 proc-macro1。所以 vendor 一份并去掉那行假依赖。
+[patch.crates-io]
+arrayref = { path = "vendor/arrayref" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# 不用 panic = "abort"：gpui 内部有 catch_unwind，abort 会破坏它
