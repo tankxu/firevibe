@@ -11,7 +11,7 @@
 
 [下载最新版](https://github.com/tankxu/firevibe/releases/latest) · [开发笔记](docs/DEVELOPMENT.md)
 
-<img src="design/shots/main.png" width="820" alt="界面">
+<img src="design/shots/screen-main.png" width="820" alt="界面">
 
 </div>
 
@@ -54,8 +54,7 @@
 点软遥控器上的键也会直接执行它配好的动作。
 
 <div align="center">
-<img src="design/shots/edit-dialog.png" width="420" alt="配置某个键">
-<img src="design/shots/settings.png" width="420" alt="设置">
+<img src="design/shots/screen-settings.png" width="820" alt="设置">
 </div>
 
 ## 安装
