@@ -149,12 +149,10 @@ hidutil property --matching '{"ProductID":0x0421,"VendorID":0x0171}' --set '{"Us
 
 重启 Mac 也会清掉。
 
-## 已知限制
+## 适用范围
 
-- **只有 macOS**。Windows / Linux 没做按键注入
-- **没做 Apple 公证**，所以首次打开要绕一下（见上面第 2 步）
-- 只在 **Fire TV Alexa Voice Remote 3rd Gen** 上实测过
-- 云端语音识别（火山引擎 / 阿里 / FunASR）还没接，目前只有系统的离线识别
+- **macOS 12 或更新**（Apple Silicon）
+- 安装包未经 Apple 公证，首次打开需右键 →「打开」（见上面第 2 步）
 
 ## 许可证
 

@@ -340,7 +340,9 @@ impl FireVibe {
     /// 放在 render 里而不是 pump —— 开窗需要 `&mut App`，pump 里拿不到。
     fn sync_hud(&mut self, cx: &mut Context<Self>) {
         // 听写在收音，或者麦克风开着喂第三方输入法 —— 两种都该有电平反馈
-        let on = self.rt.dictating.lock().is_some() || self.rt.status.mic_on.load(Ordering::Relaxed);
+        let on = self.rt.cfg.read().settings.show_level_hud
+            && (self.rt.dictating.lock().is_some()
+                || self.rt.status.mic_on.load(Ordering::Relaxed));
         match (on, self.hud.is_some()) {
             (true, false) => self.hud = hud::open(self.rt.clone(), cx),
             (false, true) => {

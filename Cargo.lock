@@ -1819,7 +1819,7 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "firevibe-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "firevibe-core",
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "firevibe-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "block2",
@@ -1854,7 +1854,7 @@ dependencies = [
 
 [[package]]
 name = "firevibe-ui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "firevibe-core",

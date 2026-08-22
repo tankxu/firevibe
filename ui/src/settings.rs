@@ -17,6 +17,7 @@ impl FireVibe {
         let lang = cfg.settings.lang;
         let long_ms = cfg.settings.long_press_ms;
         let auto_in = cfg.settings.auto_switch_input;
+        let hud = cfg.settings.show_level_hud;
         let stt_locale = cfg.settings.stt_locale.clone();
         let stt_enter = cfg.settings.stt_auto_enter;
         drop(cfg);
@@ -115,6 +116,24 @@ impl FireVibe {
                                         // 关掉时把可能已经切走的设备还原回来
                                         this.rt.restore_input();
                                     }
+                                    cx.notify();
+                                },
+                            ))),
+                    )
+                    .child(hline())
+                    // 说话时的悬浮电平条
+                    .child(
+                        group_row()
+                            .child(row_icon("mic"))
+                            .child(row_text(
+                                "说话时显示电平条",
+                                Some("屏幕底部浮出一条电平，让你知道确实在收音"),
+                            ))
+                            .child(switch_ui("sw-hud", hud).on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    let v = !this.rt.cfg.read().settings.show_level_hud;
+                                    this.rt.cfg.write().settings.show_level_hud = v;
+                                    this.save();
                                     cx.notify();
                                 },
                             ))),

@@ -417,6 +417,9 @@ pub struct Settings {
     /// 每次重启 app 电量就空着，得等下一次上报才回来。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_battery: Option<i32>,
+    /// 说话时在屏幕底部显示那条悬浮电平条
+    #[serde(default = "default_true")]
+    pub show_level_hud: bool,
 }
 fn default_true() -> bool {
     true
@@ -443,6 +446,7 @@ impl Default for Settings {
             stt_auto_enter: false,
             prev_input_id: None,
             last_battery: None,
+            show_level_hud: true,
         }
     }
 }
