@@ -42,6 +42,21 @@ codesign -d --requirements - "target/FireVibe.app" | grep designated   # 不该�
 配对：遥控器一次只能配一台设备，配 Mac 前先把 Fire TV Stick 断电。
 必须用 1.5V 碱性 AAA，1.2V 充电电池会让 BLE 射频 brownout。
 
+## 想支持另一款遥控器？
+
+先跑 `firevibe-cli --hid-list` 看它的 VID/PID —— 我们是按
+`device.rs` 里的 `VID`/`PID` 两个常量打开设备的，标识对不上就完全看不到它。
+
+然后三层依次确认，越往后越难：
+
+1. **能被打开**：改那两个常量即可
+2. **按键能识别**：`--map` 重新测绘一遍 usage。注意本机这款有几个 Amazon 私有
+   usage（返回 = 键盘页 `0x00F1`、TV = `0x008D`、四个 App 键走 vendor report
+   `0xEF` / 页 `0xFF00`），别指望换一款还一样
+3. **麦克风能用**：最难。需要它同样支持 vendor report `0xF2` 开热麦、`0xF0` 吐音频流，
+   而且编码是 Opus。这是 Amazon 私有协议 —— 「能在电视上配对使用」只说明它是标准
+   BLE HID 键盘，和麦克风这条通路无关
+
 ## 协议要点
 
 完整逆向记录在 `~/LocalDev/firetv-remote-mac/NOTES.md`。几条容易踩的：

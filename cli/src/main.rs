@@ -358,6 +358,33 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // 列出所有 HID 设备。判断「另一款外观相同的遥控器能不能用」时先看这个：
+    // 我们是按 VID/PID 打开设备的，标识不一样就完全看不到它。
+    if has("--hid-list") {
+        let api = hidapi::HidApi::new()?;
+        println!("{:<8} {:<8}  {:<28} {}", "VID", "PID", "产品名", "厂商");
+        println!("{}", "-".repeat(72));
+        let mut seen = std::collections::HashSet::new();
+        for d in api.device_list() {
+            if !seen.insert((d.vendor_id(), d.product_id())) {
+                continue;
+            }
+            let ours = d.vendor_id() == firevibe_core::device::VID
+                && d.product_id() == firevibe_core::device::PID;
+            println!(
+                "0x{:04x}   0x{:04x}    {:<28} {}{}",
+                d.vendor_id(),
+                d.product_id(),
+                d.product_string().unwrap_or("?"),
+                d.manufacturer_string().unwrap_or("?"),
+                if ours { "   ← FireVibe 认这个" } else { "" }
+            );
+        }
+        println!("\nFireVibe 只打开 VID 0x{:04x} / PID 0x{:04x}。",
+                 firevibe_core::device::VID, firevibe_core::device::PID);
+        return Ok(());
+    }
+
     if has("--inputs") {
         let cur = firevibe_core::audio::default_input();
         for d in firevibe_core::audio::input_devices() {

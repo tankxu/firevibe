@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+hidapi = "2"
 firevibe-core = { path = "../core" }
 anyhow.workspace = true
 libc = "0.2.189"
