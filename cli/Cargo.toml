@@ -9,8 +9,8 @@ firevibe-core = { path = "../core" }
 anyhow.workspace = true
 libc = "0.2.189"
 
-# 产物叫 firecli（短、好敲）。不叫 firectl —— 本机已有同名的另一个项目；
-# 也不叫 firevibe —— 会和 app 里的可执行文件同名，授权列表里分不清。
+# 产物叫 firectl —— 跟 systemctl / kubectl 一个路子，「fire control」也贴题。
+# 不叫 firevibe：会和 app 里的可执行文件同名，授权列表里分不清该勾哪个。
 [[bin]]
-name = "firecli"
+name = "firectl"
 path = "src/main.rs"

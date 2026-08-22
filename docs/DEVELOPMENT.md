@@ -16,8 +16,8 @@
 
 ```bash
 cargo run --release -p firevibe-ui        # 界面
-cargo run --release -p firecli -- --map     # 测绘按键 usage
-cargo run --release -p firecli -- --sniff   # 看原始 HID 报文
+cargo run --release -p firectl -- --map     # 测绘按键 usage
+cargo run --release -p firectl -- --sniff   # 看原始 HID 报文
 ```
 
 ### ⚠ 签名必须用真证书，别用 ad-hoc
@@ -44,7 +44,7 @@ codesign -d --requirements - "target/FireVibe.app" | grep designated   # 不该�
 
 ## 想支持另一款遥控器？
 
-先跑 `firecli --hid-list` 看它的 VID/PID —— 我们是按
+先跑 `firectl --hid-list` 看它的 VID/PID —— 我们是按
 `device.rs` 里的 `VID`/`PID` 两个常量打开设备的，标识对不上就完全看不到它。
 
 然后三层依次确认，越往后越难：
@@ -146,7 +146,7 @@ Spotlight（id 64）是 `enabled = 0`，Spotlight 照样弹，说明走的是更
 唯一的解法是在事件层拦掉。先用诊断工具看清系统生成了什么事件：
 
 ```bash
-firecli --tap          # 然后按遥控器上的键
+firectl --tap          # 然后按遥控器上的键
 ```
 
 它**只打印非字符键**（功能/媒体键区、修饰键、systemDefined），你打的字一个都不记录。
