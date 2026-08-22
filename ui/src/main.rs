@@ -4,7 +4,6 @@
 mod assets;
 mod cards;
 mod editor;
-mod adapt;
 mod hud;
 mod i18n;
 mod remote;
@@ -45,8 +44,6 @@ use widget::*;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Screen {
-    /// 遥控器适配（选设备 + 重新认键）
-    Adapt,
     Main,
     Settings,
 }
@@ -107,10 +104,6 @@ pub struct FireVibe {
     /// 装虚拟声卡前的说明弹窗。系统那个授权框只写「osascript wants to
     /// make changes」，署名还是个陌生进程 —— 直接弹给人输密码是不合格的，
     /// 先把要做什么讲清楚。
-    /// 扫到的 HID 设备列表。None = 还没扫过
-    pub hid_devs: Option<Vec<firevibe_core::device::HidDev>>,
-    /// 正在逐键测绘，值是 Slot::ALL 的下标
-    pub mapping: Option<usize>,
     /// 方案改名弹窗：装着输入框，None = 没在改
     pub renaming: Option<Entity<InputState>>,
     pub install_confirm: bool,
@@ -242,8 +235,6 @@ impl FireVibe {
             audio_rx: None,
             audio_at: Instant::now() - Duration::from_secs(10),
             input_open: false,
-            hid_devs: None,
-            mapping: None,
             renaming: None,
             install_confirm: false,
             voice_test: false,
@@ -527,19 +518,6 @@ impl FireVibe {
             match ev {
                 // 之前这个分支压根没有，按遥控器时界面一个字都不显示 ——
                 // 包括「没有语音识别权限」这种关键报错，全被丢掉了
-                Event::Learned(k) => {
-                    if let Some(i) = self.mapping {
-                        if let Some(&slot) = Slot::ALL.get(i) {
-                            self.rt.cfg.write().set_slot(slot, k);
-                            self.mapping = Some(i + 1);
-                            self.save();
-                            self.toast(format!(
-                                "{} 已记下",
-                                crate::cards::card_title(slot)
-                            ));
-                        }
-                    }
-                }
                 Event::Key { down, result, .. } => {
                     if down && !result.is_empty() {
                         self.toast(result);
@@ -732,9 +710,6 @@ impl FireVibe {
         let l = self.l();
         let on = self.connected();
         let batt = self.battery();
-        if std::env::var_os("FIREVIBE_UI_DEBUG").is_some() {
-            eprintln!("[ui] status_cards: on={on} batt={batt}");
-        }
 
         // 配对 + 电量
         let mut pair = div()
@@ -796,18 +771,7 @@ impl FireVibe {
                             }),
                         ),
                     ))
-                    // 连不上时给一条出路：可能是另一款遥控器，标识对不上
-                    .when(!on, |d| {
-                        d.child(div().ml(px(6.)).child(
-                            ghost_btn("to-adapt", "适配其它型号").on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.screen = Screen::Adapt;
-                                    this.err = None;
-                                    cx.notify();
-                                },
-                            )),
-                        ))
-                    }),
+                    ,
             );
         if batt > 0 {
             pair = pair.child(
@@ -1392,52 +1356,7 @@ impl FireVibe {
         }
     }
 
-    /// 测试输入：按住看电平。把「音频有没有真的进来」这件事变成肉眼可见。
-    /// 扫一遍 HID 设备。**必须丢后台线程** —— hidapi 枚举会跑 run loop，
-    /// 在 gpui 的 update 里直接调会撞 `RefCell already borrowed` 然后 abort。
-    fn scan_hid(&mut self, cx: &mut Context<Self>) {
-        self.hid_devs = Some(Vec::new()); // 先占位，界面显示「没扫到」而不是回到按钮
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(firevibe_core::device::list_hid());
-        });
-        cx.spawn(async move |this, cx| {
-            // 后台线程很快就回来，这里轮询等它
-            for _ in 0..100 {
-                cx.background_executor()
-                    .timer(Duration::from_millis(30))
-                    .await;
-                if let Ok(list) = rx.try_recv() {
-                    let _ = this.update(cx, |v, cx| {
-                        v.hid_devs = Some(list);
-                        cx.notify();
-                    });
-                    return;
-                }
-            }
-        })
-        .detach();
-        cx.notify();
-    }
 
-    /// 用这台设备：写进配置，重新打开 HID，硬件层映射也跟着换标识
-    fn pick_device(&mut self, d: &firevibe_core::device::HidDev, cx: &mut Context<Self>) {
-        {
-            let mut g = self.rt.cfg.write();
-            g.settings.device_vid = Some(format!("0x{:04x}", d.vid));
-            g.settings.device_pid = Some(format!("0x{:04x}", d.pid));
-        }
-        self.save();
-        firevibe_core::hidremap::set_ids(d.vid, d.pid);
-        // 让 2 秒一次的自动重连立刻用新标识开一次。
-        // 注意：如果旧设备的读线程还活着，它会继续读到自己出错为止 ——
-        // 走到这个界面的人一般是「压根没连上」，所以实践中不存在旧线程。
-        self.started = false;
-        self.hid_try_at = Instant::now() - Duration::from_secs(10);
-        self.err = None;
-        self.toast(format!("已选 {}，正在连接…", d.label()));
-        cx.notify();
-    }
 
     /// 提交方案改名。按钮和回车共用同一条路径。
     fn commit_rename(&mut self, cx: &mut Context<Self>) {
@@ -1834,19 +1753,6 @@ impl Render for FireVibe {
         // 顶栏与左侧遥控栏都固定不滑，只有右侧那列滚 —— 遥控栏自己也带滚动，
         // 但只在窗口矮到装不下它时才起作用。
         let body: gpui::AnyElement = match self.screen {
-            Screen::Adapt => div()
-                .id("adapt-scroll")
-                .flex_1()
-                .w_full()
-                .min_h(px(0.))
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .items_center()
-                .px(px(32.))
-                .pb(px(48.))
-                .child(div().w_full().max_w(px(680.)).child(self.adapt_page(cx)))
-                .into_any_element(),
             Screen::Settings => div()
                 .id("set-scroll")
                 .flex_1()

@@ -1,4 +1,5 @@
 //! 无界面版：在做 GUI 之前把引擎跑通，也用于排障。
+mod adapt;
 mod map;
 mod sniff;
 use firevibe_core::{
@@ -204,6 +205,9 @@ fn main() -> anyhow::Result<()> {
              \x20 --gain <倍数>      覆盖增益\n\
              \x20 --no-voice         只测按键\n\
              \x20 --descriptor       打印 HID 报告描述符后退出\n\
+             \x20 --adapt            换一款遥控器：选设备 → 逐键认键 → 看报文（写进配置）\n\
+             \x20 --probe-mic        按键能用但没声音时跑这个：打出报告描述符和实收报文\n\
+             \x20 --hid-list         列出所有 HID 设备的 VID/PID\n\
              \x20 --map              按键测绘：逐个记录每个物理键的真实 HID usage\n\
              \x20 --sniff            原始 report 嗅探：打印每一条报文（含 vendor 0xEF/0xF1）\n\
              \x20 --tap              看系统把遥控器按键翻译成了什么事件（只打印非字符键）\n\
@@ -215,6 +219,18 @@ fn main() -> anyhow::Result<()> {
              \x20 --set-input <前缀> 切换系统默认输入设备"
         );
         return Ok(());
+    }
+
+    // 「按键能用但没声音」专用：一条命令把判定音频通路需要的信息全打出来。
+    // 只发我们已知的开麦报文（0xF2 01 01），**不做 opcode 盲扫** ——
+    // 对不明设备盲扫厂商命令可能干出不可逆的事。
+    if has("--probe-mic") {
+        return probe_mic();
+    }
+
+    // 换一款遥控器：选设备 → 逐键认键 → 看报文，全程写进配置
+    if has("--adapt") {
+        return adapt::run();
     }
 
     if has("--map") {
@@ -710,4 +726,82 @@ fn run_watch_mods() -> anyhow::Result<()> {
     loop {
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+
+/// 音频通路探测：报告描述符 + 开麦后 12 秒内收到的所有 report id。
+/// 输出整段贴回来就能判断它的语音走哪条路。
+fn probe_mic() -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+    let mut cfg = firevibe_core::config::Config::load();
+    cfg.voice.enabled = false;
+    let (vid, pid) = cfg.device_ids();
+    let (rt, _rx) = firevibe_core::runtime::Runtime::new(cfg);
+    rt.start()?;
+    std::thread::sleep(Duration::from_millis(400));
+
+    println!("\n===== FireVibe 音频通路探测 =====");
+    println!("设备标识: 0x{vid:04x} / 0x{pid:04x}");
+
+    let d = rt.descriptor.lock().clone();
+    println!("\n-- HID 报告描述符（{} 字节）--", d.len());
+    println!("{}", d.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    // 描述符里出现过的 Report ID（0x85 是 Report ID 标签）
+    let mut ids: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i + 1 < d.len() {
+        if d[i] == 0x85 && !ids.contains(&d[i + 1]) {
+            ids.push(d[i + 1]);
+        }
+        i += 1;
+    }
+    println!("描述符里声明的 Report ID: {}",
+        if ids.is_empty() { "（没解析到）".into() }
+        else { ids.iter().map(|b| format!("0x{b:02X}")).collect::<Vec<_>>().join(" ") });
+
+    println!("\n-- 现在请**按住麦克风键说话**，12 秒 --");
+    rt.seen_rids.lock().clear();
+    rt.status.mic_on.store(true, Ordering::Relaxed);
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(12) {
+        std::thread::sleep(Duration::from_millis(400));
+        print!("\r   收到 {} 种报文，音频帧 {}      ",
+            rt.seen_rids.lock().len(),
+            rt.status.audio_frames.load(Ordering::Relaxed));
+        let _ = std::io::stdout().flush();
+    }
+    rt.status.mic_on.store(false, Ordering::Relaxed);
+    println!("\n");
+
+    let seen = rt.seen_rids.lock().clone();
+    println!("-- 实际收到的报文 --");
+    if seen.is_empty() {
+        println!("   一条都没有（设备标识可能不对，先跑 --adapt 第一步）");
+    }
+    for (rid, cnt) in &seen {
+        let what = match *rid {
+            0x01 => "键盘键",
+            0x02 => "多媒体键",
+            0x03 => "电量",
+            0xF0 => "音频流（我们认的那条）",
+            0xEF | 0xF1 | 0xF2 => "厂商私有",
+            _ => "未知",
+        };
+        println!("   0x{rid:02X}  {what:<22} {cnt} 条");
+    }
+    let audio = seen.get(&0xF0).copied().unwrap_or(0);
+    println!("\n-- 结论 --");
+    if audio > 0 {
+        println!("   ✓ 音频走 HID 0xF0，和 Fire TV 3rd Gen 一致，麦克风应该能用");
+    } else if seen.keys().any(|r| *r >= 0xE0) {
+        println!("   ? 有厂商私有报文但没有 0xF0 —— 音频可能在别的 report id 上");
+        println!("     把上面整段发回来，能定位到具体是哪个");
+    } else {
+        println!("   ✗ 只有普通按键报文，没有任何音频/私有报文");
+        println!("     它的语音大概不走 HID（可能是 BLE GATT），那条目前没实现");
+    }
+    println!("\n===== 探测结束，把这一整段发回来即可 =====\n");
+    rt.stop();
+    Ok(())
 }

@@ -59,6 +59,9 @@ pub struct Runtime {
     /// 遥控器最近一次发出键报告的时间。屏蔽只在「这一下确实来自遥控器」时生效 ——
     /// 键码跟 Mac 自带键盘是同一套，光看键码必然把用户自己的键一起吞掉。
     pub last_hid_key: Arc<Mutex<Option<Instant>>>,
+    /// 见过哪些 report id、各多少条。换一款遥控器时靠它判断
+    /// 「语音通路是不是我们认识的那条」—— 有 0xF0 才说明音频流对得上。
+    pub seen_rids: Arc<Mutex<std::collections::BTreeMap<u8, u64>>>,
     /// 遥控器现在是否还按着键。macOS 会给按住的键**自动重复**发事件，
     /// 而遥控器只发一次 HID 报告 —— 光靠时间窗口会让重复事件全部漏出去
     /// （麦克风键漏一个就把 Spotlight 拉起来）。按住期间一律吞。
@@ -93,6 +96,7 @@ impl Runtime {
                 recent_ev: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 last_hid_key: Arc::new(Mutex::new(None)),
                 hid_key_held: Arc::new(AtomicBool::new(false)),
+                seen_rids: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
                 dictating: Arc::new(Mutex::new(None)),
                 learned: Arc::new(Mutex::new(Vec::new())),
                 tap: Arc::new(Mutex::new(None)),
@@ -384,6 +388,7 @@ impl Runtime {
         let learned_codes = self.learned.clone();
         let last_hid_key = self.last_hid_key.clone();
         let hid_key_held = self.hid_key_held.clone();
+        let seen_rids = self.seen_rids.clone();
         let dictating = self.dictating.clone();
         let stop = self.stop.clone();
         let tx = self.tx.clone();
@@ -458,6 +463,7 @@ impl Runtime {
                     }
                     let rid = buf[0];
                     let payload = &buf[1..n];
+                    *seen_rids.lock().entry(rid).or_insert(0) += 1;
 
                     match rid {
                         RID_AUDIO => {

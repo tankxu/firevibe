@@ -121,22 +121,6 @@ impl FireVibe {
                             ))),
                     )
                     .child(hline())
-                    // 换一款遥控器
-                    .child(
-                        group_row()
-                            .child(row_icon("keyboard"))
-                            .child(row_text(
-                                "遥控器适配",
-                                Some("用的不是 Fire TV Alexa Voice Remote 3rd Gen 时，在这里选设备、重新认键"),
-                            ))
-                            .child(mini2("to-adapt2", "打开").on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.screen = Screen::Adapt;
-                                    cx.notify();
-                                },
-                            ))),
-                    )
-                    .child(hline())
                     // 说话时的悬浮电平条
                     .child(
                         group_row()
