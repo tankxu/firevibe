@@ -1,7 +1,7 @@
 [package]
 name = "firevibe-ui"
 edition = "2021"
-version = "0.1.1"
+version = "0.1.2-beta.1"
 
 [dependencies]
 firevibe-core = { path = "../core" }

@@ -121,6 +121,22 @@ impl FireVibe {
                             ))),
                     )
                     .child(hline())
+                    // 换一款遥控器
+                    .child(
+                        group_row()
+                            .child(row_icon("keyboard"))
+                            .child(row_text(
+                                "遥控器适配",
+                                Some("用的不是 Fire TV Alexa Voice Remote 3rd Gen 时，在这里选设备、重新认键"),
+                            ))
+                            .child(mini2("to-adapt2", "打开").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.screen = Screen::Adapt;
+                                    cx.notify();
+                                },
+                            ))),
+                    )
+                    .child(hline())
                     // 说话时的悬浮电平条
                     .child(
                         group_row()
@@ -369,30 +385,3 @@ impl FireVibe {
     }
 }
 
-fn row_icon(name: &str) -> AnyElement {
-    div().flex_none().flex().text_color(c(INK3)).child(icon(name, 16.)).into_any_element()
-}
-
-fn row_text(title: &str, hint: Option<&str>) -> AnyElement {
-    let mut d = div()
-        .flex_1()
-        .min_w(px(0.))
-        .flex()
-        .flex_col()
-        .gap(px(2.))
-        .child(
-            div()
-                .text_size(px(13.))
-                .font_weight(w(560.))
-                .child(SharedString::from(title.to_string())),
-        );
-    if let Some(h) = hint {
-        d = d.child(
-            div()
-                .text_size(px(11.5))
-                .text_color(c(INK3))
-                .child(SharedString::from(h.to_string())),
-        );
-    }
-    d.into_any_element()
-}

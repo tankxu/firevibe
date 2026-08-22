@@ -170,6 +170,12 @@ impl Runtime {
         )
     }
 
+    /// 按键测绘模式。开着时每次按下只上报 `Event::Learned(key)`，不执行任何动作 ——
+    /// 换一款遥控器时用它重新认键。
+    pub fn set_learn(&self, on: bool) {
+        self.learn.store(on, Ordering::Relaxed);
+    }
+
     /// 实时电平（0~1），界面画电平条用
     pub fn level(&self) -> f32 {
         if let Some(r) = self.dictating.lock().as_ref() {
@@ -337,7 +343,8 @@ impl Runtime {
         api.set_open_exclusive(exclusive);
         // 错误分类用 ASCII 前缀，别让界面去匹配中文 ——
         // 原来消息里永远带「输入监控」四个字，结果「设备没连上」也被显示成权限问题。
-        let dev = api.open(VID, PID).map_err(|e| {
+        let (vid, pid) = self.cfg.read().device_ids();
+        let dev = api.open(vid, pid).map_err(|e| {
             let raw = e.to_string();
             let kind = if raw.contains("not permitted") || raw.contains("0xE00002E2") {
                 "HID_NOT_PERMITTED"

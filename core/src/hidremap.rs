@@ -18,15 +18,30 @@
 use anyhow::{anyhow, Context, Result};
 use std::process::Command;
 
-/// 遥控器的 USB 标识 —— 映射只对这台设备生效，不碰用户自己的键盘
-const VID: u16 = 0x0171;
-const PID: u16 = 0x0421;
+/// 遥控器的 USB 标识 —— 映射只对这台设备生效，不碰用户自己的键盘。
+/// 可被配置覆盖（见 Config::device_ids），所以这里是运行时传进来的。
+pub const VID_DEFAULT: u16 = crate::device::VID;
+pub const PID_DEFAULT: u16 = crate::device::PID;
+static IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(
+    ((VID_DEFAULT as u32) << 16) | PID_DEFAULT as u32,
+);
+
+/// 设置映射要匹配的设备。启动时按配置调一次。
+pub fn set_ids(vid: u16, pid: u16) {
+    IDS.store(((vid as u32) << 16) | pid as u32, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn ids() -> (u16, u16) {
+    let v = IDS.load(std::sync::atomic::Ordering::Relaxed);
+    ((v >> 16) as u16, (v & 0xffff) as u16)
+}
 
 /// 麦克风键在 HID 里的来源 usage：Consumer page 0x0C，usage 0x0221 (AC Search)
 const SRC_MIC: u64 = 0x0C00_00_0221;
 
 fn matching() -> String {
-    format!("{{\"ProductID\":0x{PID:04x},\"VendorID\":0x{VID:04x}}}")
+    let (vid, pid) = ids();
+    format!("{{\"ProductID\":0x{pid:04x},\"VendorID\":0x{vid:04x}}}")
 }
 
 /// 键名 → HID Keyboard page (0x07) 的 usage。只放修饰键 ——
@@ -118,8 +133,18 @@ mod tests {
     }
 
     #[test]
+    /// 默认值和覆盖写在同一个测试里 —— IDS 是全局的，
+    /// 拆成两个测试并行跑会互相踩。
     fn matching_dict_targets_the_remote() {
         let m = matching();
-        assert!(m.contains("0x0421") && m.contains("0x0171"), "{m}");
+        assert!(m.contains("0x0421") && m.contains("0x0171"), "默认值不对: {m}");
+
+        set_ids(0x1234, 0x5678);
+        let m = matching();
+        assert!(m.contains("0x1234") && m.contains("0x5678"), "覆盖没生效: {m}");
+
+        set_ids(super::VID_DEFAULT, super::PID_DEFAULT);
+        let m = matching();
+        assert!(m.contains("0x0421") && m.contains("0x0171"), "还原失败: {m}");
     }
 }

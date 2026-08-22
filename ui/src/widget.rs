@@ -3,6 +3,7 @@
 
 use crate::theme::*;
 use gpui::{
+    AnyElement,
     div, prelude::*, px, svg, App, Div, FontWeight, Hsla, IntoElement, RenderOnce, SharedString,
     Stateful, Window,
 };
@@ -402,4 +403,58 @@ pub fn spacer() -> Div {
 
 pub fn hline() -> Div {
     div().h(px(1.)).bg(c(LINE))
+}
+
+
+// ── 设置/适配页里的「一行」构件 ──
+
+pub fn row_icon(name: &str) -> AnyElement {
+    div().flex_none().flex().text_color(c(INK3)).child(icon(name, 16.)).into_any_element()
+}
+
+pub fn row_text(title: &str, hint: Option<&str>) -> AnyElement {
+    let mut d = div()
+        .flex_1()
+        .min_w(px(0.))
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(
+            div()
+                .text_size(px(13.))
+                .font_weight(w(560.))
+                .child(SharedString::from(title.to_string())),
+        );
+    if let Some(h) = hint {
+        d = d.child(
+            div()
+                .text_size(px(11.5))
+                .text_color(c(INK3))
+                .child(SharedString::from(h.to_string())),
+        );
+    }
+    d.into_any_element()
+}
+
+/// 标题和说明都是运行时拼出来的字符串时用这个
+pub fn row_text2(title: impl Into<String>, hint: impl Into<String>) -> AnyElement {
+    div()
+        .flex_1()
+        .min_w(px(0.))
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .child(
+            div()
+                .text_size(px(13.))
+                .font_weight(w(560.))
+                .child(SharedString::from(title.into())),
+        )
+        .child(
+            div()
+                .text_size(px(11.5))
+                .text_color(c(INK3))
+                .child(SharedString::from(hint.into())),
+        )
+        .into_any_element()
 }

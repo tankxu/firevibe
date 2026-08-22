@@ -20,10 +20,19 @@ cargo build --release -p firevibe-ui
 echo "▸ 生成图标"
 python3 design/icon/gen.py
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+# ⚠️ 必须加 timeout + 独立的 user-data-dir：共用默认 profile 时，
+# 上一次没退干净的实例会持有锁，新实例就一直挂着不返回（踩过，整条打包卡死，
+# 而且会攒下一堆僵尸 chrome 进程）。渲不出来就沿用现有图标，不阻塞打包。
 if [ -x "$CHROME" ]; then
-  "$CHROME" --headless --disable-gpu --hide-scrollbars --default-background-color=00000000 \
-    --window-size=1024,1024 --screenshot="design/icon/icon-1024.png" \
-    "file://$PWD/design/icon/_render.html" 2>/dev/null
+  CHROME_TMP=$(mktemp -d)
+  if ! timeout 60 "$CHROME" --headless --disable-gpu --hide-scrollbars \
+      --no-first-run --no-default-browser-check \
+      --user-data-dir="$CHROME_TMP" --default-background-color=00000000 \
+      --window-size=1024,1024 --screenshot="design/icon/icon-1024.png" \
+      "file://$PWD/design/icon/_render.html" 2>/dev/null; then
+    echo "  (Chrome 渲图标失败或超时，沿用现有 icon-1024.png)"
+  fi
+  rm -rf "$CHROME_TMP"
 else
   echo "  (没有 Chrome，沿用现有 icon-1024.png)"
 fi

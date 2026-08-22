@@ -348,13 +348,19 @@ impl Default for VoiceConfig {
 /// 只按名字前缀挑，真正的设备查找在 voice/audio 里做。
 pub fn preferred_voice_device() -> String {
     const OURS: &str = crate::audiodriver::DEVICE_NAME;
-    if crate::audio::input_devices()
-        .iter()
-        .any(|d| d.name.starts_with(OURS))
-    {
+    let devs = crate::audio::input_devices();
+    let has = |n: &str| devs.iter().any(|d| d.name.starts_with(n));
+    // 自己那块装了就用它
+    if has(OURS) {
         return OURS.into();
     }
-    "BlackHole".into()
+    // 自己那块没装、但人家已经有 BlackHole —— 尊重现状，别逼他再装一块
+    if has("BlackHole") {
+        return "BlackHole".into();
+    }
+    // 两块都没有：指向自己那块。界面上的「安装」按钮装的就是它
+    //（应用自带驱动），退回 BlackHole 会让人以为得去别处下载。
+    OURS.into()
 }
 
 // ---------------- 应用设置 ----------------
@@ -420,6 +426,16 @@ pub struct Settings {
     /// 说话时在屏幕底部显示那条悬浮电平条
     #[serde(default = "default_true")]
     pub show_level_hud: bool,
+    /// 遥控器的 USB 标识覆盖（十六进制字符串，比如 "0x0171"）。
+    ///
+    /// 为什么留这个口子：平替遥控器要在 Fire TV 上开机即用，就得实现 Amazon 那套
+    /// 私有语音报文，所以**协议**很可能是一样的；但 VID/PID 恰恰是电视不查的东西，
+    /// 厂商完全可能填自己的。协议对得上、只是标识不同的话，填在这里就能用，
+    /// 不用改代码重编。用 `firevibe-cli --hid-list` 查你的设备是多少。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_vid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_pid: Option<String>,
 }
 fn default_true() -> bool {
     true
@@ -447,6 +463,8 @@ impl Default for Settings {
             prev_input_id: None,
             last_battery: None,
             show_level_hud: true,
+            device_vid: None,
+            device_pid: None,
         }
     }
 }
@@ -505,6 +523,22 @@ pub fn config_path() -> PathBuf {
 }
 
 impl Config {
+    /// 要打开的遥控器 USB 标识。配置里填了就用配置的，否则用实测那款的默认值。
+    /// 容忍 "0x0171" / "0171" / "371"（十进制）几种写法。
+    pub fn device_ids(&self) -> (u16, u16) {
+        fn parse(v: &Option<String>, fallback: u16) -> u16 {
+            let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+                return fallback;
+            };
+            let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+            u16::from_str_radix(s, 16).unwrap_or(fallback)
+        }
+        (
+            parse(&self.settings.device_vid, crate::device::VID),
+            parse(&self.settings.device_pid, crate::device::PID),
+        )
+    }
+
     /// 麦克风键要不要在 HID 设备层映射成修饰键，映射成哪个。
     ///
     /// 不做成独立设置项 —— 它就是「第三方语音输入」这个动作的**实现方式**：
