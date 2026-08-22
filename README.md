@@ -1,194 +1,164 @@
+<div align="center">
+
+<img src="design/shots/icon.png" width="120" alt="FireVibe">
+
 # FireVibe
 
-把 Fire TV 遥控器（Alexa Voice Remote，3rd Gen）变成 Mac 的**遥控器 + 麦克风**。
+**把 Fire TV 遥控器变成 Mac 的遥控器 + 麦克风**
 
-```
-firevibe/
-├── core/     协议、配置、动作执行、语音（跨平台）
-├── cli/      命令行：测绘按键 / 抓原始报文
-├── ui/       GPUI 桌面界面（macOS）
-└── design/   设计稿（mockup.html 是界面的唯一依据）
-```
+用躺在抽屉里的 Fire TV 遥控器控制 Mac：切歌、调音量、翻页、一键唤起常用应用，
+按住麦克风键说话直接出字。
 
-## 它能干什么
+[下载最新版](https://github.com/tankxu/firevibe/releases/latest) · [开发笔记](docs/DEVELOPMENT.md)
 
-- **21 个实体按键全部可映射**：映射键盘按键、输入文字、打开应用、跑 AppleScript、执行 shell 命令
-- 每个键**短按 / 长按各一个动作**，可整键禁用；多套方案（profile）随时切换
-- **「外部语音 app」动作**：发一个快捷键去唤起闪电说 / VoiceInput 这类语音输入法，
-  由它识别并把文字打进当前焦点。支持「敲一下」和「按住期间保持按下」两种模式 ——
-  后者伺候「按着说」型交互，普通 `映射按键` 做不到（它是按下松开一体的）。
-- **麦克风当电脑麦克风**：遥控器的语音键把 Opus 流解码后灌进虚拟声卡（BlackHole），
-  支持「点一下开始/停止」和「按住说话」两种用法
-- **没配动作的键自动直通，不用配就有效**：方向键 / OK / 返回走键盘按键，
-  音量 / 静音 / 播放暂停 / 快进快退走系统媒体键（有原生音量 HUD）。
-  快进快退映到「下一曲 / 上一曲」而不是 seek —— 后者在 macOS 上几乎没有 app 认。
+<img src="design/shots/main.png" width="820" alt="界面">
 
-## 跑起来
+</div>
 
-打成 app（图标、名字、稳定的权限身份都靠它）：
+## 支持的遥控器
 
-```bash
-./package.sh                      # → target/FireVibe.app
-```
+| 型号 | 状态 |
+|---|---|
+| **Fire TV Alexa Voice Remote（3rd Gen）** — VID `0x0171` / PID `0x0421` | ✅ 实测通过，21 个键全部测绘 |
+| 其它 Fire TV 遥控器（Lite / Pro / 老款） | ⚠️ 没测过。蓝牙能配上就能读到按键，但键位映射、麦克风和硬件层映射都是按 3rd Gen 的 ID 写的 |
 
-或者直接跑二进制：
+遥控器**一次只能配一台设备**。配 Mac 之前先把 Fire TV Stick 断电，否则它会被抢回去。
+另外必须用 **1.5V 碱性 AAA 电池** —— 1.2V 充电电池会让蓝牙射频供电不足，表现是时连时断。
 
-```bash
-cargo run --release -p firevibe-ui        # 界面
-cargo run --release -p firevibe-cli -- --map     # 测绘按键 usage
-cargo run --release -p firevibe-cli -- --sniff   # 看原始 HID 报文
-```
+## 能干什么
 
-### ⚠ 签名必须用真证书，别用 ad-hoc
+**每个键都能改，短按长按各一个动作**
 
-`package.sh` 会自动挑 `security find-identity -p codesigning` 找到的第一个身份。
-**不要退回 `codesign -s -`**：ad-hoc 签名的 designated requirement 是写死的 cdhash，
-而 TCC 就是按它记授权的 —— cdhash 每次重建都变，于是授权静默失效，
-可系统设置里那条开关**仍然显示是开着的**，根本看不出问题。
+21 个实体键随便配：映射成键盘按键、输入一段文字、打开某个应用、跑 AppleScript、执行 shell 命令。
+每个键可以单独禁用。多套方案随时切换 —— 比如写代码一套、看视频一套。
 
-用证书签，DR 变成 `identifier + 证书`，重建不失效。验证：
+**没配的键自动直通，装上就能用**
 
-```bash
-codesign -d --requirements - "target/FireVibe.app" | grep designated   # 不该出现 cdhash
-```
+方向键 / OK / 返回当键盘用；音量 / 静音 / 播放暂停 / 快进快退走系统媒体键，
+**有 macOS 原生的音量 HUD**。快进快退映到「下一曲 / 上一曲」而不是快进几秒 ——
+后者在 macOS 上几乎没有应用认。
 
-已经踩进去了：`tccutil reset ListenEvent com.tankxu.firevibe`，再去设置里勾一次。
-界面上那条警示里也有个「重置授权」按钮干这件事。
+**按住麦克风键说话，文字直接进输入框**
 
-**必须给「输入监控」权限**（系统设置 › 隐私与安全性 › 输入监控），
-授权后要**完全退出再重开**才生效 —— 界面上打不开遥控器时会直接提示并给一个跳转按钮。
+三种方式，按你的习惯挑：
 
-配对：遥控器一次只能配一台设备，配 Mac 前先把 Fire TV Stick 断电。
-必须用 1.5V 碱性 AAA，1.2V 充电电池会让 BLE 射频 brownout。
+| 方式 | 谁做识别 | 特点 |
+|---|---|---|
+| **内置语音转文字** | macOS 自带（离线） | 不装任何东西，不联网，中文原生。按住说话、松手出字 |
+| **喂给第三方语音输入工具** | 你现在用的那个 | 把麦克风键在硬件层变成一个修饰键，和你按键盘完全一样 |
+| **当成一支麦克风** | 任何应用 | 遥控器音频进虚拟声卡，会议、录音、语音输入都能用它 |
 
-## 协议要点
+**软遥控器跟手亮**
 
-完整逆向记录在 `~/LocalDev/firetv-remote-mac/NOTES.md`。几条容易踩的：
+界面左边那只遥控器会实时高亮你在实体遥控器上按下的键 —— 配键时不用猜「这颗是哪个」。
+点软遥控器上的键也会直接执行它配好的动作。
 
-- 语音走 **BLE HID vendor report**，不走 GATT。开麦 = `SetReport(Output, 0xF2, [01 01 00×8])`，
-  麦克风是**热的**，发一次就一直吐流，退出前必须发 `[01 00 ...]` 关掉。
-- 编码是 **Opus**（CELT-only / WB 16kHz / 单声道 / 20ms / 32kbit/s），不是 IMA ADPCM ——
-  80 字节/帧这个尺寸跟 ADPCM 撞了容易误判，以 TOC 字节 `0xB8` 为准。
-- 几个反直觉的 usage：OK = `0x58` Keypad Enter（不是 Return）、返回 = 键盘页 `0x00F1`
-  （Amazon 私有，不是 Esc）、TV = `0x008D` Program Guide。
-  四个 App 快捷键走 vendor report `0xEF`（页 `0xFF00`），按下发 `A1`~`A4`。
-- ⚠️ **GATT 特征 `CFBFA004` 是 OTA 的 VENDOR_CMD，上面有 `WIPE=12`/`WIPE_UNPAIR=14`** ——
-  盲扫 opcode 会把遥控器擦掉。本项目全程只走 HID，不碰 GATT。
+<div align="center">
+<img src="design/shots/edit-dialog.png" width="420" alt="配置某个键">
+<img src="design/shots/settings.png" width="420" alt="设置">
+</div>
 
-## 界面
+## 安装
 
-`design/mockup.html` 是**定稿**，GPUI 界面按它 1:1 实现，改界面前先改设计稿。
+1. 到 [Releases](https://github.com/tankxu/firevibe/releases/latest) 下载 zip，解压，把 **FireVibe.app** 拖进「应用程序」
 
-窗口用系统的透明标题栏（`appears_transparent`）：整条系统标题栏隐掉，
-顶部留 40px 可拖拽条给红绿灯浮着，页内没有品牌标题，设置按钮在状态行最右端。
-内容整体最大宽度 1280px 居中，遥控器那一栏 300px、遥控器在栏内居中。
-顶栏和左侧遥控栏都固定不滚，只有右侧那列滚（遥控栏在窗口太矮时自己滚一点）。
-卡片 hover 是按帧插值的 140ms 缓出过渡；图上按键**鼠标按住会凹下去**（压暗+去投影+收 1px），
-**实体遥控器按下则是亮起来** —— 前者模拟手感，后者用来指示「刚按的是哪个键」。
+2. ⚠️ **首次打开会被 macOS 拦下来**（这个包没做 Apple 公证）。
+   **右键点图标 →「打开」**，弹框里再确认一次就好。等价的命令行写法：
 
-图标：`design/icon/gen.py` 生成 `icon.svg`，改图标改脚本、别手改 svg；
-`package.sh` 会自动重新生成、转 `.icns`、装进 bundle。
-`design/demo-config.json` 是设计稿里那套演示状态（含禁用键、AppleScript、shell 命令），
-想复现截图就拷到 `~/Library/Application Support/firevibe/config.json`。
+   ```bash
+   xattr -dr com.apple.quarantine "/Applications/FireVibe.app"
+   ```
 
-自检用的启动开关（只影响首帧，方便截图核对）：
+3. 给权限，**系统设置 › 隐私与安全性**：
 
-```bash
-FIREVIBE_WIN=1060x1360 \
-FIREVIBE_BOOT=settings|add|profile|menu:app2|hover:app1|dialog:app1:long \
-  cargo run -p firevibe-ui
-```
+   | 权限 | 干什么用 | 什么时候要 |
+   |---|---|---|
+   | **输入监控** | 读遥控器按键 | 必需 |
+   | **辅助功能** | 帮你按键盘、打字 | 必需 |
+   | **语音识别** | 内置语音转文字 | 用到时会自己弹框 |
 
-## 自带语音转文字（不依赖任何第三方）
+   > 勾完「输入监控」要**完全退出应用再重开**才生效。界面上读不到遥控器时会直接提示，并给一个跳转按钮。
 
-`ActionType::VoiceDictate` —— 按住遥控器说话，松手把识别出的文字打进当前焦点。
-用系统的 `SFSpeechRecognizer`，**离线**（`requiresOnDeviceRecognition`）、中文原生、不用下模型。
+4. 蓝牙里配对遥控器：遥控器上**同时按住「主页」和「返回」** 进入配对，然后在
+   系统设置 › 蓝牙 里连上它。
 
-**走「文件识别」而不是实时 buffer**：按住期间把解码后的 PCM 攒在内存，松手写一个临时
-WAV 再识别。省掉构造 `AVAudioPCMBuffer` 那一大坨 unsafe，而且能用 `say` 合成语音自测。
-代价是没有实时中间结果 —— 对「按住说话、松手出字」这个用法无所谓。
+## 语音输入怎么用
 
-**它完全不碰虚拟声卡和系统输入设备** —— 直接吃解码后的 PCM。这是它相对
-「喂第三方工具」最大的好处：不用把系统默认输入切走，你的真麦克风一直可用。
+### 内置语音转文字（推荐先试这个）
 
-需要一次「语音识别」权限（Info.plist 的 `NSSpeechRecognitionUsageDescription`）。
-**裸二进制拿不到这个权限** —— 没有 Info.plist，系统不会弹授权框。只能从
-打好包的 app 里申请：设置 › 语音转文字 › 请求授权。
+不用装任何东西。给麦克风键配上「语音转文字」，按住说话、松手，文字直接打进当前输入框。
+识别在本机离线完成，不联网。第一次用会弹一次「语音识别」授权。
 
-设置里还有识别语言（zh-CN / en-US）和「识别后自动回车」——
-后者在 agent 里就是说完直接发出去。
+设置里可以选识别语言，还有「识别后自动回车」—— 在 AI agent 里就是说完直接发出去。
+说话时屏幕下方会浮出一条电平条，让你知道确实在收音。
 
-## 语音输入怎么落到 agent 里
+### 喂给你已经在用的语音输入工具
 
-Claude Code、Claude 桌面版这类 agent **没有「音频输入」的概念**，只认「文字进焦点框」。
-所以音频和 agent 之间必须有个东西把语音变成击键。三条路：
+如果你有顺手的语音输入工具，给麦克风键配「第三方语音输入」，选一个修饰键
+（要和那个工具里设的热键一致）。
 
-| 路线 | 谁做识别 | 要改系统输入设备 | 状态 |
-|---|---|---|---|
-| 灌 BlackHole，靠第三方输入法 | 豆包输入法等 | **要**（全局副作用）| 可用，见下 |
-| 发快捷键唤起外部语音 app | 闪电说 / VoiceInput | 不要 | **已做** |
-| firevibe 自己识别再打字 | 系统 SFSpeechRecognizer（离线） | 不要 | **已做** |
+按下麦克风键时，那个键会在**硬件层**直接变成你选的修饰键 —— 系统收到的和你按真键盘
+完全一样。这一点很关键：有些工具只认硬件来源的按键，软件合成的它收不到。
 
-第一条是 [mi_remote_control](https://github.com/godarrenw/mi_remote_control) 的路子，
-省事但要把 系统设置 › 声音 › 输入 切成 BlackHole 2ch —— 一切过去，你的真麦克风
-对所有 app 就失效了（会议、录屏全在听 BlackHole），用完得手动切回来。
+> 这个映射只作用于**这台遥控器**，你自己的键盘完全不受影响。应用退出时会自动还原。
 
-第二条不动任何系统设置：给麦克风键配「外部语音 app」动作，填上那个 app 的快捷键。
-**注意 Fn 和右 Command 合成无效** —— macOS 里合成修饰键码不更新全局修饰位，
-这是系统行为改不了。去那个 app 里把快捷键改成普通组合键（F13 或 ⌥⌘Space）。
+### 当成一支普通麦克风
 
-## 麦克风键为什么会弹 Spotlight
+界面上点「安装」装一块自带的虚拟声卡 **FireVibe Mic**（需要管理员密码），
+之后任何应用都能把它当麦克风选。遥控器的语音键一按，声音就进去了。
 
-麦克风键的 HID usage 是 **Consumer `0x0221` = AC Search**，macOS 自己就把这个
-usage 当「搜索键」→ 弹 Spotlight。而我们**打不开独占 HID**（独占要 root），
-所以系统和 firevibe 同时收到这个键。
+<details>
+<summary>为什么要自带一块声卡，不用现成的 BlackHole？</summary>
 
-注意这跟 ⌘Space 那个符号热键无关 —— 实测本机 `AppleSymbolicHotKeys` 里
-Spotlight（id 64）是 `enabled = 0`，Spotlight 照样弹，说明走的是更底层的路径，
-改设置压不住。
+因为语音输入工具通常会把传输类型标记为「虚拟」的声卡从麦克风列表里过滤掉，
+BlackHole 就是这样被漏掉的 —— 它压根不出现在候选里。
 
-唯一的解法是在事件层拦掉。先用诊断工具看清系统生成了什么事件：
+`FireVibe Mic` 基于 BlackHole 改了一处：让它自称 USB 设备。这样那些工具就认它了。
+整个改动就一行，记录在 [`driver/build.sh`](driver/build.sh)。
+
+</details>
+
+## 常见问题
+
+**按麦克风键弹出了 Spotlight？**
+这个键的 HID 用途码是「搜索」，macOS 自己就会响应它。FireVibe 会在事件层拦掉 ——
+而且只在**确认这一下来自遥控器**时才拦，你键盘上的搜索键不受影响。
+
+**遥控器时连时断？**
+换 1.5V 碱性电池。1.2V 充电电池撑不住蓝牙射频的峰值电流。
+
+**权限明明开着，却说没有权限？**
+如果你是自己从源码构建的，且用了临时（ad-hoc）签名，每次重新构建都会掉授权 ——
+系统设置里那条开关**看着还是开的**。设置页里有个「重置授权」按钮可以修。
+Releases 里下载的包不会有这个问题。
+
+**升级后按键没反应？**
+同上，重新勾一次「输入监控」。你的按键配置不会丢。
+
+**装的虚拟声卡怎么卸掉？**
 
 ```bash
-firevibe-cli --tap          # 然后按遥控器上的键
+sudo rm -rf /Library/Audio/Plug-Ins/HAL/FireVibeMic.driver && sudo killall -9 coreaudiod
 ```
 
-它**只打印非字符键**（功能/媒体键区、修饰键、systemDefined），你打的字一个都不记录。
-需要「辅助功能」权限。排障时可以 `FIREVIBE_TAP_ALL=1` 关掉过滤（会看到所有按键）。
+**硬件层映射残留了怎么办？**（正常退出会自动清，被强杀才会留）
 
-拿到确切事件后，用 `core/src/tap.rs` 的 `spawn(..., listen_only=false, ...)`
-把它吞掉 —— tap 跑在自己的线程和 CFRunLoop 上，不碰 gpui 的主循环。
+```bash
+hidutil property --matching '{"ProductID":0x0421,"VendorID":0x0171}' --set '{"UserKeyMapping":[]}'
+```
 
-### 其它平台的语音助手
+重启 Mac 也会清掉。
 
-- **macOS**：Siri，`open -b com.apple.siri.launcher`（已作为麦克风键短按的默认动作）。
-  想要「语音转文字进焦点框」其实**系统听写**更对路 —— 它直接打字，而 Siri 是命令助手。
-- **Windows 11**：`Win+H` 是语音输入（直接打字进焦点框，对应听写）；
-  `Win+Ctrl+S` 是 Voice Access。Cortana 已经废弃了，别指望。
-- **Linux**：没有系统级语音助手，只有第三方（nerd-dictation 之类）。
+## 已知限制
 
-后两个目前是纸面对应 —— 按键注入只做了 macOS（见已知边界）。
+- **只有 macOS**。Windows / Linux 没做按键注入
+- **没做 Apple 公证**，所以首次打开要绕一下（见上面第 2 步）
+- 只在 **Fire TV Alexa Voice Remote 3rd Gen** 上实测过
+- 云端语音识别（火山引擎 / 阿里 / FunASR）还没接，目前只有系统的离线识别
 
-## 说话时自动切系统输入设备
+## 许可证
 
-靠输入法/外部 app 做识别时，它们听的是**系统默认输入**。所以默认开启：
-按下说话键把系统默认输入切到虚拟声卡，说完 400ms 后切回原来的设备
-（延迟一点是为了不把尾音截断）。设置里可关。
+FireVibe 自身是 [MIT](LICENSE)。
 
-实测切换耗时 **3~13ms**（`AudioObjectSetPropertyData` 是异步的，
-返回后要轮询才知道生效；见 `core/src/audio.rs` 的 `switch_timing` 测试）。
-注意消费方 app 未必立刻跟着换流 —— 那部分延迟不在我们手里。
-另外某些虚拟驱动（本机的 "Virtual Audio"）压根不接受当默认输入，切了 2 秒也不生效。
-
-⚠️ 副作用：切走期间你的真麦克风对所有用默认输入的 app 都失效。
-`Runtime::stop()` 和关掉这个开关时都会还原。
-
-## 已知边界
-
-- 界面只做了 macOS。**按键注入也只有 macOS**：`inject/linux.rs`、`inject/windows.rs`
-  从来没写过（mod.rs 里那两个 cfg 分支指向不存在的文件，非 macOS 压根编译不过），
-  现已统一落到 fallback —— 别的功能都在，只有注入报「这个平台没有按键注入」。
-- 「开机启动」写 `~/Library/LaunchAgents/com.tankxu.firevibe.plist`，未实机验证。
-- 按键注入（含媒体键）还需要**「辅助功能」权限**，和读 HID 的「输入监控」是两回事。
-- 「检查更新」需要在设置里配一个 JSON 清单地址（`settings.update_endpoint`），
-  格式 `{"version":"0.2.0","url":"...","notes":"..."}`；没配就显示「未配置更新源」。
+自带的虚拟声卡基于 [BlackHole](https://github.com/ExistentialAudio/BlackHole)（GPL-3.0），
+构建时从上游获取，改动只有一处传输类型 —— 详见 [`driver/NOTICE.md`](driver/NOTICE.md)。
