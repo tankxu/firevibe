@@ -197,7 +197,7 @@ fn main() -> anyhow::Result<()> {
 
     if has("--help") || has("-h") {
         println!(
-            "firevibe-cli [选项]\n\
+            "firecli [选项]\n\
              \x20 --list-devices     列出音频输出设备\n\
              \x20 --exclusive        独占打开设备（系统收不到原始按键）\n\
              \x20 --device <前缀>    覆盖输出设备\n\

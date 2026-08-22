@@ -114,8 +114,8 @@ echo
 # CLI 一起编出来 —— 排障和「换一款遥控器」（--adapt）都靠它。
 # 不放进 bundle 内部：从 shell 跑 .app 里的可执行文件，TCC 会把权限归责到
 # 父进程（shell）直接 abort，踩过。放在 zip 里和 .app 并列。
-cargo build --release -p firevibe-cli
-cp target/release/firevibe-cli "$(dirname "$APP")/firevibe-cli"
+cargo build --release -p firevibe-cli  # 产物叫 firecli
+cp target/release/firecli "$(dirname "$APP")/firecli"
 
 echo "好了：$APP"
 echo "拖到 /Applications，然后到 系统设置 › 隐私与安全性 › 输入监控 里勾上它。"
