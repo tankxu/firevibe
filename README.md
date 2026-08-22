@@ -176,7 +176,17 @@ hidutil property --matching '{"ProductID":0x0421,"VendorID":0x0171}' --set '{"Us
 
 ## 想改代码？
 
-工程结构、协议逆向记录、构建和签名的注意事项都在
+**Rust + [GPUI](https://www.gpui.rs)**（Zed 的 GUI 框架），界面和逻辑都是原生的，
+没有 Electron / WebView。音频、HID、事件注入直接调 CoreAudio / IOKit / CoreGraphics。
+
+```
+core/     协议、配置、动作执行、语音识别
+cli/      命令行：按键测绘、原始报文嗅探、各类自检
+ui/       桌面界面
+driver/   虚拟声卡的构建脚本
+```
+
+工程细节、协议逆向记录、构建和签名的注意事项都在
 [**开发笔记**](docs/DEVELOPMENT.md) 里。
 
 ## 许可证
