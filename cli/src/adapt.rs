@@ -88,8 +88,8 @@ fn step2_map_keys() -> anyhow::Result<()> {
         return step3_watch_reports();
     }
 
-    let mut cfg = Config::load();
-    cfg.voice.enabled = false;
+    // 探测不 start_voice()，不会建 sink，不用动配置
+    let cfg = Config::load();
     let (rt, rx) = Runtime::new(cfg);
     if let Err(e) = rt.start() {
         println!("  打不开遥控器：{e:#}");
@@ -134,8 +134,7 @@ fn step2_map_keys() -> anyhow::Result<()> {
 }
 
 fn step3_watch_reports() -> anyhow::Result<()> {
-    let mut cfg = Config::load();
-    cfg.voice.enabled = false;
+    let cfg = Config::load();
     let (rt, rx) = Runtime::new(cfg);
     if rt.start().is_err() {
         println!("\n【第三步】跳过（遥控器没连上）");

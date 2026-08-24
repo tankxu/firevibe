@@ -20,15 +20,17 @@ mod imp {
         let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
         Some(FrontApp {
             pid: app.processIdentifier(),
-            name: app.localizedName().map(|s| s.to_string()).unwrap_or_default(),
+            name: app
+                .localizedName()
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
             bundle_id: app.bundleIdentifier().map(|s| s.to_string()),
         })
     }
 
     /// 把某个进程切回前台。返回是否发出去了。
     pub fn activate(pid: i32) -> bool {
-        let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
-        else {
+        let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
             return false;
         };
         app.activateWithOptions(NSApplicationActivationOptions::empty())

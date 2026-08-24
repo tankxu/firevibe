@@ -46,11 +46,11 @@ fn usage_name(k: Key) -> Option<&'static str> {
         (PAGE_KEYBOARD, 0x0051) => "下",
         (PAGE_KEYBOARD, 0x0050) => "左",
         (PAGE_KEYBOARD, 0x004F) => "右",
-        (PAGE_KEYBOARD, 0x0058) => "OK",          // Keypad Enter，不是 0x28
-        (PAGE_KEYBOARD, 0x00F1) => "返回",         // Amazon 私有值，不是 Esc
+        (PAGE_KEYBOARD, 0x0058) => "OK",   // Keypad Enter，不是 0x28
+        (PAGE_KEYBOARD, 0x00F1) => "返回", // Amazon 私有值，不是 Esc
 
-        (PAGE_CONSUMER, 0x0221) => "麦克风",       // AC Search
-        (PAGE_CONSUMER, 0x0223) => "主页",         // AC Home
+        (PAGE_CONSUMER, 0x0221) => "麦克风", // AC Search
+        (PAGE_CONSUMER, 0x0223) => "主页",   // AC Home
         (PAGE_CONSUMER, 0x0040) => "菜单",
         (PAGE_CONSUMER, 0x00B4) => "快退",
         (PAGE_CONSUMER, 0x00CD) => "播放/暂停",
@@ -58,7 +58,7 @@ fn usage_name(k: Key) -> Option<&'static str> {
         (PAGE_CONSUMER, 0x00E2) => "静音",
         (PAGE_CONSUMER, 0x00E9) => "音量+",
         (PAGE_CONSUMER, 0x00EA) => "音量-",
-        (PAGE_CONSUMER, 0x008D) => "TV",    // Program Guide，不是 0x0089
+        (PAGE_CONSUMER, 0x008D) => "TV", // Program Guide，不是 0x0089
 
         (PAGE_VENDOR, 0xA1) => "Prime Video 键",
         (PAGE_VENDOR, 0xA2) => "NETFLIX 键",
@@ -85,8 +85,8 @@ pub fn passthrough(k: Key) -> Option<&'static str> {
         (PAGE_KEYBOARD, 0x50) => "left",
         (PAGE_KEYBOARD, 0x51) => "down",
         (PAGE_KEYBOARD, 0x52) => "up",
-        (PAGE_KEYBOARD, 0x58) => "return",   // 实测：OK 是 Keypad Enter
-        (PAGE_KEYBOARD, 0xF1) => "escape",   // 实测：返回是 0x00F1（Amazon 私有）
+        (PAGE_KEYBOARD, 0x58) => "return", // 实测：OK 是 Keypad Enter
+        (PAGE_KEYBOARD, 0xF1) => "escape", // 实测：返回是 0x00F1（Amazon 私有）
         (PAGE_KEYBOARD, 0x2A) => "backspace",
         (PAGE_KEYBOARD, 0x2B) => "tab",
         (PAGE_KEYBOARD, 0x2C) => "space",

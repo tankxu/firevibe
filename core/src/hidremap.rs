@@ -22,13 +22,15 @@ use std::process::Command;
 /// 可被配置覆盖（见 Config::device_ids），所以这里是运行时传进来的。
 pub const VID_DEFAULT: u16 = crate::device::VID;
 pub const PID_DEFAULT: u16 = crate::device::PID;
-static IDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(
-    ((VID_DEFAULT as u32) << 16) | PID_DEFAULT as u32,
-);
+static IDS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(((VID_DEFAULT as u32) << 16) | PID_DEFAULT as u32);
 
 /// 设置映射要匹配的设备。启动时按配置调一次。
 pub fn set_ids(vid: u16, pid: u16) {
-    IDS.store(((vid as u32) << 16) | pid as u32, std::sync::atomic::Ordering::Relaxed);
+    IDS.store(
+        ((vid as u32) << 16) | pid as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 fn ids() -> (u16, u16) {
@@ -111,7 +113,13 @@ pub fn clear() {
 /// 现在设着映射吗
 pub fn is_set() -> bool {
     Command::new("/usr/bin/hidutil")
-        .args(["property", "--matching", &matching(), "--get", "UserKeyMapping"])
+        .args([
+            "property",
+            "--matching",
+            &matching(),
+            "--get",
+            "UserKeyMapping",
+        ])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("HIDKeyboardModifierMappingDst"))
         .unwrap_or(false)
@@ -137,14 +145,23 @@ mod tests {
     /// 拆成两个测试并行跑会互相踩。
     fn matching_dict_targets_the_remote() {
         let m = matching();
-        assert!(m.contains("0x0421") && m.contains("0x0171"), "默认值不对: {m}");
+        assert!(
+            m.contains("0x0421") && m.contains("0x0171"),
+            "默认值不对: {m}"
+        );
 
         set_ids(0x1234, 0x5678);
         let m = matching();
-        assert!(m.contains("0x1234") && m.contains("0x5678"), "覆盖没生效: {m}");
+        assert!(
+            m.contains("0x1234") && m.contains("0x5678"),
+            "覆盖没生效: {m}"
+        );
 
         set_ids(super::VID_DEFAULT, super::PID_DEFAULT);
         let m = matching();
-        assert!(m.contains("0x0421") && m.contains("0x0171"), "还原失败: {m}");
+        assert!(
+            m.contains("0x0421") && m.contains("0x0171"),
+            "还原失败: {m}"
+        );
     }
 }

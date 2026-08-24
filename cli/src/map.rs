@@ -21,7 +21,6 @@ pub fn run() -> anyhow::Result<()> {
     let mut exclusive = want_exclusive;
     let (rt, rx) = loop {
         let mut cfg = Config::load();
-        cfg.voice.enabled = false;
         cfg.exclusive = exclusive;
         let (rt, rx) = Runtime::new(cfg);
         match rt.start() {

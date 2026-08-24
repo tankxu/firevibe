@@ -37,6 +37,13 @@ impl FireVibe {
         drop(cfg);
 
         let input = new_input(&a.arg, window, cx);
+        let body_in = new_input(&a.body, window, cx);
+        let retries_in = new_input(&a.retries.to_string(), window, cx);
+        let timeout_in = new_input(
+            &(if a.timeout_ms > 0 { a.timeout_ms } else { 2000 }).to_string(),
+            window,
+            cx,
+        );
         self.dialog = Some(EditState {
             slot,
             long,
@@ -48,8 +55,13 @@ impl FireVibe {
             // 说没见过双击触发，所以只作为可选项留着，不当默认。
             dbl: a.arg == "double",
             input,
+            post: a.method.eq_ignore_ascii_case("POST"),
+            body_in,
+            retries_in,
+            timeout_in,
             focus: cx.focus_handle(),
             recording: false,
+            grab: None,
         });
         self.menu_open = None;
         // 打开就是热键类型且还没设过键 → 直接等你按
@@ -250,6 +262,58 @@ if d.long {
             ActionType::Shell => {
                 body = body.child(div().child(field_lab(l.shell_cmd())).child(code_field(d)));
             }
+            ActionType::Http => {
+                let post = d.post;
+                body = body
+                    .child(div().child(field_lab("URL")).child(code_field(d)))
+                    .child(
+                        div().flex().flex_col().gap(px(6.)).child(field_lab("方法")).child(
+                            div()
+                                .flex()
+                                .gap(px(6.))
+                                .child(chip("m-get", "GET", !post).on_click(cx.listener(
+                                    |t, _, _, cx| {
+                                        if let Some(d) = &mut t.dialog {
+                                            d.post = false;
+                                        }
+                                        cx.notify();
+                                    },
+                                )))
+                                .child(chip("m-post", "POST", post).on_click(cx.listener(
+                                    |t, _, _, cx| {
+                                        if let Some(d) = &mut t.dialog {
+                                            d.post = true;
+                                        }
+                                        cx.notify();
+                                    },
+                                ))),
+                        ),
+                    )
+                    .when(post, |b| {
+                        b.child(
+                            div()
+                                .child(field_lab("请求体"))
+                                .child(input_box(&d.body_in)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(12.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(field_lab("重试次数"))
+                                    .child(input_box(&d.retries_in)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(field_lab("超时 (毫秒)"))
+                                    .child(input_box(&d.timeout_in)),
+                            ),
+                    );
+            }
             ActionType::Text => {
                 body = body.child(div().child(field_lab(l.text_arg())).child(code_field(d)));
             }
@@ -362,11 +426,23 @@ if d.long {
             d.input.read(cx).value().to_string()
         }
     }
+    /// 从弹窗当前状态构造完整 Action（含 HTTP 的方法/请求体/重试/超时）
+    fn build_action(&self, cx: &Context<Self>) -> Option<Action> {
+        let arg = self.dialog_arg(cx);
+        let d = self.dialog.as_ref()?;
+        let mut a = to_action(d, &arg);
+        if d.kind == ActionType::Http {
+            a.method = if d.post { "POST".into() } else { "GET".into() };
+            a.body = d.body_in.read(cx).value().to_string();
+            a.retries = d.retries_in.read(cx).value().trim().parse().unwrap_or(0);
+            a.timeout_ms = d.timeout_in.read(cx).value().trim().parse().unwrap_or(0);
+        }
+        Some(a)
+    }
     /// 保存弹窗
     fn save_dialog(&mut self, cx: &mut Context<Self>) {
-        let arg = self.dialog_arg(cx);
+        let Some(a) = self.build_action(cx) else { return };
         let Some(d) = &self.dialog else { return };
-        let a = to_action(d, &arg);
         let (slot, long) = (d.slot, d.long);
         {
             let mut g = self.rt.cfg.write();
@@ -382,9 +458,7 @@ if d.long {
     }
     /// 弹窗里「测试一次」：用当前编辑值直接跑，不落盘
     fn run_dialog_action(&mut self, cx: &mut Context<Self>) {
-        let arg = self.dialog_arg(cx);
-        let Some(d) = &self.dialog else { return };
-        let a = to_action(d, &arg);
+        let Some(a) = self.build_action(cx) else { return };
         let r = self.rt.run_action(&a, true);
         self.toast(if r.is_empty() { "已执行".into() } else { r });
         cx.notify();
@@ -416,10 +490,20 @@ impl FireVibe {
             .border_1()
             .cursor_pointer()
             .on_click(cx.listener(|this, _, window, cx| {
+                let mut err = None;
                 if let Some(dd) = &mut this.dialog {
                     dd.recording = true;
+                    // 起 tap 录制。失败（缺辅助功能权限）也不拦着 ——
+                    // 退回窗口的 on_key_down，只是录不到被别人占用的组合。
+                    match firevibe_core::hotkey::start() {
+                        Ok(g) => dd.grab = Some(g),
+                        Err(e) => err = Some(format!("{e:#}")),
+                    }
                     let h = dd.focus.clone();
                     window.focus(&h);
+                }
+                if let Some(e) = err {
+                    this.toast(format!("录制退回窗口模式（{e}）"));
                 }
                 cx.notify();
             }))
@@ -589,6 +673,22 @@ fn code_field(d: &EditState) -> AnyElement {
         .px(px(12.))
         .py(px(10.))
         .child(Input::new(&d.input).appearance(false))
+        .into_any_element()
+}
+
+/// 和 code_field 一样的外观，但吃任意 InputState（HTTP 那几个字段用）
+fn input_box(input: &gpui::Entity<gpui_component::input::InputState>) -> AnyElement {
+    div()
+        .font_family("Menlo")
+        .text_size(px(12.))
+        .text_color(c(INK))
+        .bg(c(CODE_BG))
+        .border_1()
+        .border_color(c(LINE_STRONG))
+        .rounded(px(9.))
+        .px(px(12.))
+        .py(px(10.))
+        .child(Input::new(input).appearance(false))
         .into_any_element()
 }
 /// 预设芯片：点一下把 code 灌进输入框

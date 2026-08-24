@@ -21,9 +21,9 @@ core-foundation = "=0.10.0"
 # 系统媒体键（音量 / 静音 / 播放 / 上下曲）走 NSEvent systemDefined，
 # CGEvent 造不出这类事件，只能借 AppKit
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSEvent", "NSGraphicsContext", "NSWorkspace", "NSRunningApplication", "objc2-core-graphics"] }
+objc2-app-kit = { version = "0.3", features = ["NSEvent", "NSGraphicsContext", "NSWorkspace", "NSRunningApplication", "objc2-core-graphics", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSButton", "NSControl", "NSView", "NSResponder", "NSApplication", "NSWindow", "NSImage"] }
 objc2-core-graphics = "0.3"
-objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSURL", "NSLocale", "NSError", "NSArray", "NSObject"] }
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSURL", "NSLocale", "NSError", "NSArray", "NSObject", "NSData"] }
 block2 = "0.6"
 objc2-speech = { version = "0.3", features = [
     "SFSpeechRecognizer", "SFSpeechRecognitionRequest",

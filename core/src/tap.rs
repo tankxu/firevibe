@@ -135,7 +135,14 @@ extern "C" fn on_event(
     };
     let pid = unsafe { CGEventGetIntegerValueField(event, FIELD_SOURCE_PID) };
     let kb_type = unsafe { CGEventGetIntegerValueField(event, FIELD_KEYBOARD_TYPE) };
-    let ev = Ev { kind, code, flags, nx_down, pid, kb_type };
+    let ev = Ev {
+        kind,
+        code,
+        flags,
+        nx_down,
+        pid,
+        kb_type,
+    };
     if let Some(l) = &ctx.log {
         l(ev);
     }
@@ -185,7 +192,11 @@ pub fn spawn(
             CGEventTapCreate(
                 TAP_SESSION,
                 PLACE_HEAD,
-                if listen_only { OPT_LISTEN_ONLY } else { OPT_DEFAULT },
+                if listen_only {
+                    OPT_LISTEN_ONLY
+                } else {
+                    OPT_DEFAULT
+                },
                 m,
                 on_event,
                 ctx as *mut Ctx as *mut c_void,

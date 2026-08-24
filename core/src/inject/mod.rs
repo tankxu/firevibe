@@ -19,7 +19,7 @@ pub trait Injector: Send + Sync {
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::{key_names, new_injector, ns_modifier_alt};
+pub use macos::{key_names, name_of_code, new_injector, ns_modifier_alt};
 
 // Linux(uinput) / Windows(SendInput) 还没写。之前这里是 `mod linux;` / `mod windows;`
 // 但文件从来就不存在 —— 非 macOS 平台压根编译不过。先统一落到 fallback：
@@ -27,4 +27,4 @@ pub use macos::{key_names, new_injector, ns_modifier_alt};
 #[cfg(not(target_os = "macos"))]
 mod fallback;
 #[cfg(not(target_os = "macos"))]
-pub use fallback::{key_names, new_injector};
+pub use fallback::{key_names, name_of_code, new_injector};

@@ -71,6 +71,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
        需要的是「输入监控」(kTCCServiceListenEvent)，那个没有 plist 键，只能用户去勾 -->
   <key>NSSpeechRecognitionUsageDescription</key>
   <string>用来把遥控器麦克风说的话转成文字，打进当前输入框。识别在本机离线完成。</string>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>读取遥控器的电池电量。</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>遥控器的麦克风音频经蓝牙 HID 进来，不使用系统麦克风。</string>
   <key>NSAppleEventsUsageDescription</key>
@@ -85,7 +86,8 @@ PLIST
 # 于是「系统设置里开关还是开着，但应用实际被拒」，极难自查。
 # 用证书签，DR 变成 identifier + 证书，重建也不失效。
 IDENT=$(security find-identity -v -p codesigning 2>/dev/null         | sed -n 's/.*) [0-9A-F]* "\(.*\)"/\1/p' | head -1)
-if [ -n "$IDENT" ]; then
+SIGN=${IDENT:--}   # 没证书就退回 ad-hoc
+
 # 带上我们自己那块虚拟声卡（driver/build.sh 编的）。第三方语音输入工具会把
 # 传输类型为「虚拟」的设备滤掉，所以必须用自建的这块（自称 USB）。
 # 没编过就跳过 —— 界面上会提示去编。
@@ -98,12 +100,24 @@ else
   echo "▸ 没找到 driver/out/FireVibeMic.driver，跳过（先跑 ./driver/build.sh）"
 fi
 
+  # 电量辅助程序：独立进程读 GATT 电池服务（进程内的 CoreBluetooth 起不来，
+# 详见 core/src/battery.rs 的说明）。没 swiftc 就跳过，电量只是不显示。
+if xcrun --find swiftc >/dev/null 2>&1; then
+  # ⚠️ 必须是**裸二进制、由 FireVibe fork/exec 拉起**，不能打成 .app 走 LaunchServices ——
+  # 前者 TCC 归责到 FireVibe，用它那一份蓝牙授权；后者会变成一个独立身份，
+  # 需要用户再点一次「BattProbe 想使用蓝牙」，而且名字莫名其妙。
+  xcrun swiftc -O -o "$APP/Contents/MacOS/battprobe" helper/battprobe.swift
+  echo "▸ 已带上电量辅助程序"
+else
+  echo "  (没有 swiftc，跳过电量辅助程序)"
+fi
+
+if [ -n "$IDENT" ]; then
   echo "▸ 签名（${IDENT}）"
-  codesign --force --deep --sign "$IDENT" "$APP" 2>&1 | sed 's/^/  /'
 else
   echo "▸ ad-hoc 签名（没找到证书；注意每次重建都要重新授权输入监控）"
-  codesign --force --deep --sign - "$APP" 2>&1 | sed 's/^/  /'
 fi
+codesign --force --deep --sign "$SIGN" "$APP" 2>&1 | sed 's/^/  /'
 echo "  designated requirement:"
 codesign -d --requirements - "$APP" 2>&1 | grep designated | sed 's/^/    /'
 if codesign -d --requirements - "$APP" 2>&1 | grep -q 'designated => cdhash'; then

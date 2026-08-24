@@ -16,13 +16,28 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug)]
 pub enum Event {
     /// 按键事件 + 处理结果描述
-    Key { key: Key, down: bool, result: String },
+    Key {
+        key: Key,
+        down: bool,
+        result: String,
+    },
     /// 未识别的 report（学习/调试）
-    Raw { report_id: u8, data: Vec<u8> },
+    Raw {
+        report_id: u8,
+        data: Vec<u8>,
+    },
     /// 学习模式下捕获到的键
     Learned(Key),
+    /// 原始按键边沿（trace_keys 开时每个 down/up 都发，用来诊断长按瞬断）
+    KeyEdge {
+        key: Key,
+        down: bool,
+    },
     Log(String),
-    Connected { product: String, serial: String },
+    Connected {
+        product: String,
+        serial: String,
+    },
     Disconnected(String),
 }
 
@@ -59,6 +74,17 @@ pub struct Runtime {
     /// 遥控器最近一次发出键报告的时间。屏蔽只在「这一下确实来自遥控器」时生效 ——
     /// 键码跟 Mac 自带键盘是同一套，光看键码必然把用户自己的键一起吞掉。
     pub last_hid_key: Arc<Mutex<Option<Instant>>>,
+    /// 关掉后：开局不补关麦、自愈也不发关麦。诊断麦克风时要用 ——
+    /// 不然分不清「设备不吐流」和「我们自己把它关掉了」。
+    pub auto_mic_off: Arc<AtomicBool>,
+    /// 打开后：**每一条**报文都往外发 `Event::Raw`（平时只有 vendor 报文才发）。
+    /// 换遥控器时要看原始字节才能判断按键到底发了什么。
+    pub raw_all: Arc<AtomicBool>,
+    /// 打开后：每个派生出来的 down/up 边沿都发 `Event::KeyEdge`（诊断长按用）
+    pub trace_keys: Arc<AtomicBool>,
+    /// 待下发的 OUTPUT 报文。读线程每圈取一次 —— 设备句柄在那个线程里，
+    /// 外面拿不到，只能这样递进去。
+    pub pending_writes: Arc<Mutex<Vec<Vec<u8>>>>,
     /// 见过哪些 report id、各多少条。换一款遥控器时靠它判断
     /// 「语音通路是不是我们认识的那条」—— 有 0xF0 才说明音频流对得上。
     pub seen_rids: Arc<Mutex<std::collections::BTreeMap<u8, u64>>>,
@@ -68,6 +94,8 @@ pub struct Runtime {
     pub hid_key_held: Arc<AtomicBool>,
     /// 听写录音缓冲。Some 表示正在录 —— 读线程会把解码后的 PCM 也塞进来。
     pub dictating: Arc<Mutex<Option<crate::stt::Recorder>>>,
+    /// 正在录音到文件（按一下开始、再按一下停止）
+    pub recording: Arc<Mutex<Option<crate::recorder::Rec>>>,
     /// 学到的要吞掉的键码
     pub learned: Arc<Mutex<Vec<i64>>>,
     tap: Arc<Mutex<Option<crate::tap::Tap>>>,
@@ -96,8 +124,13 @@ impl Runtime {
                 recent_ev: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 last_hid_key: Arc::new(Mutex::new(None)),
                 hid_key_held: Arc::new(AtomicBool::new(false)),
+                auto_mic_off: Arc::new(AtomicBool::new(true)),
+                raw_all: Arc::new(AtomicBool::new(false)),
+                trace_keys: Arc::new(AtomicBool::new(false)),
+                pending_writes: Arc::new(Mutex::new(Vec::new())),
                 seen_rids: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
                 dictating: Arc::new(Mutex::new(None)),
+                recording: Arc::new(Mutex::new(None)),
                 learned: Arc::new(Mutex::new(Vec::new())),
                 tap: Arc::new(Mutex::new(None)),
                 descriptor: Arc::new(Mutex::new(Vec::new())),
@@ -170,7 +203,12 @@ impl Runtime {
     /// 界面上的听写开关（测试面板用）
     pub fn set_dictating(&self, on: bool) -> String {
         gate_dictation(
-            &self.cfg, &self.status, &self.inj, &self.dictating, &self.tx, on,
+            &self.cfg,
+            &self.status,
+            &self.inj,
+            &self.dictating,
+            &self.tx,
+            on,
         )
     }
 
@@ -271,12 +309,8 @@ impl Runtime {
                 // 允许**最多等 15ms**（tap 回调可以短暂阻塞，这点延迟感知不到）。
                 // 别用 kCGKeyboardEventKeyboardType 去区分设备 ——
                 // 实测那个字段每个事件都不一样，不是稳定的设备 id。
-                let fresh = |win: Duration| {
-                    last_hid
-                        .lock()
-                        .map(|t| t.elapsed() < win)
-                        .unwrap_or(false)
-                };
+                let fresh =
+                    |win: Duration| last_hid.lock().map(|t| t.elapsed() < win).unwrap_or(false);
                 // 按住期间 macOS 会疯狂重复发事件，同样的判定只打一次日志
                 let dbg = std::env::var_os("FIREVIBE_TAP_DEBUG").is_some()
                     && last_say.lock().replace((ev.code, true)) != Some((ev.code, true));
@@ -312,7 +346,11 @@ impl Runtime {
         *self.tap.lock() = Some(t);
         self.log(format!(
             "已接管系统默认行为，屏蔽键码 {:?}（仅遥控器连接时生效）",
-            self.learned.lock().iter().map(|c| format!("0x{c:x}")).collect::<Vec<_>>()
+            self.learned
+                .lock()
+                .iter()
+                .map(|c| format!("0x{c:x}"))
+                .collect::<Vec<_>>()
         ));
         Ok(())
     }
@@ -361,7 +399,11 @@ impl Runtime {
         })?;
 
         let product = dev.get_product_string().ok().flatten().unwrap_or_default();
-        let serial = dev.get_serial_number_string().ok().flatten().unwrap_or_default();
+        let serial = dev
+            .get_serial_number_string()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let mut dbuf = vec![0u8; 4096];
         if let Ok(n) = dev.get_report_descriptor(&mut dbuf) {
             *self.descriptor.lock() = dbuf[..n].to_vec();
@@ -389,7 +431,11 @@ impl Runtime {
         let last_hid_key = self.last_hid_key.clone();
         let hid_key_held = self.hid_key_held.clone();
         let seen_rids = self.seen_rids.clone();
+        let raw_all = self.raw_all.clone();
+        let trace_keys = self.trace_keys.clone();
+        let pending_writes = self.pending_writes.clone();
         let dictating = self.dictating.clone();
+        let recording = self.recording.clone();
         let stop = self.stop.clone();
         let tx = self.tx.clone();
 
@@ -406,8 +452,14 @@ impl Runtime {
                 let mut pcm = vec![0i16; OPUS_FRAME * 6];
                 let mut buf = [0u8; 128];
                 let mut active: HashSet<Key> = HashSet::new();
-                let mut last_ka = Instant::now();
+                // 开局补一发关麦：上次进程若被强杀，遥控器会一直热着、50 帧/秒吐音频，
+                // 一两天吃掉 30% 电；而 `mic_now != mic_was` 两边都 false 时不触发，不补关不掉。
+                // （关麦命令有效，前提是本进程有「输入监控」授权 —— 见 device.rs。）
+                let _ = dev.write(&MIC_OFF);
                 let mut mic_was = false;
+                let mut last_ka = Instant::now();
+                let mut idle_frames = status.audio_frames.load(Ordering::Relaxed);
+                let mut idle_at = Instant::now();
                 // 长按状态机：按下时间 + 是否已触发长按
                 let mut held: HashMap<Key, (Instant, bool)> = HashMap::new();
 
@@ -415,17 +467,45 @@ impl Runtime {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
+                    // 外面递进来的 OUTPUT 报文（--probe-all 的三轮对照用来试开麦）
+                    {
+                        let todo: Vec<Vec<u8>> = std::mem::take(&mut *pending_writes.lock());
+                        for b in todo {
+                            let hex: String =
+                                b.iter().map(|x| format!("{x:02X} ")).collect();
+                            let msg = match dev.write(&b) {
+                                Ok(n) => format!("写 {hex}→ 成功 {n} 字节"),
+                                Err(e) => format!("写 {hex}→ 失败: {e}"),
+                            };
+                            eprintln!("[cmd] {msg}");
+                            let _ = tx.send(Event::Log(msg));
+                        }
+                    }
                     // 开关麦：标志一变立刻下发（读超时 200ms，所以延迟 <=200ms）
                     let mic_now = status.mic_on.load(Ordering::Relaxed);
                     if mic_now != mic_was {
-                        let _ = dev.write(if mic_now { &MIC_ON } else { &MIC_OFF });
+                        let cmd: &[u8] = if mic_now { &MIC_ON } else { &MIC_OFF };
+                        match dev.write(cmd) {
+                            Ok(n) => eprintln!("[mic] {}麦 {cmd:02X?} → 成功 {n} 字节", if mic_now { "开" } else { "关" }),
+                            Err(e) => eprintln!("[mic] {}麦 {cmd:02X?} → 失败 {e}", if mic_now { "开" } else { "关" }),
+                        }
                         mic_was = mic_now;
                         last_ka = Instant::now();
                     }
-                    // keepalive：麦克风开着时每秒重发一次
+                    // keepalive：麦克风开着时每秒重发一次 MIC_ON。
+                    // 不补的话说着说着流会断。
                     if mic_now && last_ka.elapsed() >= Duration::from_secs(1) {
                         let _ = dev.write(&MIC_ON);
                         last_ka = Instant::now();
+                    }
+                    // 自愈：没开麦却还在收音频 → 设备侧还热着（上次强杀、或没收到命令），补关麦
+                    if !mic_now && idle_at.elapsed() >= Duration::from_secs(2) {
+                        let now_frames = status.audio_frames.load(Ordering::Relaxed);
+                        if now_frames > idle_frames + 5 {
+                            let _ = dev.write(&MIC_OFF);
+                        }
+                        idle_frames = now_frames;
+                        idle_at = Instant::now();
                     }
                     // 长按到时：立刻触发长按动作，并标记以抑制本次短按
                     {
@@ -438,14 +518,33 @@ impl Runtime {
                             }
                         }
                         for k in fire {
-                            let r = dispatch(&cfg, &status, &inj, &dictating, &tx, &voice, &prev_input, k, true, true);
+                            let r = dispatch(
+                                &cfg,
+                                &status,
+                                &inj,
+                                &dictating,
+                                &recording,
+                                &tx,
+                                &voice,
+                                &prev_input,
+                                k,
+                                true,
+                                true,
+                            );
                             if !r.is_empty() {
                                 // 只在动作真的执行了才学 —— 否则会把「没配动作」的键也
                                 // 学进屏蔽表，结果系统默认行为被吞、又没有替代动作，纯亏
-                                if let Some(l) = learn_suppress_codes(&cfg, &recent_ev, &learned_codes) {
-                                    let _ = tx.send(Event::Log(format!("已学到要屏蔽的系统键码: {l:?}")));
+                                if let Some(l) =
+                                    learn_suppress_codes(&cfg, &recent_ev, &learned_codes)
+                                {
+                                    let _ = tx
+                                        .send(Event::Log(format!("已学到要屏蔽的系统键码: {l:?}")));
                                 }
-                                let _ = tx.send(Event::Key { key: k, down: true, result: r });
+                                let _ = tx.send(Event::Key {
+                                    key: k,
+                                    down: true,
+                                    result: r,
+                                });
                             }
                         }
                     }
@@ -464,6 +563,13 @@ impl Runtime {
                     let rid = buf[0];
                     let payload = &buf[1..n];
                     *seen_rids.lock().entry(rid).or_insert(0) += 1;
+                    let raw_on = raw_all.load(Ordering::Relaxed);
+                    if raw_on {
+                        let _ = tx.send(Event::Raw {
+                            report_id: rid,
+                            data: payload.to_vec(),
+                        });
+                    }
 
                     match rid {
                         RID_AUDIO => {
@@ -474,7 +580,8 @@ impl Runtime {
                             // 以前这里只在 passing 为真时解码，于是听写永远收不到采样，
                             // 一松手就是「说得太短」。两条路要各自判断。
                             let taking = dictating.lock().is_some();
-                            if passing || taking {
+                            let recing = recording.lock().is_some();
+                            if passing || taking || recing {
                                 if let Ok(got) = dec.decode(payload, &mut pcm, false) {
                                     if passing {
                                         if let Some(sink) = &sink {
@@ -484,22 +591,21 @@ impl Runtime {
                                     if let Some(r) = dictating.lock().as_mut() {
                                         r.push(&pcm[..got]);
                                     }
+                                    {
+                                        let mut g = recording.lock();
+                                        if let Some(r) = g.as_mut() {
+                                            r.push(&pcm[..got]);
+                                            if r.samples_len() % 16_000 < 320 {
+                                                eprintln!("[rec] 已写 {:.1}s", r.seconds());
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                         RID_BATTERY => {
                             if let Some(&b) = payload.first() {
-                                let b = b as i32;
-                                let was = status.battery.swap(b, Ordering::Relaxed);
-                                // 变了才落盘 —— 下次启动界面上立刻有电量，
-                                // 不用干等遥控器下一次上报
-                                if was != b {
-                                    let mut g = cfg.write();
-                                    if g.settings.last_battery != Some(b) {
-                                        g.settings.last_battery = Some(b);
-                                        let _ = g.save();
-                                    }
-                                }
+                                record_battery(&status, &cfg, b as i32, "上报");
                             }
                         }
                         RID_KEYBOARD | RID_CONSUMER | RID_VENDOR_EF => {
@@ -540,9 +646,17 @@ impl Runtime {
                             hid_key_held.store(!active.is_empty(), Ordering::Relaxed);
 
                             for (k, down) in events {
+                                // 纯观测：诊断长按用，原样上报每个边沿，不影响任何逻辑
+                                if trace_keys.load(Ordering::Relaxed) {
+                                    let _ = tx.send(Event::KeyEdge { key: k, down });
+                                }
                                 {
                                     let mut p = pressed.lock();
-                                    if down { p.insert(k); } else { p.remove(&k); }
+                                    if down {
+                                        p.insert(k);
+                                    } else {
+                                        p.remove(&k);
+                                    }
                                 }
                                 if learn.load(Ordering::Relaxed) {
                                     if down {
@@ -562,51 +676,137 @@ impl Runtime {
                                         continue; // 按下先不动作，等长按到时或松手
                                     }
                                     // 无长按配置：按下即触发短按（响应更快）
-                                    let r = dispatch(&cfg, &status, &inj, &dictating, &tx, &voice, &prev_input, k, true, false);
+                                    let r = dispatch(
+                                        &cfg,
+                                        &status,
+                                        &inj,
+                                        &dictating,
+                                        &recording,
+                                        &tx,
+                                        &voice,
+                                        &prev_input,
+                                        k,
+                                        true,
+                                        false,
+                                    );
                                     if !r.is_empty() {
                                         // 只在动作真的执行了才学 —— 否则会把「没配动作」的键也
                                         // 学进屏蔽表，结果系统默认行为被吞、又没有替代动作，纯亏
-                                        if let Some(l) = learn_suppress_codes(&cfg, &recent_ev, &learned_codes) {
-                                            let _ = tx.send(Event::Log(format!("已学到要屏蔽的系统键码: {l:?}")));
+                                        if let Some(l) =
+                                            learn_suppress_codes(&cfg, &recent_ev, &learned_codes)
+                                        {
+                                            let _ = tx.send(Event::Log(format!(
+                                                "已学到要屏蔽的系统键码: {l:?}"
+                                            )));
                                         }
-                                        let _ = tx.send(Event::Key { key: k, down: true, result: r });
+                                        let _ = tx.send(Event::Key {
+                                            key: k,
+                                            down: true,
+                                            result: r,
+                                        });
                                     }
                                 } else {
                                     match held.remove(&k) {
                                         // 长按已触发 -> 松手只给长按动作发 release（按住说话要停流）
                                         Some((_, true)) => {
-                                            let r = dispatch(&cfg, &status, &inj, &dictating, &tx, &voice, &prev_input, k, false, true);
+                                            let r = dispatch(
+                                                &cfg,
+                                                &status,
+                                                &inj,
+                                                &dictating,
+                                                &recording,
+                                                &tx,
+                                                &voice,
+                                                &prev_input,
+                                                k,
+                                                false,
+                                                true,
+                                            );
                                             if !r.is_empty() {
                                                 // 只在动作真的执行了才学 —— 否则会把「没配动作」的键也
                                                 // 学进屏蔽表，结果系统默认行为被吞、又没有替代动作，纯亏
-                                                if let Some(l) = learn_suppress_codes(&cfg, &recent_ev, &learned_codes) {
-                                                    let _ = tx.send(Event::Log(format!("已学到要屏蔽的系统键码: {l:?}")));
+                                                if let Some(l) = learn_suppress_codes(
+                                                    &cfg,
+                                                    &recent_ev,
+                                                    &learned_codes,
+                                                ) {
+                                                    let _ = tx.send(Event::Log(format!(
+                                                        "已学到要屏蔽的系统键码: {l:?}"
+                                                    )));
                                                 }
-                                                let _ = tx.send(Event::Key { key: k, down: false, result: r });
+                                                let _ = tx.send(Event::Key {
+                                                    key: k,
+                                                    down: false,
+                                                    result: r,
+                                                });
                                             }
                                         }
                                         // 没到长按阈值就松手 -> 短按
                                         Some((_, false)) => {
-                                            let r = dispatch(&cfg, &status, &inj, &dictating, &tx, &voice, &prev_input, k, true, false);
+                                            let r = dispatch(
+                                                &cfg,
+                                                &status,
+                                                &inj,
+                                                &dictating,
+                                                &recording,
+                                                &tx,
+                                                &voice,
+                                                &prev_input,
+                                                k,
+                                                true,
+                                                false,
+                                            );
                                             if !r.is_empty() {
                                                 // 只在动作真的执行了才学 —— 否则会把「没配动作」的键也
                                                 // 学进屏蔽表，结果系统默认行为被吞、又没有替代动作，纯亏
-                                                if let Some(l) = learn_suppress_codes(&cfg, &recent_ev, &learned_codes) {
-                                                    let _ = tx.send(Event::Log(format!("已学到要屏蔽的系统键码: {l:?}")));
+                                                if let Some(l) = learn_suppress_codes(
+                                                    &cfg,
+                                                    &recent_ev,
+                                                    &learned_codes,
+                                                ) {
+                                                    let _ = tx.send(Event::Log(format!(
+                                                        "已学到要屏蔽的系统键码: {l:?}"
+                                                    )));
                                                 }
-                                                let _ = tx.send(Event::Key { key: k, down: true, result: r });
+                                                let _ = tx.send(Event::Key {
+                                                    key: k,
+                                                    down: true,
+                                                    result: r,
+                                                });
                                             }
                                         }
                                         // 没起定时器（无长按配置）-> 按下时已触发，松手补 release
                                         None => {
-                                            let r = dispatch(&cfg, &status, &inj, &dictating, &tx, &voice, &prev_input, k, false, false);
+                                            let r = dispatch(
+                                                &cfg,
+                                                &status,
+                                                &inj,
+                                                &dictating,
+                                                &recording,
+                                                &tx,
+                                                &voice,
+                                                &prev_input,
+                                                k,
+                                                false,
+                                                false,
+                                            );
                                             if !r.is_empty() {
                                                 // 只在动作真的执行了才学 —— 否则会把「没配动作」的键也
                                                 // 学进屏蔽表，结果系统默认行为被吞、又没有替代动作，纯亏
-                                                if let Some(l) = learn_suppress_codes(&cfg, &recent_ev, &learned_codes) {
-                                                    let _ = tx.send(Event::Log(format!("已学到要屏蔽的系统键码: {l:?}")));
+                                                if let Some(l) = learn_suppress_codes(
+                                                    &cfg,
+                                                    &recent_ev,
+                                                    &learned_codes,
+                                                ) {
+                                                    let _ = tx.send(Event::Log(format!(
+                                                        "已学到要屏蔽的系统键码: {l:?}"
+                                                    )));
                                                 }
-                                                let _ = tx.send(Event::Key { key: k, down: false, result: r });
+                                                let _ = tx.send(Event::Key {
+                                                    key: k,
+                                                    down: false,
+                                                    result: r,
+                                                });
                                             }
                                         }
                                     }
@@ -614,16 +814,20 @@ impl Runtime {
                             }
                         }
                         RID_VENDOR_F1 => {
-                            let _ = tx.send(Event::Raw {
-                                report_id: rid,
-                                data: payload.to_vec(),
-                            });
+                            if !raw_on {
+                                let _ = tx.send(Event::Raw {
+                                    report_id: rid,
+                                    data: payload.to_vec(),
+                                });
+                            }
                         }
                         _ => {
-                            let _ = tx.send(Event::Raw {
-                                report_id: rid,
-                                data: payload.to_vec(),
-                            });
+                            if !raw_on {
+                                let _ = tx.send(Event::Raw {
+                                    report_id: rid,
+                                    data: payload.to_vec(),
+                                });
+                            }
                         }
                     }
                 }
@@ -646,7 +850,11 @@ impl Runtime {
     pub fn trigger_slot(&self, slot: crate::layout::Slot, long: bool) -> String {
         let (disabled, act, key) = {
             let c = self.cfg.read();
-            (c.profile().is_disabled(slot), c.profile().action(slot, long), c.slot_key(slot))
+            (
+                c.profile().is_disabled(slot),
+                c.profile().action(slot, long),
+                c.slot_key(slot),
+            )
         };
         if disabled {
             return "已禁用".into();
@@ -676,8 +884,19 @@ impl Runtime {
                 let Some(sink) = self.voice.lock().clone() else {
                     return "语音未启动".into();
                 };
-                gate_voice(&self.cfg, &self.status, &sink, &self.prev_input, down, false);
-                if down { "开始送流".into() } else { "停止送流".into() }
+                gate_voice(
+                    &self.cfg,
+                    &self.status,
+                    &sink,
+                    &self.prev_input,
+                    down,
+                    false,
+                );
+                if down {
+                    "开始送流".into()
+                } else {
+                    "停止送流".into()
+                }
             }
             ActionType::VoiceToggle => {
                 if !down {
@@ -688,18 +907,34 @@ impl Runtime {
                 };
                 let on = !sink.passing();
                 gate_voice(&self.cfg, &self.status, &sink, &self.prev_input, on, false);
-                if on { "开始送流".into() } else { "停止送流".into() }
+                if on {
+                    "开始送流".into()
+                } else {
+                    "停止送流".into()
+                }
             }
             // 听写要吃松开事件（松手才去识别），必须在 `!down` 短路之前。
             // 长按 = 按住说话；短按 = 点一下开始、再点一下结束。
+            ActionType::Record => {
+                return toggle_record(&self.status, &self.recording, &self.tx, down);
+            }
             ActionType::VoiceDictate => {
                 let long = act.arg == "hold";
                 if !long && !down {
                     return String::new();
                 }
-                let on = if long { down } else { self.dictating.lock().is_none() };
+                let on = if long {
+                    down
+                } else {
+                    self.dictating.lock().is_none()
+                };
                 gate_dictation(
-                    &self.cfg, &self.status, &self.inj, &self.dictating, &self.tx, on,
+                    &self.cfg,
+                    &self.status,
+                    &self.inj,
+                    &self.dictating,
+                    &self.tx,
+                    on,
                 )
             }
             // 「按住」模式要分 down/up 两次调用，所以它必须在 `!down` 短路之前
@@ -761,6 +996,10 @@ impl Runtime {
                 spawn_applescript(&act.arg);
                 act.describe()
             }
+            ActionType::Http => {
+                spawn_http(act, self.tx.clone());
+                return act.describe();
+            }
             ActionType::Shell => {
                 spawn_shell(&act.arg);
                 act.describe()
@@ -801,6 +1040,13 @@ impl Runtime {
         }
     }
 
+    /// 递一条 OUTPUT 报文给设备（第一个字节是 report id）。
+    /// ⚠️ 只用来发**已知语义**的命令 —— 对不明设备盲扫厂商 opcode
+    /// 可能干出不可逆的事（GATT 那边就有 WIPE）。
+    pub fn send_report(&self, bytes: Vec<u8>) {
+        self.pending_writes.lock().push(bytes);
+    }
+
     pub fn stop(&self) {
         // 映射是系统状态，退出必须清 —— 留着遥控器那颗键会一直是修饰键
         crate::hidremap::clear();
@@ -816,6 +1062,7 @@ fn dispatch(
     status: &Arc<Status>,
     inj: &Arc<dyn Injector>,
     dictating: &Arc<Mutex<Option<crate::stt::Recorder>>>,
+    recording: &Arc<Mutex<Option<crate::recorder::Rec>>>,
     tx: &Sender<Event>,
     voice: &Arc<Mutex<Option<Arc<VoiceSink>>>>,
     prev: &Arc<Mutex<Option<u32>>>,
@@ -850,7 +1097,11 @@ fn dispatch(
             return "按住说话：语音未启动".into();
         };
         gate_voice(cfg, status, &sink, prev, down, false);
-        return if down { "开始送流".into() } else { "停止送流".into() };
+        return if down {
+            "开始送流".into()
+        } else {
+            "停止送流".into()
+        };
     }
     if act.kind == ActionType::VoiceToggle {
         if !down {
@@ -861,7 +1112,11 @@ fn dispatch(
         };
         let on = !sink.passing();
         gate_voice(cfg, status, &sink, prev, on, false);
-        return if on { "开始送流".into() } else { "停止送流".into() };
+        return if on {
+            "开始送流".into()
+        } else {
+            "停止送流".into()
+        };
     }
 
     // 听写同样要吃松开事件。长按 = 按住说话；短按 = 点一下开始、再点一下结束。
@@ -870,7 +1125,11 @@ fn dispatch(
         if !hold && !down {
             return String::new();
         }
-        let on = if hold { down } else { dictating.lock().is_none() };
+        let on = if hold {
+            down
+        } else {
+            dictating.lock().is_none()
+        };
         return gate_dictation(cfg, status, inj, dictating, tx, on);
     }
     // 外部语音 app 的「按住」模式同样要吃松开事件，必须在 !down 短路之前
@@ -933,6 +1192,7 @@ fn dispatch(
 
     match act.kind {
         ActionType::None => "未设置".into(),
+        ActionType::Record => toggle_record(status, recording, tx, down),
         ActionType::Key => match inj.key_stroke(&act.key, &act.mods) {
             Ok(_) => act.describe(),
             Err(e) => format!("失败: {e}"),
@@ -951,6 +1211,10 @@ fn dispatch(
         }
         ActionType::Shell => {
             spawn_shell(&act.arg);
+            act.describe()
+        }
+        ActionType::Http => {
+            spawn_http(&act, tx.clone());
             act.describe()
         }
         ActionType::VoicePtt
@@ -1064,7 +1328,11 @@ fn gate_dictation(
         eprintln!("[stt] wav={} locale={locale} {:.1}s", path.display(), secs);
         let t0 = std::time::Instant::now();
         let out = crate::stt::transcribe_file(&path, &locale, true);
-        eprintln!("[stt] 耗时 {:.1}s 结果 {:?}", t0.elapsed().as_secs_f32(), out);
+        eprintln!(
+            "[stt] 耗时 {:.1}s 结果 {:?}",
+            t0.elapsed().as_secs_f32(),
+            out
+        );
         match out {
             Ok(text) if text.trim().is_empty() => {
                 let _ = tx.send(Event::Log("没识别出内容".into()));
@@ -1169,10 +1437,8 @@ fn gate_voice(
                     let _ = g.save();
                 }
             }
-            let ok = crate::audio::set_default_input_and_wait(
-                target.id,
-                Duration::from_millis(250),
-            );
+            let ok =
+                crate::audio::set_default_input_and_wait(target.id, Duration::from_millis(250));
             if !ok {
                 eprintln!("[voice] 切到 {} 没在 250ms 内生效", target.name);
             }
@@ -1224,7 +1490,9 @@ fn spawn_open_app(target: &str) {
         }
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("cmd").args(["/C", "start", "", &t]).spawn();
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "start", "", &t])
+                .spawn();
         }
     });
 }
@@ -1238,7 +1506,9 @@ fn spawn_applescript(script: &str) {
     std::thread::spawn(move || {
         #[cfg(target_os = "macos")]
         {
-            let _ = std::process::Command::new("osascript").args(["-e", &s]).spawn();
+            let _ = std::process::Command::new("osascript")
+                .args(["-e", &s])
+                .spawn();
         }
         #[cfg(not(target_os = "macos"))]
         let _ = &s;
@@ -1254,7 +1524,59 @@ fn spawn_shell(cmd: &str) {
         #[cfg(windows)]
         let _ = std::process::Command::new("cmd").args(["/C", &c]).spawn();
         #[cfg(not(windows))]
-        let _ = std::process::Command::new("/bin/sh").args(["-c", &c]).spawn();
+        let _ = std::process::Command::new("/bin/sh")
+            .args(["-c", &c])
+            .spawn();
+    });
+}
+
+/// 发一个 HTTP 请求。用 `curl` 直接传**参数向量**（不过 shell），所以 URL、
+/// 请求体里的引号/空格/换行都不会被拆断（用户拿 shell+curl 就栽在换行上）。
+/// `--retry` / `--max-time` 是 curl 原生的。结果（HTTP 状态码或错误）回报到 Event::Log。
+fn spawn_http(act: &Action, tx: Sender<Event>) {
+    let url = act.arg.trim().to_string();
+    if url.is_empty() {
+        let _ = tx.send(Event::Log("HTTP 动作没填 URL".into()));
+        return;
+    }
+    let method = if act.method.is_empty() {
+        "GET".to_string()
+    } else {
+        act.method.to_uppercase()
+    };
+    let timeout_ms = if act.timeout_ms == 0 { 2000 } else { act.timeout_ms };
+    let retries = act.retries;
+    let body = act.body.clone();
+    std::thread::spawn(move || {
+        let mut cmd = std::process::Command::new("/usr/bin/curl");
+        cmd.arg("-sS") // 安静，但保留错误信息
+            .arg("-o")
+            .arg("/dev/null")
+            .arg("-w")
+            .arg("%{http_code}")
+            .arg("-X")
+            .arg(&method)
+            .arg("--max-time")
+            .arg(format!("{:.2}", timeout_ms as f64 / 1000.0))
+            .arg("--retry")
+            .arg(retries.to_string());
+        if method == "POST" && !body.is_empty() {
+            cmd.arg("-d").arg(&body);
+        }
+        cmd.arg(&url);
+        match cmd.output() {
+            Ok(o) if o.status.success() => {
+                let code = String::from_utf8_lossy(&o.stdout);
+                let _ = tx.send(Event::Log(format!("HTTP {method} → {}", code.trim())));
+            }
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                let _ = tx.send(Event::Log(format!("HTTP 请求失败：{}", err.trim())));
+            }
+            Err(e) => {
+                let _ = tx.send(Event::Log(format!("HTTP 起不来（curl 缺失？）：{e}")));
+            }
+        }
     });
 }
 
@@ -1289,9 +1611,14 @@ pub fn app_presets() -> &'static [(&'static str, &'static str)] {
 
 /// 让 UI 能直接构造动作
 pub fn make_action(kind: ActionType, key: &str, mods: Vec<String>, arg: &str) -> Action {
-    Action { kind, key: key.into(), mods, arg: arg.into() }
+    Action {
+        kind,
+        key: key.into(),
+        mods,
+        arg: arg.into(),
+        ..Default::default()
+    }
 }
-
 
 /// 「按住说话」型的第三方工具靠按住时长判断，太短会被当成单击。
 /// 记下每个键的按下时刻，松开前补足最短时长。
@@ -1320,4 +1647,94 @@ fn double_stroke(inj: &Arc<dyn Injector>, key: &str, mods: &[String]) -> Result<
     inj.key_stroke(key, mods)?;
     std::thread::sleep(Duration::from_millis(80));
     inj.key_stroke(key, mods)
+}
+
+/// 记下电量。变了才落盘 —— 下次启动界面上立刻有值，不用干等遥控器上报。
+fn record_battery(status: &Arc<Status>, cfg: &Arc<RwLock<Config>>, b: i32, how: &str) {
+    if !(1..=100).contains(&b) {
+        return; // 0 或越界当无效，别把界面刷成 0%
+    }
+    let was = status.battery.swap(b, Ordering::Relaxed);
+    if was != b {
+        eprintln!("[batt] {how} {b}%");
+        let mut g = cfg.write();
+        if g.settings.last_battery != Some(b) {
+            g.settings.last_battery = Some(b);
+            let _ = g.save();
+        }
+    }
+}
+
+// ⚠️ 电量**没法主动读**。三条路都试过了：
+//   1. GetReport(Input, 0x03) → IOHIDDeviceGetReport 报
+//      0xE00002F0「data was not found」。这台设备的 BLE HOGP 通路不给读，
+//      只肯自己推。
+//   2. IORegistry 的 BatteryPercent → 只有 Apple 自家设备才发布，
+//      遥控器的 IOHIDDevice 节点上没有任何 battery/percent 属性。
+//   3. 剩下唯一可能是 BLE GATT 标准电池服务（0x180F / 特征 0x2A19）。
+//      笔记里说 macOS 对 app 隐藏 HID 服务 0x1812，但电池服务不是 HID 服务、
+//      通常可见 —— 没验，要写 CoreBluetooth。
+// 所以现在只被动收 0x03 上报，并把最后一次值落盘（last_battery），
+// 这样重启后界面上立刻有值，不用干等。
+
+/// 录音：**按住录、松手存**。
+///
+/// 为什么不是「按一下开始、再按一下停止」：遥控器只在**实体麦克风键按住**期间
+/// 才吐音频流 —— 软件开麦无效（四种有出处的写法都试过，写入成功但音频帧为 0）。
+/// 所以录音只能跟着按住的那段时间走，配在麦克风键上才有意义。
+///
+/// 录的是遥控器麦克风解码后的 PCM（和听写共用同一路），不碰系统输入设备。
+fn toggle_record(
+    status: &Arc<Status>,
+    recording: &Arc<Mutex<Option<crate::recorder::Rec>>>,
+    tx: &Sender<Event>,
+    down: bool,
+) -> String {
+    // 松手 → 收尾保存
+    if !down {
+        let taken = recording.lock().take();
+        let Some(r) = taken else {
+            return String::new();
+        };
+        status.mic_on.store(false, Ordering::Relaxed);
+        return match r.finish() {
+            Ok((path, secs)) if secs < 0.2 => {
+                // 什么都没录到：多半是没按住实体麦克风键，删掉空文件别留垃圾
+                let _ = std::fs::remove_file(&path);
+                let _ = tx.send(Event::Log(
+                    "没录到声音 —— 录音要按住遥控器的麦克风键才有音频".into(),
+                ));
+                "没录到声音".into()
+            }
+            Ok((path, secs)) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let _ = tx.send(Event::Log(format!(
+                    "录音已保存到「下载」：{name}（{secs:.1}s）"
+                )));
+                format!("录音结束 · {secs:.1}s")
+            }
+            Err(e) => {
+                let _ = tx.send(Event::Log(format!("录音保存失败: {e}")));
+                "录音保存失败".into()
+            }
+        };
+    }
+    // 按下 → 开始录（已经在录就别重开）
+    if recording.lock().is_some() {
+        return String::new();
+    }
+    match crate::recorder::Rec::start(OPUS_RATE) {
+        Ok(r) => {
+            *recording.lock() = Some(r);
+            status.mic_on.store(true, Ordering::Relaxed);
+            "开始录音".into()
+        }
+        Err(e) => {
+            let _ = tx.send(Event::Log(format!("录音启动失败: {e}")));
+            "录音启动失败".into()
+        }
+    }
 }

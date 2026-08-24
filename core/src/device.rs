@@ -12,10 +12,20 @@ pub const RID_VENDOR_EF: u8 = 0xEF;
 pub const RID_VENDOR_F1: u8 = 0xF1;
 pub const RID_CMD: u8 = 0xF2;
 
-/// 开麦 / 关麦。决定开关的是第二个字节；单字节 [0x01] 无效。
-/// hidapi 把 buffer[0] 当 report ID，所以是 [0xF2, opcode, arg]。
+/// 开麦 / 关麦。hidapi 把 buffer[0] 当 report id。
+///
+/// ★ 实测定死（`firectl --mic-off-test`，授权环境、控制变量、可复现）：
+///   开麦 `[F2,01,01]`(3B) → 起流 ~50 帧/秒（第 3 字节 01=开）
+///   关麦 **`[F2,00]`(2B)** → 停流。⚠️ **`[F2,01,00]`(3B) 停不了**（写成功但流照走 61/秒）——
+///   费电真凶就是它：v0.1.0 一直用 [F2,01,00] 当关麦，从来没真关上过。
+///   关麦不是「把开麦第 3 字节改 0」，而是另一条 2 字节命令。
+///
+/// ⚠️ 能不能发出去取决于**进程有没有「输入监控」授权**（跟长度无关）：
+///   没授权 → 任何写都 `0xE00002E2 not permitted`。FireVibe.app 有自己的授权；
+///   firectl 靠 disclaim 自持授权（见 main.rs）。别把权限错误当成字节错误
+///   —— 我在这上面栽过一整轮。
 pub const MIC_ON: [u8; 3] = [RID_CMD, 0x01, 0x01];
-pub const MIC_OFF: [u8; 3] = [RID_CMD, 0x01, 0x00];
+pub const MIC_OFF: [u8; 2] = [RID_CMD, 0x00];
 
 use crate::keys::{Key, PAGE_CONSUMER, PAGE_KEYBOARD, PAGE_VENDOR};
 

@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 pub fn run() -> anyhow::Result<()> {
     let mut cfg = Config::load();
-    cfg.voice.enabled = false;
     cfg.exclusive = false; // 独占要 root，这里只读不拦
 
     let (rt, rx) = Runtime::new(cfg);

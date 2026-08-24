@@ -22,8 +22,12 @@ use firevibe_core::{
 };
 use gpui::{
     deferred, div, prelude::*, px, relative, size, App, Application, Bounds, Context, Entity,
-    SharedString, Window, WindowBounds, WindowOptions,
+    Menu, MenuItem, SharedString, Window, WindowBounds, WindowOptions,
 };
+
+// 退出动作 —— 菜单栏和 Cmd-Q 都触发它。macOS 上 close 被改成隐藏（见 open_window
+// 里的 on_window_should_close），所以必须有个明确的退出入口，否则 app 退不掉。
+gpui::actions!(firevibe, [Quit]);
 use gpui_component::{input::InputState, Root};
 use remote::COL_LEFT_W;
 
@@ -60,12 +64,24 @@ pub struct EditState {
     /// 「外部语音 app」短按时用双击而不是单击。豆包默认就是「双击开、单击关」，
     /// 单击它压根不进收音状态 —— 这是目标 app 的约定，只能由用户按实际情况选。
     pub dbl: bool,
-    /// 文本参数（打开应用 / AppleScript / 命令 / 输入文字）
+    /// 文本参数（打开应用 / AppleScript / 命令 / 输入文字；HTTP 时是 URL）
     pub input: Entity<InputState>,
+    /// HTTP：方法是不是 POST（否则 GET）
+    pub post: bool,
+    /// HTTP：POST 请求体
+    pub body_in: Entity<InputState>,
+    /// HTTP：重试次数
+    pub retries_in: Entity<InputState>,
+    /// HTTP：超时毫秒
+    pub timeout_in: Entity<InputState>,
     /// 热键录制用的焦点句柄。要收键盘事件，元素必须 track_focus 且被聚焦。
     pub focus: gpui::FocusHandle,
     /// 正在等你按组合键
     pub recording: bool,
+    /// 录制期间的 tap 会话。走 tap 而不是窗口事件 —— 要录的组合键
+    /// 可能已经被别的软件注册成全局热键，那样窗口这边永远收不到。
+    /// drop 即停止（键盘恢复正常）。
+    pub grab: Option<firevibe_core::hotkey::Capture>,
 }
 
 pub struct FireVibe {
@@ -104,6 +120,8 @@ pub struct FireVibe {
     /// 装虚拟声卡前的说明弹窗。系统那个授权框只写「osascript wants to
     /// make changes」，署名还是个陌生进程 —— 直接弹给人输密码是不合格的，
     /// 先把要做什么讲清楚。
+    /// 电量读取已经起过了吗（后台线程，定时跑 bundle 里的 battprobe）
+    batt_started: bool,
     /// 方案改名弹窗：装着输入框，None = 没在改
     pub renaming: Option<Entity<InputState>>,
     pub install_confirm: bool,
@@ -145,6 +163,68 @@ impl FireVibe {
         let cfg = Config::load();
         let (rt, rx) = Runtime::new(cfg);
         let rt = Arc::new(rt);
+        // 自测钩子：FIREVIBE_REC_TEST=<延迟秒>,<时长秒> —— 到点自己录一段再停
+        if let Ok(v) = std::env::var("FIREVIBE_REC_TEST") {
+            let mut it = v.split(',').filter_map(|x| x.trim().parse::<f32>().ok());
+            let delay = it.next().unwrap_or(6.0);
+            let dur = it.next().unwrap_or(4.0);
+            let rt2 = rt.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs_f32(delay));
+                match firevibe_core::recorder::Rec::start(firevibe_core::voice::OPUS_RATE) {
+                    Ok(r) => {
+                        *rt2.recording.lock() = Some(r);
+                        rt2.status.mic_on.store(true, Ordering::Relaxed);
+                        eprintln!("[rectest] 开始录音");
+                    }
+                    Err(e) => {
+                        eprintln!("[rectest] 起不来: {e}");
+                        return;
+                    }
+                }
+                // FIREVIBE_REC_WAV：把一个 16k/单声道 WAV 当成遥控器音频灌进去，
+                // 这样「录音 → 写盘 → 文件名/时长」整条链路不用真按遥控器就能验
+                if let Ok(wav) = std::env::var("FIREVIBE_REC_WAV") {
+                    match std::fs::read(&wav) {
+                        Ok(b) if b.len() > 44 => {
+                            let pcm: Vec<i16> = b[44..]
+                                .chunks_exact(2)
+                                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                                .collect();
+                            if let Some(r) = rt2.recording.lock().as_mut() {
+                                r.push(&pcm);
+                            }
+                            eprintln!(
+                                "[rectest] 灌入 {} 采样（{:.2}s）",
+                                pcm.len(),
+                                pcm.len() as f32 / 16000.0
+                            );
+                        }
+                        Ok(_) => eprintln!("[rectest] WAV 太小"),
+                        Err(e) => eprintln!("[rectest] 读 WAV 失败 {e}"),
+                    }
+                }
+                for i in 0..(dur as u32).max(1) {
+                    std::thread::sleep(Duration::from_secs(1));
+                    eprintln!("[rectest] 第 {}s，准备取锁", i + 1);
+                    eprintln!(
+                        "[rectest] {}s 音频帧={} 已写={:.2}s",
+                        i + 1,
+                        rt2.status.audio_frames.load(Ordering::Relaxed),
+                        rt2.recording.lock().as_ref().map(|r| r.seconds()).unwrap_or(-1.0)
+                    );
+                }
+                rt2.status.mic_on.store(false, Ordering::Relaxed);
+                // 注意别在持锁时调 finish —— 先 take 出来再单独收尾
+                let taken = rt2.recording.lock().take();
+                if let Some(r) = taken {
+                    match r.finish() {
+                        Ok((p, s)) => eprintln!("[rectest] 存好 {} （{s:.2}s）", p.display()),
+                        Err(e) => eprintln!("[rectest] 收尾失败 {e}"),
+                    }
+                }
+            });
+        }
         // 自测钩子：FIREVIBE_TYPE_TEST=<秒>,<文字> —— 到点从本进程打一段字，
         // 用来把「注入」和「识别」分开定位
         if let Ok(v) = std::env::var("FIREVIBE_TYPE_TEST") {
@@ -235,6 +315,7 @@ impl FireVibe {
             audio_rx: None,
             audio_at: Instant::now() - Duration::from_secs(10),
             input_open: false,
+            batt_started: false,
             renaming: None,
             install_confirm: false,
             voice_test: false,
@@ -403,6 +484,8 @@ impl FireVibe {
     }
 
     fn pump(&mut self) {
+        self.poll_hotkey_grab();
+        self.poll_battery();
         // 淡出放完就把它摘掉，免得一直被当成「在动」
         if self.hover_from.is_some() && self.hover_at.elapsed() > HOVER_MS {
             self.hover_from = None;
@@ -442,6 +525,12 @@ impl FireVibe {
                 );
                 // 上次异常退出可能把系统输入留在虚拟声卡上，开机先补救一下
                 self.rt.recover_input();
+                // 电量跟踪器要在主线程建
+                if !self.batt_started {
+                    self.batt_started = true;
+                    // 每 5 分钟读一次 —— 电量变化慢，没必要频繁连蓝牙
+                    firevibe_core::battery::spawn_tracker("Amazon", 300);
+                }
                 // 按配置重下 HID 层映射：设了就下（幂等，顺带盖掉上次残留），没设就清
                 if let Some(m) = self.rt.sync_hid_remap() {
                     eprintln!("[firevibe] {m}");
@@ -463,10 +552,7 @@ impl FireVibe {
                     Err(e) => self.toast(format!("语音链路启动失败: {e}")),
                 }
             }
-        } else if !self.voice_ready
-            && self.loopback.is_ready()
-            && self.rt.cfg.read().voice.enabled
-        {
+        } else if !self.voice_ready && self.loopback.is_ready() {
             let rt = self.rt.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             self.voice_rx = Some(rx);
@@ -591,9 +677,17 @@ impl FireVibe {
             // 列间距是 22，设计稿里 .top 的 margin-bottom 是 24，补这 2px
             .mb(px(2.))
             .child(
+                // 拖拽区：标题 + 右侧空白（flex_1 撑满到齿轮前）。按下即用
+                // performWindowDragWithEvent 原生拖窗；齿轮是单独兄弟节点，不在这里，
+                // 所以点齿轮不会误触发拖拽，输入框那些也完全不受影响。
                 div()
+                    .id("hdr-drag")
+                    .flex_1()
                     .flex()
                     .flex_col()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, _| {
+                        firevibe_core::tray::start_window_drag();
+                    })
                     .child(
                         div()
                             .text_size(px(19.))
@@ -608,7 +702,6 @@ impl FireVibe {
                             .child(SharedString::from(l.app_sub())),
                     ),
             )
-            .child(spacer())
             .child(icon_btn("gear", "settings").on_click(cx.listener(|this, _, _, cx| {
                 this.screen = Screen::Settings;
                 cx.notify();
@@ -710,6 +803,11 @@ impl FireVibe {
         let l = self.l();
         let on = self.connected();
         let batt = self.battery();
+        // 录音状态一次取完，别在 builder 链里反复上锁（见下面 when_some 处的说明）
+        let rec_state = {
+            let g = self.rt.recording.lock();
+            g.as_ref().map(|r| (r.elapsed(), r.level()))
+        };
 
         // 配对 + 电量
         let mut pair = div()
@@ -773,6 +871,32 @@ impl FireVibe {
                     ))
                     ,
             );
+        // 电量读不到、而且是卡在蓝牙授权上，就给一句能点的提示 ——
+        // 那个授权框只要还挂着没答复，蓝牙这条路就一直不通（见 core/src/battery.rs）
+        if batt <= 0 && firevibe_core::battery::needs_bluetooth_permission() {
+            pair = pair.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.))
+                    .pl(px(18.))
+                    .border_l_1()
+                    .border_color(c(LINE))
+                    .text_size(px(12.5))
+                    .child(
+                        div()
+                            .text_color(c(INK2))
+                            .child(SharedString::from("电量需蓝牙权限")),
+                    )
+                    .child(mini2("open-bt", "去授权").h(px(26.)).on_click(cx.listener(
+                        |_, _, _, _| {
+                            let _ = std::process::Command::new("open")
+                                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth")
+                                .spawn();
+                        },
+                    ))),
+            );
+        }
         if batt > 0 {
             pair = pair.child(
                 div()
@@ -799,9 +923,67 @@ impl FireVibe {
             .flex()
             .gap(px(10.))
             .child(pair)
+            // ⚠️ 先把值取出来再建元素。写成
+            // `.when(self.rt.recording.lock().is_some(), |d| d.child(self.recording_card()))`
+            // 会死锁：判据里那个临时 guard 活到整条语句结束，闭包里又在同一线程
+            // 上锁一次，而 parking_lot::Mutex 不可重入 —— UI 线程永久持锁，
+            // 连 HID 线程都被拖死。
+            .when_some(rec_state, |d, (secs, lvl)| d.child(Self::recording_card(secs, lvl)))
             .child(self.loopback_card(cx))
             .child(spacer())
             .child(self.input_switch(cx))
+    }
+
+    /// 录音中的状态卡。**只在本应用窗口里显示** —— 不弹任何系统界面。
+    fn recording_card(secs: f32, lvl: f32) -> gpui::AnyElement {
+        let mm = (secs as u32) / 60;
+        let ss = (secs as u32) % 60;
+        // 6 格小电平，跟着说话跳
+        let lit = (lvl * 24.0).min(6.0) as usize;
+        let mut meter = div().flex().items_end().gap(px(2.)).h(px(12.));
+        for i in 0..6 {
+            meter = meter.child(
+                div()
+                    .w(px(2.5))
+                    .h(px(4. + i as f32 * 1.6))
+                    .rounded(px(1.))
+                    .bg(if i < lit { c(ERR) } else { c(LINE_STRONG) }),
+            );
+        }
+        div()
+            .flex()
+            .items_center()
+            .gap(px(9.))
+            .flex_none()
+            .rounded(px(R))
+            .px(px(12.))
+            .py(px(9.))
+            .border_1()
+            .border_color(c(ERR))
+            .bg(c(SURFACE))
+            .shadow(sh1())
+            .child(div().size(px(8.)).rounded(px(4.)).flex_none().bg(c(ERR)))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .line_height(relative(1.25))
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(w(580.))
+                            .text_color(c(ERR))
+                            .child(SharedString::from(format!("录音中 {mm:02}:{ss:02}"))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(c(INK3))
+                            .child("再按一下那个键停止"),
+                    ),
+            )
+            .child(meter)
+            .into_any_element()
     }
 
     /// 系统默认输入设备切换。放在状态行最右端。
@@ -1357,6 +1539,48 @@ impl FireVibe {
     }
 
 
+
+    /// 电量：HID 那条 `0x03` 报文要等设备主动上报，界面能空很久；
+    /// 主动 GetReport 又被 BLE HOGP 拒（0xE00002F0）。所以走 CoreBluetooth
+    /// 读标准电池服务 —— 实测能读到，见 core/src/battery.rs 的说明。
+    fn poll_battery(&mut self) {
+        if let Some(v) = firevibe_core::battery::last() {
+            let was = self.rt.status.battery.swap(v, Ordering::Relaxed);
+            if was != v {
+                let mut g = self.rt.cfg.write();
+                if g.settings.last_battery != Some(v) {
+                    g.settings.last_battery = Some(v);
+                    let _ = g.save();
+                }
+                drop(g);
+                eprintln!("[batt] 蓝牙读到 {v}%");
+            }
+        }
+    }
+
+    /// 录快捷键：从 tap 会话里取结果。
+    ///
+    /// 走 tap 是因为被别的软件占用的组合键根本到不了窗口。tap 在录制期间还会
+    /// 把那次按键吞掉，否则录「已占用的组合」会顺带把那个软件唤起来。
+    fn poll_hotkey_grab(&mut self) {
+        let Some(d) = &mut self.dialog else { return };
+        let Some(g) = &d.grab else { return };
+        if let Some(got) = g.take() {
+            if got.key == "escape" {
+                d.recording = false;
+                d.grab = None;
+                return;
+            }
+            d.key = got.key;
+            d.mods = got.mods;
+            d.recording = false;
+            d.grab = None;
+        } else if g.timed_out() {
+            // 超时收摊 —— 别让 tap 一直吞用户的按键
+            d.recording = false;
+            d.grab = None;
+        }
+    }
 
     /// 提交方案改名。按钮和回车共用同一条路径。
     fn commit_rename(&mut self, cx: &mut Context<Self>) {
@@ -1922,7 +2146,10 @@ impl Render for FireVibe {
 }
 
 fn main() {
-    Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
+    let app = Application::new().with_assets(assets::Assets);
+    // 点 Dock 图标（关窗隐藏后）重新唤出窗口
+    app.on_reopen(|cx| cx.activate(true));
+    app.run(|cx: &mut App| {
         gpui_component::init(cx);
         // HID 设备层映射是**进程外的系统状态** —— 我们退出了它还在，
         // 遥控器那颗键会一直是修饰键。退出时必须清掉。
@@ -1931,6 +2158,16 @@ fn main() {
             async {}
         })
         .detach();
+
+        // 应用菜单 + 退出 —— 之前顶部菜单栏空的、Cmd-Q 没绑，关窗又改成隐藏，
+        // 结果 app 彻底退不掉。这里补一个 FireVibe 菜单，含「退出」并绑 Cmd-Q。
+        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+        cx.bind_keys([gpui::KeyBinding::new("cmd-q", Quit, None)]);
+        cx.set_menus(vec![Menu {
+            name: "FireVibe".into(),
+            items: vec![MenuItem::action("退出 FireVibe", Quit)],
+        }]);
+
         gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
         // 输入框聚焦时的边框走 theme.ring，默认是近黑色，一圈粗黑边太重。
         // 换成我们的强调色，和别处的选中态一致。
@@ -1978,11 +2215,29 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
+                // 点红叉 = 隐藏到后台，**不**走 GPUI 默认关闭 —— 默认会 drop 掉最后一个
+                // 窗口，触发主线程死循环（关窗后卡死、要 force quit 的根因）。返回 false
+                // 阻止关闭，改为 hide()；点 Dock 图标可重新唤出，Cmd-Q 才真正退出
+                //（退出会跑 on_app_quit 清掉 hidremap）。
+                window.on_window_should_close(cx, |_window, cx| {
+                    cx.hide();
+                    false
+                });
                 let view = cx.new(FireVibe::new);
                 cx.new(|cx| Root::new(view, window, cx))
             },
         )
         .unwrap();
         cx.activate(true);
+        // 右上角菜单栏状态项（图标 + 显示/退出菜单）—— 关窗隐藏后也能从这里操作
+        let tl = i18n::L(firevibe_core::config::Config::load().settings.lang);
+        firevibe_core::tray::install(
+            include_bytes!("../assets/tray/tray@2x.png"),
+            tl.tray_show(),
+            tl.tray_quit(),
+        );
+        // 让窗口背景可拖（含整个 header）—— gpui 的 window_control_area/start_window_move
+        // 在 mac 上是空实现，只能靠 NSWindow.movableByWindowBackground。
+        firevibe_core::tray::make_windows_draggable();
     });
 }

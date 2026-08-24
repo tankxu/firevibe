@@ -70,47 +70,133 @@ extern "C" {
 
 /// macOS 虚拟键码（kVK_*），跟 HID usage 不是一回事
 const VK: &[(&str, u16)] = &[
-    ("return", 0x24), ("enter", 0x24), ("tab", 0x30), ("space", 0x31),
-    ("delete", 0x33), ("backspace", 0x33), ("escape", 0x35), ("esc", 0x35),
-    ("left", 0x7B), ("right", 0x7C), ("down", 0x7D), ("up", 0x7E),
-    ("home", 0x73), ("pageup", 0x74), ("forwarddelete", 0x75), ("end", 0x77),
+    ("return", 0x24),
+    ("enter", 0x24),
+    ("tab", 0x30),
+    ("space", 0x31),
+    ("delete", 0x33),
+    ("backspace", 0x33),
+    ("escape", 0x35),
+    ("esc", 0x35),
+    ("left", 0x7B),
+    ("right", 0x7C),
+    ("down", 0x7D),
+    ("up", 0x7E),
+    ("home", 0x73),
+    ("pageup", 0x74),
+    ("forwarddelete", 0x75),
+    ("end", 0x77),
     ("pagedown", 0x79),
-    ("a", 0x00), ("s", 0x01), ("d", 0x02), ("f", 0x03), ("h", 0x04), ("g", 0x05),
-    ("z", 0x06), ("x", 0x07), ("c", 0x08), ("v", 0x09), ("b", 0x0B), ("q", 0x0C),
-    ("w", 0x0D), ("e", 0x0E), ("r", 0x0F), ("y", 0x10), ("t", 0x11), ("o", 0x1F),
-    ("u", 0x20), ("i", 0x22), ("p", 0x23), ("l", 0x25), ("j", 0x26), ("k", 0x28),
-    ("n", 0x2D), ("m", 0x2E),
-    ("1", 0x12), ("2", 0x13), ("3", 0x14), ("4", 0x15), ("5", 0x17), ("6", 0x16),
-    ("7", 0x1A), ("8", 0x1C), ("9", 0x19), ("0", 0x1D),
-    ("minus", 0x1B), ("equal", 0x18), ("leftbracket", 0x21), ("rightbracket", 0x1E),
-    ("semicolon", 0x29), ("quote", 0x27), ("comma", 0x2B), ("period", 0x2F),
-    ("slash", 0x2C), ("backslash", 0x2A), ("grave", 0x32),
+    ("a", 0x00),
+    ("s", 0x01),
+    ("d", 0x02),
+    ("f", 0x03),
+    ("h", 0x04),
+    ("g", 0x05),
+    ("z", 0x06),
+    ("x", 0x07),
+    ("c", 0x08),
+    ("v", 0x09),
+    ("b", 0x0B),
+    ("q", 0x0C),
+    ("w", 0x0D),
+    ("e", 0x0E),
+    ("r", 0x0F),
+    ("y", 0x10),
+    ("t", 0x11),
+    ("o", 0x1F),
+    ("u", 0x20),
+    ("i", 0x22),
+    ("p", 0x23),
+    ("l", 0x25),
+    ("j", 0x26),
+    ("k", 0x28),
+    ("n", 0x2D),
+    ("m", 0x2E),
+    ("1", 0x12),
+    ("2", 0x13),
+    ("3", 0x14),
+    ("4", 0x15),
+    ("5", 0x17),
+    ("6", 0x16),
+    ("7", 0x1A),
+    ("8", 0x1C),
+    ("9", 0x19),
+    ("0", 0x1D),
+    ("minus", 0x1B),
+    ("equal", 0x18),
+    ("leftbracket", 0x21),
+    ("rightbracket", 0x1E),
+    ("semicolon", 0x29),
+    ("quote", 0x27),
+    ("comma", 0x2B),
+    ("period", 0x2F),
+    ("slash", 0x2C),
+    ("backslash", 0x2A),
+    ("grave", 0x32),
     // 标点的字面量别名。热键录制拿到的是键面上印的字符（"]" 而不是 "rightbracket"），
     // 两种写法都收，配置文件里存哪种都能用。
-    ("-", 0x1B), ("=", 0x18), ("[", 0x21), ("]", 0x1E), (";", 0x29), ("'", 0x27),
-    (",", 0x2B), (".", 0x2F), ("/", 0x2C), ("\\", 0x2A), ("`", 0x32),
-    ("f1", 0x7A), ("f2", 0x78), ("f3", 0x63), ("f4", 0x76), ("f5", 0x60),
-    ("f6", 0x61), ("f7", 0x62), ("f8", 0x64), ("f9", 0x65), ("f10", 0x6D),
-    ("f11", 0x67), ("f12", 0x6F),
+    ("-", 0x1B),
+    ("=", 0x18),
+    ("[", 0x21),
+    ("]", 0x1E),
+    (";", 0x29),
+    ("'", 0x27),
+    (",", 0x2B),
+    (".", 0x2F),
+    ("/", 0x2C),
+    ("\\", 0x2A),
+    ("`", 0x32),
+    ("f1", 0x7A),
+    ("f2", 0x78),
+    ("f3", 0x63),
+    ("f4", 0x76),
+    ("f5", 0x60),
+    ("f6", 0x61),
+    ("f7", 0x62),
+    ("f8", 0x64),
+    ("f9", 0x65),
+    ("f10", 0x6D),
+    ("f11", 0x67),
+    ("f12", 0x6F),
     // F13~F15：没有默认绑定，很适合当外部 app 的热键，按住也不会打出字符
-    ("f13", 0x69), ("f14", 0x6B), ("f15", 0x71),
+    ("f13", 0x69),
+    ("f14", 0x6B),
+    ("f15", 0x71),
     // 修饰键本体。外部语音 app（闪电说这类）常把「按着说」绑在这上面，
     // 得能单独发。注意 fn 是硬件级的，合成基本无效 —— 这也是为什么
     // 界面上建议你去那个 app 里改成普通组合键。
-    ("cmd", 0x37), ("leftcmd", 0x37), ("rightcmd", 0x36),
-    ("shift", 0x38), ("leftshift", 0x38), ("rightshift", 0x3C),
-    ("alt", 0x3A), ("leftoption", 0x3A), ("rightoption", 0x3D),
-    ("ctrl", 0x3B), ("leftcontrol", 0x3B), ("rightcontrol", 0x3E),
+    ("cmd", 0x37),
+    ("leftcmd", 0x37),
+    ("rightcmd", 0x36),
+    ("shift", 0x38),
+    ("leftshift", 0x38),
+    ("rightshift", 0x3C),
+    ("alt", 0x3A),
+    ("leftoption", 0x3A),
+    ("rightoption", 0x3D),
+    ("ctrl", 0x3B),
+    ("leftcontrol", 0x3B),
+    ("rightcontrol", 0x3E),
     ("fn", 0x3F),
 ];
 
 pub fn key_names() -> Vec<&'static str> {
-    VK.iter().map(|(n, _)| *n).chain(NX.iter().map(|(n, _)| *n)).collect()
+    VK.iter()
+        .map(|(n, _)| *n)
+        .chain(NX.iter().map(|(n, _)| *n))
+        .collect()
 }
 
 fn code_of(name: &str) -> Option<u16> {
     let l = name.to_ascii_lowercase();
     VK.iter().find(|(n, _)| *n == l).map(|(_, c)| *c)
+}
+
+/// keycode → 键名。录快捷键时用（tap 给的是 keycode）。
+/// 表里同一个 code 有多个别名（return/enter），取第一个 —— 那是首选写法。
+pub fn name_of_code(code: u16) -> Option<&'static str> {
+    VK.iter().find(|(_, c)| *c == code).map(|(n, _)| *n)
 }
 
 fn flags_of(mods: &[String]) -> CGEventFlags {
@@ -169,8 +255,8 @@ fn emit(key: &str, mods: &[String], down: bool) -> Result<()> {
     // 根本没有的 0x20000000 位（实测），而且 set_flags 清不掉它。
     let src = CGEventSource::new(CGEventSourceStateID::Private)
         .map_err(|_| anyhow!("建 CGEventSource 失败"))?;
-    let ev = CGEvent::new_keyboard_event(src, code, down)
-        .map_err(|_| anyhow!("建 CGEvent 失败"))?;
+    let ev =
+        CGEvent::new_keyboard_event(src, code, down).map_err(|_| anyhow!("建 CGEvent 失败"))?;
     if self_flag.is_some() {
         // 主键本身就是修饰键 → 改成 flagsChanged
         ev.set_type(core_graphics::event::CGEventType::FlagsChanged);
@@ -359,7 +445,10 @@ mod tests {
                 .args(["-e", "output volume of (get volume settings)"])
                 .output()
                 .expect("osascript");
-            String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(-1)
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(-1)
         }
         let before = vol();
         post_media(nx_of("volume_down").unwrap()).unwrap();

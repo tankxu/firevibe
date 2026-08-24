@@ -1,6 +1,7 @@
 //! 无界面版：在做 GUI 之前把引擎跑通，也用于排障。
 mod adapt;
 mod map;
+mod probeall;
 mod sniff;
 use firevibe_core::{
     config::{Config, VoiceMode},
@@ -185,7 +186,243 @@ fn run_tap() -> anyhow::Result<()> {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+
+/// 让 firectl 成为自己的 TCC「责任进程」，从而能像 FireVibe.app 一样
+/// 在系统设置里**独立持有**「输入监控」授权 —— 而不是继承启动它的终端那份。
+///
+/// 背景：从 shell 跑一个 CLI，TCC 把权限归责到父进程（终端）。所以哪怕 firectl
+/// 自己签名再正确，用的还是终端那份授权；终端若是 ad-hoc 签名，授权还会静默失效。
+/// 解法：进程一启动就用带 `disclaim` 的 posix_spawn 原地重执行自己（SETEXEC），
+/// 重执行出来的这一份对 TCC 自负其责。之后在「输入监控」里勾一次 firectl 本体，
+/// 从任何终端跑都认这份授权。
+///
+/// 首次生效需要用户在弹框里授权一次 firectl（跟当初授权 FireVibe 一样）。
+#[cfg(target_os = "macos")]
+fn become_self_responsible() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    // 已经重执行过 → 跳过，避免无限循环
+    if std::env::var_os("FIRECTL_DISCLAIMED").is_some() {
+        return;
+    }
+    extern "C" {
+        // 私有 API（libSystem 里有，无公开头文件）：令 posix_spawn 出的进程
+        // 对 TCC 自负其责，不再继承父进程的责任归属。
+        fn responsibility_spawnattrs_setdisclaim(
+            attr: *mut libc::posix_spawnattr_t,
+            disclaim: libc::c_int,
+        ) -> libc::c_int;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe_c) = CString::new(exe.as_os_str().as_bytes()) else { return };
+
+    // argv 原样透传
+    let args: Vec<CString> = std::env::args_os()
+        .filter_map(|a| CString::new(a.as_bytes()).ok())
+        .collect();
+    let mut argv: Vec<*mut libc::c_char> = args.iter().map(|a| a.as_ptr() as *mut _).collect();
+    argv.push(std::ptr::null_mut());
+
+    // envp 透传 + 打上标记，防止重执行后再次进来
+    let mut envs: Vec<CString> = std::env::vars_os()
+        .filter_map(|(k, v)| {
+            let mut kv = k.into_vec();
+            kv.push(b'=');
+            kv.extend_from_slice(v.as_bytes());
+            CString::new(kv).ok()
+        })
+        .collect();
+    if let Ok(m) = CString::new("FIRECTL_DISCLAIMED=1") {
+        envs.push(m);
+    }
+    let mut envp: Vec<*mut libc::c_char> = envs.iter().map(|e| e.as_ptr() as *mut _).collect();
+    envp.push(std::ptr::null_mut());
+
+    unsafe {
+        let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+        if libc::posix_spawnattr_init(&mut attr) != 0 {
+            return;
+        }
+        responsibility_spawnattrs_setdisclaim(&mut attr, 1);
+        // SETEXEC：像 exec 一样原地替换本进程镜像，但带上 disclaim 属性。
+        // 成功则不返回；返回了就是失败，退回原流程（最坏 == 改动前的行为）。
+        libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_SETEXEC as libc::c_short);
+        libc::posix_spawn(
+            std::ptr::null_mut(),
+            exe_c.as_ptr(),
+            std::ptr::null(),
+            &attr,
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
+        libc::posix_spawnattr_destroy(&mut attr);
+    }
+}
+
+
+/// 定死哪个关麦命令真能停流。直接用 hidapi 开设备，不经 runtime（免得开局补发/
+/// 自愈那些自动发命令干扰）。开麦→测基线帧率→发候选关麦→测之后帧率，逐个比。
+fn mic_off_test() -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+    let cfg = firevibe_core::config::Config::load();
+    let (vid, pid) = cfg.device_ids();
+    let api = hidapi::HidApi::new()?;
+    #[cfg(target_os = "macos")]
+    api.set_open_exclusive(false); // 非独占，跟 runtime 一致；默认独占会 privilege violation
+    let dev = api.open(vid, pid).map_err(|e| anyhow::anyhow!("HID_NOT_PERMITTED: {e}"))?;
+    dev.set_blocking_mode(false).ok();
+    println!("已打开 0x{vid:04x}/0x{pid:04x}\n");
+
+    // 数 secs 秒内收到多少条 0xF0 音频帧
+    let count = |dev: &hidapi::HidDevice, secs: f32| -> u32 {
+        let mut buf = [0u8; 128];
+        let mut n = 0u32;
+        let end = Instant::now() + Duration::from_secs_f32(secs);
+        while Instant::now() < end {
+            if let Ok(len) = dev.read_timeout(&mut buf, 50) {
+                if len > 0 && buf[0] == 0xF0 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    let arm = |dev: &hidapi::HidDevice| {
+        let _ = dev.write(&[0xF2, 0x01, 0x01]); // 已知有效的开麦
+        std::thread::sleep(Duration::from_millis(800));
+    };
+
+    // 候选关麦命令
+    let candidates: &[(&str, &[u8])] = &[
+        ("[F2 01 00]  3字节（旧关麦，实测无效）", &[0xF2, 0x01, 0x00]),
+        ("[F2 00]     2字节（现用关麦）", &[0xF2, 0x00]),
+    ];
+
+    println!("先开麦，测基线帧率（应 ~50/秒）…");
+    arm(&dev);
+    let base = count(&dev, 3.0);
+    println!("  基线 {} 帧 / 3秒 = {:.0}/秒\n", base, base as f32 / 3.0);
+    if base < 30 {
+        println!("⚠ 基线太低，麦克风没在吐流（可能没按住/没热）。先确认 --mic 能出流再来。");
+        return Ok(());
+    }
+
+    for (label, cmd) in candidates {
+        arm(&dev); // 每轮先确保在开麦态
+        let _ = count(&dev, 1.0); // 稳定一下
+        let w = dev.write(cmd);
+        std::thread::sleep(Duration::from_millis(600)); // 给停流留反应时间
+        let after = count(&dev, 3.0);
+        let rate = after as f32 / 3.0;
+        let verdict = if rate < 5.0 { "✓ 停了" } else if rate < 25.0 { "~ 半停" } else { "✗ 没停" };
+        println!(
+            "{label:32} 写={:<6} 之后 {rate:4.0}/秒  {verdict}",
+            w.map(|n| format!("{n}B")).unwrap_or_else(|_| "失败".into())
+        );
+    }
+    // 收尾：用测出来有效的那个关，兜底两个都发
+    let _ = dev.write(&[0xF2, 0x00]);
+    let _ = dev.write(&[0xF2, 0x01, 0x00]);
+    println!("\n（已尝试关麦收尾）");
+    Ok(())
+}
+
+
+/// 按键边沿追踪：每个键的**按下 / 松开**都带时间戳打印，不执行任何动作。
+/// 专门诊断「短按先于长按触发」——按住一个键 2 秒，看它中途会不会
+/// 冒出一次「松开→按下」（BLE 瞬断），那就是短按被提前触发的根因。
+fn key_trace() -> anyhow::Result<()> {
+    use firevibe_core::runtime::Event;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    let cfg = firevibe_core::config::Config::load();
+    let (rt, rx) = firevibe_core::runtime::Runtime::new(cfg);
+    rt.start()?;
+    rt.set_learn(true); // 只观测，不执行动作
+    rt.trace_keys.store(true, Ordering::Relaxed);
+
+    println!("\n按键边沿追踪 —— 每个按下/松开都会打出来（带时间戳，单位毫秒）。");
+    println!("请**按住那个配了短按+长按的键约 2 秒，再松开**。可重复几次。");
+    println!("正常长按应只有一条「按下」…（2秒）…一条「松开」；");
+    println!("要是中途冒出「松开」紧接「按下」，就是 BLE 瞬断 —— 短按被提前触发的元凶。");
+    println!("30 秒后自动结束，Ctrl-C 也行。");
+    println!("{}", "─".repeat(60));
+
+    let t0 = Instant::now();
+    let mut last: Option<(bool, f64)> = None;
+    while t0.elapsed().as_secs() < 30 {
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::KeyEdge { key, down } = ev {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                // 标出与上一条的间隔，瞬断一眼可见
+                let gap = last.map(|(_, t)| format!("(+{:.0}ms)", ms - t)).unwrap_or_default();
+                let flag = match last {
+                    Some((true, t)) if down && (ms - t) < 300.0 => "  ⚠ 按下→按下",
+                    Some((false, t)) if down && (ms - t) < 120.0 => "  ⚠⚠ 松开紧接按下 = 瞬断！",
+                    _ => "",
+                };
+                println!(
+                    "[{ms:8.0}ms] {:<6} {key}   {gap}{flag}",
+                    if down { "按下" } else { "松开" }
+                );
+                last = Some((down, ms));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    rt.trace_keys.store(false, Ordering::Relaxed);
+    rt.stop();
+    println!("{}", "─".repeat(60));
+    println!("把上面整段发回来。");
+    Ok(())
+}
+
+fn main() {
+    if let Err(e) = run_cli() {
+        let msg = format!("{e:#}");
+        eprintln!("\n错误: {msg}");
+        if msg.contains("HID_NOT_PERMITTED")
+            || msg.contains("not permitted")
+            || msg.contains("0xE00002E2")
+        {
+            perm_help();
+        } else if msg.contains("HID_NOT_FOUND") {
+            eprintln!("\n找不到遥控器。先确认：");
+            eprintln!("  · 遥控器已在 系统设置 › 蓝牙 里连上（不是配在电视上）");
+            eprintln!("  · 设备标识对：先跑 `firectl --probe-all` 选一次设备");
+        }
+        std::process::exit(1);
+    }
+}
+
+/// 权限指引 —— 遇到 `not permitted (0xE00002E2)` 时打印。
+/// 这是踩了一整轮才理清的，务必讲准：
+fn perm_help() {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "firectl".into());
+    eprintln!("\n──────── 这是权限问题，不是设备/代码问题 ────────");
+    eprintln!("读写遥控器（HID）需要「输入监控」权限。firectl 已经把自己声明成独立的");
+    eprintln!("授权主体（disclaim），所以要授权的是 **firectl 本体**，不是启动它的终端 ——");
+    eprintln!("加一次，之后从任何终端跑都认（包括 Fleet 这种签名不稳的）。");
+    eprintln!();
+    eprintln!("一次性设置：");
+    eprintln!("  1. 打开 系统设置 › 隐私与安全性 › 输入监控");
+    eprintln!("  2. 点左下角「+」，定位到这个文件并添加：");
+    eprintln!("     {exe}");
+    eprintln!("     （Finder 里按 ⌘⇧G 粘贴上面的路径即可跳过去）");
+    eprintln!("  3. 确保它的开关是打开的，然后重新运行本命令。");
+    eprintln!();
+    eprintln!("⚠️ 要的是「输入监控」(Input Monitoring)，不是「辅助功能」，两者不通用。");
+    eprintln!("⚠️ 重新编译 firectl 后要重新签名（`codesign --force --sign <证书> --identifier");
+    eprintln!("   com.tankxu.firectl <路径>`），否则签名一变授权会静默失效。发布版已签好。");
+    eprintln!("⚠️ 别用 sudo —— root 不在你的图形登录会话里，反而连设备都打不开。");
+    eprintln!("（日常使用不受影响：FireVibe.app 有自己的授权，装好即用。）");
+}
+
+fn run_cli() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    become_self_responsible();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has = |f: &str| args.iter().any(|a| a == f);
     let val = |f: &str| {
@@ -194,6 +431,40 @@ fn main() -> anyhow::Result<()> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+
+    // 未知选项直接报错 —— 别让拼错的命令（比如 --proble-all）静默掉进默认引擎模式
+    // （那会加载 app 配置、跑起来，用户还以为在跑自己想要的命令）。
+    const KNOWN: &[&str] = &[
+        "--help", "-h", "--list-devices", "--exclusive", "--device", "--mode", "--gain",
+        "--no-voice", "--descriptor", "--probe-all", "--probe-mic", "--keys", "--mic-off-test",
+        "--adapt", "--map", "--sniff", "--tap", "--watch-mods", "--modcmp", "--mic", "--hold",
+        "--run", "--type", "--inputs", "--set-input", "--config", "--battery", "--hid-list",
+        "--loopback-test", "--feed-tone", "--pin-input",
+    ];
+    if let Some(bad) = args.iter().find(|a| a.starts_with("--") && !KNOWN.contains(&a.as_str())) {
+        eprintln!("未知选项：{bad}");
+        // 用编辑距离挑最接近的做「是不是想输」提示
+        fn edit_dist(a: &str, b: &str) -> usize {
+            let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+            let mut prev: Vec<usize> = (0..=b.len()).collect();
+            for (i, ca) in a.iter().enumerate() {
+                let mut cur = vec![i + 1];
+                for (j, cb) in b.iter().enumerate() {
+                    let cost = if ca == cb { 0 } else { 1 };
+                    cur.push((prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost));
+                }
+                prev = cur;
+            }
+            prev[b.len()]
+        }
+        if let Some(g) = KNOWN.iter().filter(|k| k.starts_with("--")).min_by_key(|k| edit_dist(k, bad)) {
+            if edit_dist(g, bad) <= 3 {
+                eprintln!("是不是想输：{g} ？");
+            }
+        }
+        eprintln!("跑 `firectl --help` 看全部选项。");
+        std::process::exit(2);
+    }
 
     if has("--help") || has("-h") {
         println!(
@@ -205,27 +476,54 @@ fn main() -> anyhow::Result<()> {
              \x20 --gain <倍数>      覆盖增益\n\
              \x20 --no-voice         只测按键\n\
              \x20 --descriptor       打印 HID 报告描述符后退出\n\
-             \x20 --adapt            换一款遥控器：选设备 → 逐键认键 → 看报文（写进配置）\n\
-             \x20 --probe-mic        按键能用但没声音时跑这个：打出报告描述符和实收报文\n\
+             \x20 --probe-all        ★换遥控器就跑这个：一条命令走完全套，生成报告文件\n\
+             \x20 --adapt            只做「选设备 + 逐键认键」（--probe-all 的子集）\n\
+             \x20 --probe-mic        旧名，等同 --probe-all\n\
              \x20 --hid-list         列出所有 HID 设备的 VID/PID\n\
              \x20 --map              按键测绘：逐个记录每个物理键的真实 HID usage\n\
              \x20 --sniff            原始 report 嗅探：打印每一条报文（含 vendor 0xEF/0xF1）\n\
+             \x20 --keys             按键边沿追踪：每个键的按下/松开带时间戳，诊断长按瞬断\n\
              \x20 --tap              看系统把遥控器按键翻译成了什么事件（只打印非字符键）\n\
              \x20 --mic              强制开麦并送流进虚拟声卡，实时看电平。\n\
              \x20                    只测音频链路，完全不看按键怎么配的。\n\
              \x20 --mic --hold <键>  同时按住一个快捷键（模拟「按住说话 + 触发第三方工具」）\n\
              \x20 --run <位置>:<short|long>  直接执行某个位置配置好的动作，比如 mic:long\n\
              \x20 --inputs           列出可用输入设备并标出当前默认\n\
-             \x20 --set-input <前缀> 切换系统默认输入设备"
+             \x20 --set-input <前缀> 切换系统默认输入设备\n\
+             \n\
+             权限（重要）：\n\
+             \x20 · 读写遥控器需要「输入监控」权限。firectl 会把自己声明为独立授权主体，\n\
+             \x20   所以把 **firectl 本体**加进列表（不是终端），加一次任何终端都认。\n\
+             \x20   系统设置 › 隐私与安全性 › 输入监控 → 点「+」→ 选中 firectl → 打开开关。\n\
+             \x20 · 要的是「输入监控」，不是「辅助功能」。\n\
+             \x20 · 首次报 not permitted 是正常的：照上面加一次即可，之后不再问。\n\
+             \x20 · 别用 sudo —— root 不在图形会话里，反而打不开设备。"
         );
         return Ok(());
     }
 
     // 「按键能用但没声音」专用：一条命令把判定音频通路需要的信息全打出来。
-    // 只发我们已知的开麦报文（0xF2 01 01），**不做 opcode 盲扫** ——
+    // 两步：先被动看按住麦克风键发什么，再主动发一次开麦命令。
+    // ⚠️ 只发 0xF2 的两个已知取值（0x01 开 / 0x00 关），**不做 opcode 盲扫** ——
     // 对不明设备盲扫厂商命令可能干出不可逆的事。
+    // 老命令名，直接转给 --probe-all —— 麦克风那几步已经并进去了。
+    // 留两份实现必然跑偏（上一次就是 --probe-mic 少发了开麦，把结论测反了）。
     if has("--probe-mic") {
-        return probe_mic();
+        println!("（--probe-mic 已并入 --probe-all，直接往下跑）");
+        return probeall::run();
+    }
+
+    // 换一款遥控器的唯一入口：一条命令走完全套并落一份报告文件
+    if has("--mic-off-test") {
+        return mic_off_test();
+    }
+
+    if has("--keys") {
+        return key_trace();
+    }
+
+    if has("--probe-all") {
+        return probeall::run();
     }
 
     // 换一款遥控器：选设备 → 逐键认键 → 看报文，全程写进配置
@@ -376,6 +674,33 @@ fn main() -> anyhow::Result<()> {
 
     // 列出所有 HID 设备。判断「另一款外观相同的遥控器能不能用」时先看这个：
     // 我们是按 VID/PID 打开设备的，标识不一样就完全看不到它。
+    // 验证「电量能不能主动读」：0x03 是 1 字节 INPUT 报文（电池强度 0-100），
+    // 设备想发才发，所以界面常常空着。HID 允许 GetReport(Input, id) 主动取。
+    if has("--battery") {
+        let cfg = firevibe_core::config::Config::load();
+        let (vid, pid) = cfg.device_ids();
+        let api = hidapi::HidApi::new()?;
+        let dev = api.open(vid, pid)?;
+        println!("设备 0x{vid:04x}/0x{pid:04x} 已打开\n");
+        for (label, len) in [("2 字节缓冲", 2usize), ("8 字节缓冲", 8), ("64 字节缓冲", 64)] {
+            let mut buf = vec![0u8; len];
+            buf[0] = 0x03; // 要读的 report id
+            match dev.get_input_report(&mut buf) {
+                Ok(n) => {
+                    println!("  {label}: 读到 {n} 字节 → {:02x?}", &buf[..n.min(len)]);
+                    // 约定：buf[0] 是 report id，后面才是数据
+                    if n >= 2 {
+                        println!("      电量 = {}%", buf[1]);
+                    } else if n == 1 {
+                        println!("      只回了 1 字节，可能就是电量本身 = {}%", buf[0]);
+                    }
+                }
+                Err(e) => println!("  {label}: 失败 {e}"),
+            }
+        }
+        return Ok(());
+    }
+
     if has("--hid-list") {
         let (want_vid, want_pid) = firevibe_core::config::Config::load().device_ids();
         let api = hidapi::HidApi::new()?;
@@ -457,9 +782,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(g) = val("--gain").and_then(|g| g.parse::<f32>().ok()) {
         cfg.voice.gain = g;
     }
-    if has("--no-voice") {
-        cfg.voice.enabled = false;
-    }
+    let no_voice = has("--no-voice");
 
     println!("配置: {}", firevibe_core::config::config_path().display());
     let (rt, rx) = Runtime::new(cfg);
@@ -479,7 +802,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if rt.cfg.read().voice.enabled {
+    if !no_voice {
         if let Err(e) = rt.start_voice() {
             println!("语音未启动: {e}");
         }
@@ -522,6 +845,9 @@ fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
                 Event::Learned(k) => println!("  学习到: {k}"),
+                Event::KeyEdge { key, down } => {
+                    println!("  {} {}", if down { "边沿↓" } else { "边沿↑" }, key)
+                }
             }
         }
         if last_stat.elapsed() >= Duration::from_secs(2) {
@@ -729,79 +1055,3 @@ fn run_watch_mods() -> anyhow::Result<()> {
 }
 
 
-/// 音频通路探测：报告描述符 + 开麦后 12 秒内收到的所有 report id。
-/// 输出整段贴回来就能判断它的语音走哪条路。
-fn probe_mic() -> anyhow::Result<()> {
-    use std::io::Write;
-    use std::sync::atomic::Ordering;
-    let mut cfg = firevibe_core::config::Config::load();
-    cfg.voice.enabled = false;
-    let (vid, pid) = cfg.device_ids();
-    let (rt, _rx) = firevibe_core::runtime::Runtime::new(cfg);
-    rt.start()?;
-    std::thread::sleep(Duration::from_millis(400));
-
-    println!("\n===== FireVibe 音频通路探测 =====");
-    println!("设备标识: 0x{vid:04x} / 0x{pid:04x}");
-
-    let d = rt.descriptor.lock().clone();
-    println!("\n-- HID 报告描述符（{} 字节）--", d.len());
-    println!("{}", d.iter().map(|b| format!("{b:02x}")).collect::<String>());
-    // 描述符里出现过的 Report ID（0x85 是 Report ID 标签）
-    let mut ids: Vec<u8> = Vec::new();
-    let mut i = 0;
-    while i + 1 < d.len() {
-        if d[i] == 0x85 && !ids.contains(&d[i + 1]) {
-            ids.push(d[i + 1]);
-        }
-        i += 1;
-    }
-    println!("描述符里声明的 Report ID: {}",
-        if ids.is_empty() { "（没解析到）".into() }
-        else { ids.iter().map(|b| format!("0x{b:02X}")).collect::<Vec<_>>().join(" ") });
-
-    println!("\n-- 现在请**按住麦克风键说话**，12 秒 --");
-    rt.seen_rids.lock().clear();
-    rt.status.mic_on.store(true, Ordering::Relaxed);
-    let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_secs(12) {
-        std::thread::sleep(Duration::from_millis(400));
-        print!("\r   收到 {} 种报文，音频帧 {}      ",
-            rt.seen_rids.lock().len(),
-            rt.status.audio_frames.load(Ordering::Relaxed));
-        let _ = std::io::stdout().flush();
-    }
-    rt.status.mic_on.store(false, Ordering::Relaxed);
-    println!("\n");
-
-    let seen = rt.seen_rids.lock().clone();
-    println!("-- 实际收到的报文 --");
-    if seen.is_empty() {
-        println!("   一条都没有（设备标识可能不对，先跑 --adapt 第一步）");
-    }
-    for (rid, cnt) in &seen {
-        let what = match *rid {
-            0x01 => "键盘键",
-            0x02 => "多媒体键",
-            0x03 => "电量",
-            0xF0 => "音频流（我们认的那条）",
-            0xEF | 0xF1 | 0xF2 => "厂商私有",
-            _ => "未知",
-        };
-        println!("   0x{rid:02X}  {what:<22} {cnt} 条");
-    }
-    let audio = seen.get(&0xF0).copied().unwrap_or(0);
-    println!("\n-- 结论 --");
-    if audio > 0 {
-        println!("   ✓ 音频走 HID 0xF0，和 Fire TV 3rd Gen 一致，麦克风应该能用");
-    } else if seen.keys().any(|r| *r >= 0xE0) {
-        println!("   ? 有厂商私有报文但没有 0xF0 —— 音频可能在别的 report id 上");
-        println!("     把上面整段发回来，能定位到具体是哪个");
-    } else {
-        println!("   ✗ 只有普通按键报文，没有任何音频/私有报文");
-        println!("     它的语音大概不走 HID（可能是 BLE GATT），那条目前没实现");
-    }
-    println!("\n===== 探测结束，把这一整段发回来即可 =====\n");
-    rt.stop();
-    Ok(())
-}

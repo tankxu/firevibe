@@ -19,7 +19,7 @@ const W: f32 = 300.;
 const H: f32 = 44.;
 /// 离屏幕底边多高。要够高 —— 输入法自己的候选/语音浮层就在屏幕底部，
 /// 盖住了就没法看它的状态。
-const BOTTOM_GAP: f32 = 240.;
+const BOTTOM_GAP: f32 = 140.;  // 离底部的距离；比原来 240 低了 100px
 
 pub struct Hud {
     rt: Arc<Runtime>,

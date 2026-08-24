@@ -612,13 +612,15 @@ pub fn kind_icon(k: ActionType) -> Option<&'static str> {
     Some(match k {
         ActionType::None => return None,
         ActionType::Key => "keyboard",
-        ActionType::Text => "a-large-small",
+        ActionType::Text => "type",
         ActionType::OpenApp => "external-link",
         ActionType::AppleScript => "zap",
         ActionType::Shell => "square-terminal",
+        ActionType::Http => "external-link",
         ActionType::VoicePtt | ActionType::VoiceToggle => "mic",
         ActionType::VoiceHotkey => "zap",
         ActionType::VoiceDictate => "mic",
+        ActionType::Record => "mic",
     })
 }
 
@@ -677,10 +679,18 @@ pub fn describe(a: &Action) -> (String, String) {
             (format!("AppleScript · {name}"), a.arg.clone())
         }
         ActionType::Shell => ("执行命令".into(), a.arg.clone()),
+        ActionType::Http => {
+            let m = if a.method.is_empty() { "GET" } else { &a.method };
+            (format!("HTTP {m}"), a.arg.clone())
+        }
         ActionType::VoiceToggle => {
             ("开始 / 停止说话".into(), "点一下开始，再点一下停止".into())
         }
         ActionType::VoicePtt => ("按住说话".into(), "按住送流，松手停止".into()),
+        ActionType::Record => (
+            "按住录音".into(),
+            "松手保存到「下载」".into(),
+        ),
         ActionType::VoiceDictate => (
             "语音转文字".into(),
             if a.arg == "hold" {

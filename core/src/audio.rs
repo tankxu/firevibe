@@ -38,7 +38,11 @@ mod imp {
 
     impl Addr {
         const fn new(selector: u32, scope: u32) -> Self {
-            Self { selector, scope, element: 0 }
+            Self {
+                selector,
+                scope,
+                element: 0,
+            }
         }
     }
 
@@ -274,9 +278,11 @@ mod tests {
         }
         set_default_input(orig.id).unwrap();
         std::thread::sleep(Duration::from_millis(200));
-        println!("最慢一次生效 {:.1}ms；已还原到 {}",
-                 worst as f64 / 1000.0,
-                 default_input().unwrap().name);
+        println!(
+            "最慢一次生效 {:.1}ms；已还原到 {}",
+            worst as f64 / 1000.0,
+            default_input().unwrap().name
+        );
     }
 
     /// 手动跑：`cargo test -p firevibe-core -- --ignored --nocapture list_inputs`
@@ -286,7 +292,11 @@ mod tests {
         let cur = default_input();
         println!("当前默认输入: {cur:?}");
         for d in input_devices() {
-            let mark = if Some(d.id) == cur.as_ref().map(|c| c.id) { "*" } else { " " };
+            let mark = if Some(d.id) == cur.as_ref().map(|c| c.id) {
+                "*"
+            } else {
+                " "
+            };
             println!("{mark} {:>5}  {}", d.id, d.name);
         }
         assert!(!input_devices().is_empty(), "一个输入设备都没枚举到");

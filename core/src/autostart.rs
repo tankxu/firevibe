@@ -12,7 +12,9 @@ mod imp {
 
     fn plist_path() -> Result<PathBuf> {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("找不到 home 目录"))?;
-        Ok(home.join("Library/LaunchAgents").join(format!("{LABEL}.plist")))
+        Ok(home
+            .join("Library/LaunchAgents")
+            .join(format!("{LABEL}.plist")))
     }
 
     pub fn enabled() -> bool {
@@ -25,7 +27,11 @@ mod imp {
             if path.exists() {
                 // 先卸载再删，免得留个僵尸 job
                 let _ = std::process::Command::new("launchctl")
-                    .args(["bootout", &format!("gui/{}", uid()), path.to_str().unwrap_or("")])
+                    .args([
+                        "bootout",
+                        &format!("gui/{}", uid()),
+                        path.to_str().unwrap_or(""),
+                    ])
                     .status();
                 std::fs::remove_file(&path)?;
             }
@@ -54,7 +60,11 @@ mod imp {
         );
         std::fs::write(&path, plist)?;
         let _ = std::process::Command::new("launchctl")
-            .args(["bootstrap", &format!("gui/{}", uid()), path.to_str().unwrap_or("")])
+            .args([
+                "bootstrap",
+                &format!("gui/{}", uid()),
+                path.to_str().unwrap_or(""),
+            ])
             .status();
         Ok(())
     }

@@ -20,7 +20,11 @@ pub enum UpdateStatus {
     /// 已是最新
     UpToDate,
     /// 有新版本
-    Available { version: String, url: String, notes: String },
+    Available {
+        version: String,
+        url: String,
+        notes: String,
+    },
     /// 没配更新源
     NotConfigured,
     Failed(String),
@@ -92,7 +96,11 @@ pub fn check(endpoint: Option<&str>) -> UpdateStatus {
         Err(e) => return UpdateStatus::Failed(format!("清单解析失败: {e}")),
     };
     if newer(&m.version, VERSION) {
-        UpdateStatus::Available { version: m.version, url: m.url, notes: m.notes }
+        UpdateStatus::Available {
+            version: m.version,
+            url: m.url,
+            notes: m.notes,
+        }
     } else {
         UpdateStatus::UpToDate
     }

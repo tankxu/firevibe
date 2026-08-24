@@ -18,6 +18,9 @@ impl L {
         t!(self.0, "Fire TV 遥控器控制台", "Fire TV remote console")
     }
     pub fn settings(&self) -> &'static str { t!(self.0, "设置", "Settings") }
+    // 菜单栏（tray）
+    pub fn tray_show(&self) -> &'static str { t!(self.0, "显示窗口", "Show Window") }
+    pub fn tray_quit(&self) -> &'static str { t!(self.0, "退出", "Quit") }
 
     // 状态条
     pub fn paired(&self) -> &'static str { t!(self.0, "已配对", "Paired") }

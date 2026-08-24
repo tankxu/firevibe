@@ -34,9 +34,16 @@ impl Recorder {
         if self.pcm.len() < 16_000 * 60 {
             self.pcm.extend_from_slice(s);
         }
-        let pk = s.iter().map(|v| (*v as f32 / 32768.0).abs()).fold(0.0_f32, f32::max);
+        let pk = s
+            .iter()
+            .map(|v| (*v as f32 / 32768.0).abs())
+            .fold(0.0_f32, f32::max);
         // 上升立刻跟，下降慢一点，不然条子闪得看不清
-        self.peak = if pk > self.peak { pk } else { self.peak * 0.82 + pk * 0.18 };
+        self.peak = if pk > self.peak {
+            pk
+        } else {
+            self.peak * 0.82 + pk * 0.18
+        };
     }
     /// 实时电平 0~1
     pub fn level(&self) -> f32 {
@@ -128,10 +135,8 @@ mod imp {
 
     fn recognizer(locale: &str) -> Result<Retained<SFSpeechRecognizer>> {
         unsafe {
-            let loc = NSLocale::initWithLocaleIdentifier(
-                NSLocale::alloc(),
-                &NSString::from_str(locale),
-            );
+            let loc =
+                NSLocale::initWithLocaleIdentifier(NSLocale::alloc(), &NSString::from_str(locale));
             SFSpeechRecognizer::initWithLocale(SFSpeechRecognizer::alloc(), &loc)
                 .ok_or_else(|| anyhow!("这个语言不支持语音识别: {locale}"))
         }

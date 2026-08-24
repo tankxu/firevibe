@@ -162,11 +162,11 @@ impl Slot {
     /// 各 App 键的品牌色（画上去更像实物）
     pub fn tint(self) -> Option<u32> {
         Some(match self {
-            Slot::Mic => 0x2b7fd4,     // Alexa 蓝
-            Slot::App1 => 0x1a5fa8,    // prime video 蓝
-            Slot::App2 => 0xd7202a,    // Netflix 红
-            Slot::App3 => 0x1a2b6d,    // Disney+ 深蓝
-            Slot::App4 => 0x1ce783,    // hulu 绿
+            Slot::Mic => 0x2b7fd4,  // Alexa 蓝
+            Slot::App1 => 0x1a5fa8, // prime video 蓝
+            Slot::App2 => 0xd7202a, // Netflix 红
+            Slot::App3 => 0x1a2b6d, // Disney+ 深蓝
+            Slot::App4 => 0x1ce783, // hulu 绿
             _ => return None,
         })
     }

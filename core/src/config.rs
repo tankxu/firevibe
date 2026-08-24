@@ -28,6 +28,8 @@ pub enum ActionType {
     AppleScript,
     /// 执行 shell 命令
     Shell,
+    /// 发一个 HTTP 请求（GET/POST，可配重试和超时）
+    Http,
     /// 按住把遥控器麦克风送进虚拟声卡（松手停）
     VoicePtt,
     /// 点一下开始送流，再点一下停止
@@ -40,19 +42,23 @@ pub enum ActionType {
     /// `arg` 存模式，跟着短按/长按走：`"tap"` = 敲一下（短按），
     /// `"hold"` = 按住期间一直按着（长按）
     VoiceHotkey,
+    /// 录音到「下载」：按一下开始，再按一下停止
+    Record,
 }
 impl ActionType {
-    pub const ALL: [ActionType; 10] = [
+    pub const ALL: [ActionType; 12] = [
         ActionType::None,
         ActionType::Key,
         ActionType::Text,
         ActionType::OpenApp,
         ActionType::AppleScript,
         ActionType::Shell,
+        ActionType::Http,
         ActionType::VoiceToggle,
         ActionType::VoicePtt,
         ActionType::VoiceHotkey,
         ActionType::VoiceDictate,
+        ActionType::Record,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -62,10 +68,12 @@ impl ActionType {
             ActionType::OpenApp => "打开应用",
             ActionType::AppleScript => "AppleScript",
             ActionType::Shell => "执行命令",
+            ActionType::Http => "HTTP 请求",
             ActionType::VoicePtt => "按住说话",
             ActionType::VoiceToggle => "开始 / 停止说话",
             ActionType::VoiceHotkey => "第三方语音输入",
             ActionType::VoiceDictate => "语音转文字",
+            ActionType::Record => "录音",
         }
     }
     pub fn hint(self) -> &'static str {
@@ -76,9 +84,11 @@ ActionType::Text => "把一段文字输入到当前焦点",
 ActionType::OpenApp => "按 bundle id、应用名或路径打开",
 ActionType::AppleScript => "跑一段 AppleScript，能驱动几乎所有 mac 应用",
 ActionType::Shell => "交给 /bin/sh 执行",
+ActionType::Http => "按下时发一个 HTTP 请求（GET/POST），可配重试次数和超时",
 ActionType::VoicePtt => "按住时把麦克风送进虚拟声卡，松手停止",
 ActionType::VoiceToggle => "点一下开始送流，再点一下停止",
 ActionType::VoiceDictate => "用系统自带的离线语音识别把你说的话转成文字，打进当前焦点。不依赖第三方工具，也不动系统输入设备",
+ActionType::Record => "按住录音、松手保存到「下载」。录的是遥控器麦克风 —— 遥控器只在麦克风键按住时才出声，所以这个动作配在麦克风键的长按上才有用。录音状态只在本应用窗口里显示",
 ActionType::VoiceHotkey => {"发一个快捷键去唤起第三方语音输入工具，由它识别并把文字打进当前焦点。短按 = 敲一下，长按 = 按住不放"
 }
 }
@@ -100,9 +110,25 @@ pub struct Action {
     pub key: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mods: Vec<String>,
-    /// Text / OpenApp / AppleScript / Shell 的参数
+    /// Text / OpenApp / AppleScript / Shell 的参数；Http 时是 URL
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub arg: String,
+    /// Http：请求方法 "GET" / "POST"（空=GET）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub method: String,
+    /// Http：POST 请求体
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    /// Http：失败重试次数（0=不重试）
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retries: u32,
+    /// Http：超时毫秒（0=默认 2000）
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub timeout_ms: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 impl Action {
     pub fn none() -> Self {
@@ -135,12 +161,19 @@ impl Action {
         }
     }
     /// 外部语音 app 的快捷键。`hold=true` 表示按住期间一直按着。
+    pub fn record() -> Self {
+        Self {
+            kind: ActionType::Record,
+            ..Self::none()
+        }
+    }
     pub fn voice_hotkey(key: &str, mods: Vec<String>, hold: bool) -> Self {
         Self {
             kind: ActionType::VoiceHotkey,
             key: key.into(),
             mods,
             arg: if hold { "hold".into() } else { "tap".into() },
+            ..Default::default()
         }
     }
     /// UI 上显示的一行摘要
@@ -159,9 +192,14 @@ impl Action {
             ActionType::OpenApp => format!("打开 {}", pretty_app(&self.arg)),
             ActionType::AppleScript => format!("AppleScript · {}", ellipsis(&self.arg, 24)),
             ActionType::Shell => format!("命令 · {}", ellipsis(&self.arg, 24)),
+            ActionType::Http => {
+                let m = if self.method.is_empty() { "GET" } else { &self.method };
+                format!("HTTP {m} · {}", ellipsis(&self.arg, 22))
+            }
             ActionType::VoicePtt => "按住说话".into(),
             ActionType::VoiceToggle => "开始 / 停止说话".into(),
             ActionType::VoiceDictate => "语音转文字".into(),
+            ActionType::Record => "按住录音".into(),
             ActionType::VoiceHotkey => {
                 let m: String = self.mods.iter().map(|m| format!("{m}+")).collect();
                 let k = if self.key.is_empty() {
@@ -326,7 +364,6 @@ pub enum VoiceMode {
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct VoiceConfig {
-    pub enabled: bool,
     pub mode: VoiceMode,
     pub device: String,
     pub gain: f32,
@@ -334,7 +371,6 @@ pub struct VoiceConfig {
 impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             mode: VoiceMode::Gate,
             // 自建的那块（driver/build.sh 编的）自称 USB 传输类型 ——
             // 豆包、闪电说会把「虚拟」设备从麦克风候选里滤掉，BlackHole 就是这么被漏掉的。
@@ -344,23 +380,15 @@ impl Default for VoiceConfig {
         }
     }
 }
-/// 优先用我们自己那块（自称 USB，第三方语音工具才认），退回 BlackHole。
-/// 只按名字前缀挑，真正的设备查找在 voice/audio 里做。
+/// 语音要用的声卡：**永远是我们自己那块 FireVibe Mic**。
+///
+/// ⚠️ 不回退到真 BlackHole。真 BlackHole 的传输类型是「Virtual」，豆包/闪电说这类
+/// 工具正好把 Virtual 设备从麦克风候选里滤掉 —— 喂进真 BlackHole 它们根本看不到，
+/// 等于没装。我们这块是 BlackHole 改一行「自称 USB」编出来的，就是为了绕过这个过滤。
+/// 所以没装 FireVibe Mic 时应显示「未安装」、引导装我们这块，而不是把已有的 BlackHole
+/// 当成就绪（那会让人以为能用、实则豆包里选不到）。
 pub fn preferred_voice_device() -> String {
-    const OURS: &str = crate::audiodriver::DEVICE_NAME;
-    let devs = crate::audio::input_devices();
-    let has = |n: &str| devs.iter().any(|d| d.name.starts_with(n));
-    // 自己那块装了就用它
-    if has(OURS) {
-        return OURS.into();
-    }
-    // 自己那块没装、但人家已经有 BlackHole —— 尊重现状，别逼他再装一块
-    if has("BlackHole") {
-        return "BlackHole".into();
-    }
-    // 两块都没有：指向自己那块。界面上的「安装」按钮装的就是它
-    //（应用自带驱动），退回 BlackHole 会让人以为得去别处下载。
-    OURS.into()
+    crate::audiodriver::DEVICE_NAME.into()
 }
 
 // ---------------- 应用设置 ----------------
@@ -530,7 +558,10 @@ impl Config {
             let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
                 return fallback;
             };
-            let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+            let s = s
+                .strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X"))
+                .unwrap_or(s);
             u16::from_str_radix(s, 16).unwrap_or(fallback)
         }
         (
@@ -615,6 +646,11 @@ impl Config {
             }
             c.schema = SCHEMA;
             let _ = c.save();
+        }
+        // 兜底：任何停在旧默认值 "BlackHole" 的配置都指向我们自己那块 ——
+        // 真 BlackHole 传输类型 Virtual，豆包滤得掉、喂不进（见 preferred_voice_device）。
+        if c.voice.device == "BlackHole" {
+            c.voice.device = crate::audiodriver::DEVICE_NAME.into();
         }
         c
     }

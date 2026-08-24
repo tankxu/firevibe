@@ -4,14 +4,13 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.1.2-beta.1"
+version = "0.1.2"
 
 [workspace.dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 parking_lot = "0.12"
-tracing = "0.1"
 
 # arrayref 0.3.10 在 crates.io 索引里声明了一个不存在的依赖 proc-macro1（^1.0.107），
 # 而它更早的版本全被 yank —— 任何需要 arrayref 的依赖图都解不开。

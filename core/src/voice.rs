@@ -198,10 +198,13 @@ impl VoiceSink {
         let ratio = self.out_rate as f64 / OPUS_RATE as f64;
 
         // RMS 电平给 UI
-        let sum: f64 = pcm.iter().map(|&s| {
-            let x = s as f64 / 32768.0;
-            x * x
-        }).sum();
+        let sum: f64 = pcm
+            .iter()
+            .map(|&s| {
+                let x = s as f64 / 32768.0;
+                x * x
+            })
+            .sum();
         let rms = (sum / pcm.len() as f64).sqrt() as f32;
         self.sh.level.store(f32_to_bits(rms), Ordering::Relaxed);
 
@@ -263,7 +266,9 @@ impl LoopbackStatus {
     pub fn hint(&self) -> &'static str {
         match self {
             LoopbackStatus::Unknown | LoopbackStatus::Ready { .. } => "",
-            LoopbackStatus::InstalledNotLoaded => "执行 sudo killall coreaudiod 让 CoreAudio 重新加载",
+            LoopbackStatus::InstalledNotLoaded => {
+                "执行 sudo killall coreaudiod 让 CoreAudio 重新加载"
+            }
             LoopbackStatus::Missing => "执行 brew install blackhole-2ch 安装虚拟声卡",
         }
     }
@@ -291,7 +296,9 @@ pub fn loopback_status(prefix: &str) -> LoopbackStatus {
         if let Ok(rd) = std::fs::read_dir("/Library/Audio/Plug-Ins/HAL") {
             for e in rd.flatten() {
                 let n = e.file_name().to_string_lossy().to_lowercase();
-                if n.starts_with(&want) || n.contains("blackhole") {
+                // 只认我们自己那块的驱动文件夹（FireVibeMic.driver）——
+                // 别把机器上已有的真 BlackHole 当成「我们的装了但没加载」。
+                if n.starts_with(&want) || n.contains("firevibemic") {
                     return LoopbackStatus::InstalledNotLoaded;
                 }
             }
@@ -395,7 +402,11 @@ pub fn loopback_selftest(device_prefix: &str, secs: f32) -> Result<(f32, f32)> {
     sink.set_passing(false);
 
     let (sq, cnt) = *acc.lock();
-    let heard = if cnt == 0 { 0.0 } else { (sq / cnt as f64).sqrt() as f32 };
+    let heard = if cnt == 0 {
+        0.0
+    } else {
+        (sq / cnt as f64).sqrt() as f32
+    };
     let sent_rms = (sent / done as f64).sqrt() as f32;
     Ok((sent_rms, heard))
 }

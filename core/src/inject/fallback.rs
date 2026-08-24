@@ -30,3 +30,8 @@ impl Injector for NopInjector {
         Err(anyhow!("不支持"))
     }
 }
+
+/// 这个平台没有键码表
+pub fn name_of_code(_code: u16) -> Option<&'static str> {
+    None
+}

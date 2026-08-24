@@ -25,7 +25,12 @@ pub fn bundled() -> Option<PathBuf> {
         return Some(p);
     }
     // 开发时直接跑 target/release/firevibe-ui：退回仓库里的产物
-    let dev = exe.parent()?.parent()?.parent()?.join("driver/out").join(BUNDLE);
+    let dev = exe
+        .parent()?
+        .parent()?
+        .parent()?
+        .join("driver/out")
+        .join(BUNDLE);
     dev.is_dir().then_some(dev)
 }
 
