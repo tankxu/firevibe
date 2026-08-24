@@ -1,6 +1,6 @@
 //! 编辑操作弹窗。改的是临时状态，点保存才写回配置。
 
-use crate::cards::{card_title, new_input, to_action};
+use crate::cards::{new_input, to_action};
 use crate::theme::*;
 use crate::widget::*;
 use crate::{EditState, FireVibe};
@@ -88,7 +88,7 @@ impl FireVibe {
             .unwrap_or_default();
         let sub = format!(
             "{} · {} · {}",
-            card_title(d.slot),
+            l.card_title(d.slot),
             if d.long {
                 l.long_press()
             } else {
@@ -160,33 +160,29 @@ impl FireVibe {
                             .text_size(px(11.5))
                             .text_color(c(INK2))
                             .line_height(gpui::relative(1.5))
-                            .child(SharedString::from(
-                                "这颗键会在硬件层直接变成这个修饰键 —— 系统收到的和你按真键盘\
-                                 完全一样，所以那些只认硬件按键的语音工具也能收到。\
-                                 应用退出时会自动还原。",
-                            )),
+                            .child(SharedString::from(l.hw_modifier_note())),
                     );
                 }
                 let dbl = d.dbl;
                 body = body.child(
 div().child(field_lab(l.hotkey())).child(self.hotkey_field(d, cx))).when(!d.long, |b| b.child(
     div().flex().flex_col().gap(px(6.))
-        .child(field_lab("触发方式"))
+        .child(field_lab(l.trigger_mode()))
         .child(div().flex().gap(px(6.))
-            .child(chip("hk-tap", "单击一下", !dbl).on_click(cx.listener(|this, _, _, cx| {
+            .child(chip("hk-tap", l.single_tap(), !dbl).on_click(cx.listener(|this, _, _, cx| {
                 if let Some(d) = &mut this.dialog { d.dbl = false; }
                 cx.notify();
             })))
-            .child(chip("hk-dbl", "双击", dbl).on_click(cx.listener(|this, _, _, cx| {
+            .child(chip("hk-dbl", l.double_tap(), dbl).on_click(cx.listener(|this, _, _, cx| {
                 if let Some(d) = &mut this.dialog { d.dbl = true; }
                 cx.notify();
             }))))
 )).child(
 div().px(px(12.)).py(px(10.)).rounded(px(9.)).bg(c(CODE_BG)).border_1().border_color(c(LINE)).text_size(px(11.5)).text_color(c(INK2)).line_height(gpui::relative(1.5)).child(SharedString::from(
 if d.long {
-"长按遥控器时按住这个快捷键不放，松手才松开 —— 对应第三方语音输入工具的「按住说话」。注意 Fn 是硬件级的，合成不出去；单独的修饰键能发出事件，但改不了系统全局修饰位，那个工具认不认只能实测，想稳就用普通组合键。"
+l.hotkey_hold_hint()
 } else {
-"短按遥控器时敲一下这个快捷键 —— 对应第三方语音输入工具的「按一下开始、再按一下结束」。注意 Fn 是硬件级的，合成不出去；单独的修饰键能发出事件，但改不了系统全局修饰位，那个工具认不认只能实测，想稳就用普通组合键。"
+l.hotkey_tap_hint()
 })),);
             }
             ActionType::VoiceDictate => {
@@ -209,9 +205,9 @@ if d.long {
                                 .text_color(c(INK2))
                                 .line_height(gpui::relative(1.5))
                                 .child(SharedString::from(if d.long {
-                                    "按住遥控器说话，松手后用系统自带的离线识别转成文字，打进当前焦点。不依赖任何第三方工具，也不会动你的系统输入设备。语言和「识别后自动回车」在设置里调。"
+                                    l.dictate_hold_hint()
                                 } else {
-                                    "点一下开始录，再点一下结束并识别，文字打进当前焦点。不依赖任何第三方工具，也不会动你的系统输入设备。语言和「识别后自动回车」在设置里调。"
+                                    l.dictate_tap_hint()
                                 })),
                         )
                         .child(
@@ -222,15 +218,15 @@ if d.long {
                                 .text_size(px(11.5))
                                 .text_color(if ok { c(OK) } else { c(WARN) })
                                 .child(icon(if ok { "circle-check" } else { "triangle-alert" }, 14.))
-                                .child(SharedString::from(format!("语音识别权限：{st}"))),
+                                .child(SharedString::from(l.stt_perm_label(st))),
                         )
                         .when(!ok, |d| {
-                            d.child(mini2("stt-auth", "请求授权").on_click(cx.listener(
+                            d.child(mini2("stt-auth", l.request_perm()).on_click(cx.listener(
                                 |this, _, _, cx| {
                                     std::thread::spawn(|| {
                                         let _ = firevibe_core::stt::request_auth();
                                     });
-                                    this.toast("已弹出系统授权框，允许之后回来再看");
+                                    this.toast(this.l().toast_stt_prompt2());
                                     cx.notify();
                                 },
                             )))
@@ -267,7 +263,7 @@ if d.long {
                 body = body
                     .child(div().child(field_lab("URL")).child(code_field(d)))
                     .child(
-                        div().flex().flex_col().gap(px(6.)).child(field_lab("方法")).child(
+                        div().flex().flex_col().gap(px(6.)).child(field_lab(l.http_method())).child(
                             div()
                                 .flex()
                                 .gap(px(6.))
@@ -292,7 +288,7 @@ if d.long {
                     .when(post, |b| {
                         b.child(
                             div()
-                                .child(field_lab("请求体"))
+                                .child(field_lab(l.http_body()))
                                 .child(input_box(&d.body_in)),
                         )
                     })
@@ -303,13 +299,13 @@ if d.long {
                             .child(
                                 div()
                                     .flex_1()
-                                    .child(field_lab("重试次数"))
+                                    .child(field_lab(l.http_retries()))
                                     .child(input_box(&d.retries_in)),
                             )
                             .child(
                                 div()
                                     .flex_1()
-                                    .child(field_lab("超时 (毫秒)"))
+                                    .child(field_lab(l.http_timeout()))
                                     .child(input_box(&d.timeout_in)),
                             ),
                     );
@@ -460,7 +456,7 @@ if d.long {
     fn run_dialog_action(&mut self, cx: &mut Context<Self>) {
         let Some(a) = self.build_action(cx) else { return };
         let r = self.rt.run_action(&a, true);
-        self.toast(if r.is_empty() { "已执行".into() } else { r });
+        self.toast(if r.is_empty() { self.l().toast_executed().into() } else { r });
         cx.notify();
     }
 }
@@ -470,11 +466,12 @@ impl FireVibe {
     /// 为什么不是一排预设芯片 —— 键盘有一百多个键，列不完，字母和 `]` 这种
     /// 标点全都得能选。直接监听真实按键最省事也最准。
     fn hotkey_field(&self, d: &EditState, cx: &mut Context<Self>) -> AnyElement {
+        let l = self.l();
         let rec = d.recording;
         let label = if rec {
-            "按下组合键…（Esc 取消）".to_string()
+            l.hotkey_recording().to_string()
         } else if d.key.is_empty() {
-            "点这里录制快捷键".to_string()
+            l.hotkey_click_record().to_string()
         } else {
             combo_text(&d.mods, &d.key)
         };
@@ -503,7 +500,8 @@ impl FireVibe {
                     window.focus(&h);
                 }
                 if let Some(e) = err {
-                    this.toast(format!("录制退回窗口模式（{e}）"));
+                    let m = this.l().toast_record_window_mode(&e);
+                    this.toast(m);
                 }
                 cx.notify();
             }))
@@ -566,7 +564,7 @@ impl FireVibe {
                 .child(SharedString::from(label)),
         );
         if !d.key.is_empty() && !rec {
-            row = row.child(mini2("hk-clear", "清除").h(px(46.)).on_click(cx.listener(
+            row = row.child(mini2("hk-clear", l.clear()).h(px(46.)).on_click(cx.listener(
                 |this, _, _, cx| {
                     if let Some(dd) = &mut this.dialog {
                         dd.key.clear();
@@ -578,17 +576,23 @@ impl FireVibe {
         }
         // 只按一个修饰键当热键（闪电说「自由说」默认就是右 Command）。
         // 这些没法录 —— gpui 的按键事件区分不出左右修饰键，只能列出来点。
-        const MODONLY: [(&str, &str); 6] = [
-            ("rightcmd", "右 ⌘"),
-            ("rightoption", "右 ⌥"),
-            ("rightshift", "右 ⇧"),
-            ("rightcontrol", "右 ⌃"),
-            ("cmd", "左 ⌘"),
-            ("fn", "Fn"),
+        // side: 1=右, 0=左, 2=无（Fn）—— 左右前缀按语言翻译
+        const MODONLY: [(&str, &str, u8); 6] = [
+            ("rightcmd", "⌘", 1),
+            ("rightoption", "⌥", 1),
+            ("rightshift", "⇧", 1),
+            ("rightcontrol", "⌃", 1),
+            ("cmd", "⌘", 0),
+            ("fn", "Fn", 2),
         ];
         let mut only = div().flex().flex_wrap().gap(px(6.));
-        for (i, (name, label)) in MODONLY.into_iter().enumerate() {
+        for (i, (name, sym, side)) in MODONLY.into_iter().enumerate() {
             let on = d.key == name && d.mods.is_empty();
+            let label = match side {
+                1 => format!("{} {sym}", l.mod_right()),
+                0 => format!("{} {sym}", l.mod_left()),
+                _ => sym.to_string(),
+            };
             only = only.child(chip_sm(("modonly", i), label, on).on_click(cx.listener(
                 move |this, _, _, cx| {
                     if let Some(dd) = &mut this.dialog {
@@ -602,7 +606,7 @@ impl FireVibe {
         }
         div().flex().flex_col().gap(px(8.)).child(row).child(
 div().flex().flex_col().gap(px(5.)).child(
-div().text_size(px(11.)).text_color(c(INK3)).child("或者只用一个修饰键 —— 这些改不了系统全局修饰位，能不能驱动那个工具只能实测"),).child(only),).into_any_element()
+div().text_size(px(11.)).text_color(c(INK3)).child(l.single_modifier_hint()),).child(only),).into_any_element()
     }
 }
 /// 组合键的可读写法

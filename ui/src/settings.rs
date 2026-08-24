@@ -12,6 +12,7 @@ use gpui::{div, prelude::*, px, AnyElement, Context, SharedString};
 impl FireVibe {
     pub fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let l = self.l();
+        let l2 = l;
         let cfg = self.rt.cfg.read();
         let launch = cfg.settings.launch_at_login;
         let lang = cfg.settings.lang;
@@ -22,7 +23,6 @@ impl FireVibe {
         let stt_enter = cfg.settings.stt_auto_enter;
         drop(cfg);
         let stt_ok = firevibe_core::stt::authorized();
-        let stt_st = firevibe_core::stt::auth_status();
 
         div()
             .max_w(px(620.))
@@ -56,17 +56,17 @@ impl FireVibe {
                             .child(row_icon("rocket"))
                             .child(row_text(l.launch_at_login(), Some(l.launch_hint())))
                             .child(switch_ui("sw-launch", launch).on_click(cx.listener(
-                                |this, _, _, cx| {
+                                move |this, _, _, cx| {
                                     let v = !this.rt.cfg.read().settings.launch_at_login;
                                     this.rt.cfg.write().settings.launch_at_login = v;
                                     this.save();
                                     match firevibe_core::autostart::set(v) {
                                         Ok(_) => this.toast(if v {
-                                            "已加入登录启动项"
+                                            l2.toast_login_added()
                                         } else {
-                                            "已移出登录启动项"
+                                            l2.toast_login_removed()
                                         }),
-                                        Err(e) => this.toast(format!("设置失败: {e}")),
+                                        Err(e) => this.toast(format!("{e}")),
                                     }
                                     cx.notify();
                                 },
@@ -103,10 +103,7 @@ impl FireVibe {
                     .child(
                         group_row()
                             .child(row_icon("mic"))
-                            .child(row_text(
-                                "说话时自动切输入设备",
-                                Some("按下说话键把系统默认输入切到虚拟声卡，说完切回原来的（实测 3~13ms）"),
-                            ))
+                            .child(row_text(l.auto_switch_input(), Some(l.auto_switch_hint())))
                             .child(switch_ui("sw-autoin", auto_in).on_click(cx.listener(
                                 |this, _, _, cx| {
                                     let v = !this.rt.cfg.read().settings.auto_switch_input;
@@ -125,10 +122,7 @@ impl FireVibe {
                     .child(
                         group_row()
                             .child(row_icon("mic"))
-                            .child(row_text(
-                                "说话时显示电平条",
-                                Some("屏幕底部浮出一条电平，让你知道确实在收音"),
-                            ))
+                            .child(row_text(l.show_hud(), Some(l.show_hud_hint())))
                             .child(switch_ui("sw-hud", hud).on_click(cx.listener(
                                 |this, _, _, cx| {
                                     let v = !this.rt.cfg.read().settings.show_level_hud;
@@ -183,21 +177,14 @@ impl FireVibe {
                             ),
                     ),
             )
-            .child(section_lab("语音转文字").mt(px(26.)).mb(px(8.)))
+            .child(section_lab(l.voice_to_text()).mt(px(26.)).mb(px(8.)))
             .child(
                 group()
                     // 权限
                     .child(
                         group_row()
                             .child(row_icon("mic"))
-                            .child(row_text(
-                                "语音识别权限",
-                                Some(if stt_ok {
-                                    "已授权，可以用「语音转文字」动作"
-                                } else {
-                                    "系统自带的离线识别需要一次授权"
-                                }),
-                            ))
+                            .child(row_text(l.stt_perm(), Some(if stt_ok { l.stt_perm_ok() } else { l.stt_perm_no() })))
                             .child(if stt_ok {
                                 div()
                                     .flex()
@@ -207,15 +194,15 @@ impl FireVibe {
                                     .text_size(px(11.5))
                                     .text_color(c(OK))
                                     .child(icon("circle-check", 14.))
-                                    .child(SharedString::from(stt_st))
+                                    .child(SharedString::from(l.granted()))
                                     .into_any_element()
                             } else {
-                                mini2("stt-req", "请求授权")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                mini2("stt-req", l.request_perm())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                         std::thread::spawn(|| {
                                             let _ = firevibe_core::stt::request_auth();
                                         });
-                                        this.toast("已弹出系统授权框");
+                                        this.toast(l2.toast_stt_prompt());
                                         cx.notify();
                                     }))
                                     .into_any_element()
@@ -226,7 +213,7 @@ impl FireVibe {
                     .child(
                         group_row()
                             .child(row_icon("globe"))
-                            .child(row_text("识别语言", Some("自带语音转文字识别成哪种语言")))
+                            .child(row_text(l.stt_lang(), Some(l.stt_lang_hint())))
                             .child(
                                 seg_wrap()
                                     .child(
@@ -255,10 +242,7 @@ impl FireVibe {
                     .child(
                         group_row()
                             .child(row_icon("undo-2"))
-                            .child(row_text(
-                                "识别后自动回车",
-                                Some("在 agent 里就是说完直接发出去"),
-                            ))
+                            .child(row_text(l.stt_enter(), Some(l.stt_enter_hint())))
                             .child(switch_ui("sw-enter", stt_enter).on_click(cx.listener(
                                 |this, _, _, cx| {
                                     let v = !this.rt.cfg.read().settings.stt_auto_enter;
@@ -314,18 +298,19 @@ impl FireVibe {
     /// 关于行：版本 + 更新状态 + 按钮。三种状态只显示一个。
     fn about_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let l = self.l();
+        let l2 = l;
         let has = self.update.has_update();
         let (state_text, state_icon, state_col) = match &self.update {
             UpdateStatus::Available { .. } => (l.has_update(), "sparkles", ACCENT),
             UpdateStatus::UpToDate => (l.up_to_date(), "badge-check", INK3),
             UpdateStatus::Checking => (l.checking(), "loader-circle", INK3),
             UpdateStatus::NotConfigured => (l.no_endpoint(), "triangle-alert", WARN),
-            UpdateStatus::Failed(_) => ("检查失败", "triangle-alert", WARN),
+            UpdateStatus::Failed(_) => (l.check_failed(), "triangle-alert", WARN),
             UpdateStatus::Idle => (l.not_checked(), "refresh-cw", INK3),
         };
         let ver = match &self.update {
             UpdateStatus::Available { version, .. } => {
-                format!("{VERSION} → {version} 可更新")
+                l.update_available_ver(VERSION, version)
             }
             _ => format!("{VERSION} · Rust + GPUI"),
         };
@@ -387,7 +372,7 @@ impl FireVibe {
                 primary_btn_sm_ico("do-upd", "download", l.do_update())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if url.is_empty() {
-                            this.toast("清单里没给下载地址");
+                            this.toast(l2.toast_no_download_url());
                         } else {
                             let _ = std::process::Command::new("open").arg(&url).spawn();
                         }

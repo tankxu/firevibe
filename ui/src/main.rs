@@ -550,7 +550,8 @@ impl FireVibe {
                 }
                 // 事件 tap：吞掉遥控器按键在系统那边的默认行为（麦克风键弹 Spotlight）
                 if let Err(e) = self.rt.start_tap() {
-                    self.toast(format!("屏蔽系统默认行为失败: {e}"));
+                    let m = self.l().toast_block_failed(&e.to_string());
+                    self.toast(m);
                 }
             }
         }
@@ -562,7 +563,7 @@ impl FireVibe {
                 self.voice_rx = None;
                 match r {
                     Ok(()) => self.voice_ready = true,
-                    Err(e) => self.toast(format!("语音链路启动失败: {e}")),
+                    Err(e) => { let m = self.l().toast_voice_start_failed(&e.to_string()); self.toast(m); }
                 }
             }
         } else if !self.voice_ready && self.loopback.is_ready() {
@@ -742,6 +743,7 @@ impl FireVibe {
 
         if stt_missing {
             let st = firevibe_core::stt::auth_status();
+            let l = self.l();
             return div()
                 .flex()
                 .flex_col()
@@ -771,25 +773,23 @@ impl FireVibe {
                                         .text_size(px(12.5))
                                         .font_weight(w(560.))
                                         .text_color(c(INK))
-                                        .child("语音转文字还不能用：缺「语音识别」权限"),
+                                        .child(l.stt_unavailable()),
                                 )
                                 .child(
                                     div()
                                         .text_size(px(11.))
                                         .text_color(c(WARN))
                                         .mt(px(1.))
-                                        .child(SharedString::from(format!(
-                                            "{st} · 点右侧请求授权，弹框选「允许」"
-                                        ))),
+                                        .child(SharedString::from(l.stt_ask_hint(st))),
                                 ),
                         )
                         .child(
-                            mini2("stt-ask", "请求授权").h(px(32.)).on_click(cx.listener(
+                            mini2("stt-ask", l.request_perm()).h(px(32.)).on_click(cx.listener(
                                 |this, _, _, cx| {
                                     std::thread::spawn(|| {
                                         let _ = firevibe_core::stt::request_auth();
                                     });
-                                    this.toast("已请求，系统弹框里选「允许」");
+                                    this.toast(this.l().toast_requested());
                                     cx.notify();
                                 },
                             )),
@@ -830,7 +830,7 @@ impl FireVibe {
             .bg(c(SURFACE))
             .border_1()
             .border_color(c(LINE))
-            .gap(px(18.))
+            .gap(px(12.))
             .rounded(px(R))
             .px(px(14.))
             .py(px(9.))
@@ -892,16 +892,16 @@ impl FireVibe {
                     .flex()
                     .items_center()
                     .gap(px(7.))
-                    .pl(px(18.))
+                    .pl(px(10.))
                     .border_l_1()
                     .border_color(c(LINE))
                     .text_size(px(12.5))
                     .child(
                         div()
                             .text_color(c(INK2))
-                            .child(SharedString::from("电量需蓝牙权限")),
+                            .child(SharedString::from(l.battery_needs_bt())),
                     )
-                    .child(mini2("open-bt", "去授权").h(px(26.)).on_click(cx.listener(
+                    .child(mini2("open-bt", l.grant_access()).h(px(26.)).on_click(cx.listener(
                         |_, _, _, _| {
                             let _ = std::process::Command::new("open")
                                 .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth")
@@ -916,7 +916,7 @@ impl FireVibe {
                     .flex()
                     .items_center()
                     .gap(px(7.))
-                    .pl(px(18.))
+                    .pl(px(10.))
                     .border_l_1()
                     .border_color(c(LINE))
                     .text_size(px(12.5))
@@ -941,14 +941,14 @@ impl FireVibe {
             // 会死锁：判据里那个临时 guard 活到整条语句结束，闭包里又在同一线程
             // 上锁一次，而 parking_lot::Mutex 不可重入 —— UI 线程永久持锁，
             // 连 HID 线程都被拖死。
-            .when_some(rec_state, |d, (secs, lvl)| d.child(Self::recording_card(secs, lvl)))
+            .when_some(rec_state, |d, (secs, lvl)| d.child(Self::recording_card(secs, lvl, l)))
             .child(self.loopback_card(cx))
             .child(spacer())
             .child(self.input_switch(cx))
     }
 
     /// 录音中的状态卡。**只在本应用窗口里显示** —— 不弹任何系统界面。
-    fn recording_card(secs: f32, lvl: f32) -> gpui::AnyElement {
+    fn recording_card(secs: f32, lvl: f32, l: i18n::L) -> gpui::AnyElement {
         let mm = (secs as u32) / 60;
         let ss = (secs as u32) % 60;
         // 6 格小电平，跟着说话跳
@@ -986,13 +986,13 @@ impl FireVibe {
                             .text_size(px(12.5))
                             .font_weight(w(580.))
                             .text_color(c(ERR))
-                            .child(SharedString::from(format!("录音中 {mm:02}:{ss:02}"))),
+                            .child(SharedString::from(l.recording_time(mm as u64, ss as u64))),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(c(INK3))
-                            .child("再按一下那个键停止"),
+                            .child(l.recording_stop_hint()),
                     ),
             )
             .child(meter)
@@ -1129,6 +1129,7 @@ impl FireVibe {
         // 之前错误消息里永远带「输入监控」，任何打不开设备都被误报成权限问题。
         let perm = msg.starts_with("HID_NOT_PERMITTED");
         let not_found = msg.starts_with("HID_NOT_FOUND");
+        let l = self.l();
         div()
             .flex()
             .items_center()
@@ -1153,11 +1154,11 @@ impl FireVibe {
                             .font_weight(w(560.))
                             .text_color(c(INK))
                             .child(SharedString::from(if perm {
-                                "遥控器打不开：缺「输入监控」权限"
+                                l.hid_no_perm()
                             } else if not_found {
-                                "遥控器没连上"
+                                l.hid_not_connected()
                             } else {
-                                "遥控器打不开"
+                                l.hid_open_failed()
                             })),
                     )
                     .child(
@@ -1166,8 +1167,7 @@ impl FireVibe {
                             .text_color(c(WARN))
                             .mt(px(1.))
                             .child(SharedString::from(if perm {
-                                "到 系统设置 › 隐私与安全性 › 输入监控 勾上本应用，然后完全退出重开；已经勾着还报这个，就点「重置授权」再勾一次"
-                                    .to_string()
+                                l.hid_perm_hint().to_string()
                             } else {
                                 msg.clone()
                             })),
@@ -1181,11 +1181,11 @@ impl FireVibe {
                     .gap(px(6.))
                     .flex_none()
                     .when(not_found, |d| {
-                        d.child(mini2("hid-retry", "重试").h(px(32.)).on_click(cx.listener(
+                        d.child(mini2("hid-retry", l.retry()).h(px(32.)).on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.err = None;
                                 match this.rt.start() {
-                                    Ok(_) => this.toast("已连上"),
+                                    Ok(_) => this.toast(this.l().toast_connected()),
                                     Err(e) => this.err = Some(format!("{e:#}")),
                                 }
                                 cx.notify();
@@ -1194,7 +1194,7 @@ impl FireVibe {
                     })
                     .when(perm, |d| {
                         d.child(
-                            mini2("open-tcc", "打开设置").h(px(32.)).on_click(cx.listener(
+                            mini2("open-tcc", l.open_settings()).h(px(32.)).on_click(cx.listener(
                                 |_, _, _, _| {
                                     let _ = std::process::Command::new("open")
                                         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
@@ -1206,16 +1206,16 @@ impl FireVibe {
                         // 根因是 ad-hoc 签名的 designated requirement 绑死 cdhash，
                         // 重建就失配；现在用证书签了，理论上不该再出现，留着兜底。
                         .child(
-                            mini2("reset-tcc", "重置授权").h(px(32.)).on_click(cx.listener(
+                            mini2("reset-tcc", l.reset_auth()).h(px(32.)).on_click(cx.listener(
                                 |this, _, _, cx| {
                                     let out = std::process::Command::new("tccutil")
                                         .args(["reset", "ListenEvent", "com.tankxu.firevibe"])
                                         .output();
                                     match out {
                                         Ok(o) if o.status.success() => {
-                                            this.toast("已重置，去系统设置里重新勾一次，然后完全退出重开")
+                                            this.toast(this.l().toast_reset_done())
                                         }
-                                        _ => this.toast("重置失败，手动到系统设置里取消勾选再勾上"),
+                                        _ => this.toast(this.l().toast_reset_failed()),
                                     }
                                     cx.notify();
                                 },
@@ -1295,7 +1295,7 @@ impl FireVibe {
         )
         .when(ready, |d| {
             d.child(div().ml(px(6.)).child(
-                ghost_btn("voice-test", "测试").on_click(cx.listener(|this, _, _, cx| {
+                ghost_btn("voice-test", l.test()).on_click(cx.listener(|this, _, _, cx| {
                     this.voice_test = true;
                     this.test_frames0 = this.rt.status.audio_frames.load(Ordering::Relaxed);
                     cx.notify();
@@ -1307,13 +1307,13 @@ impl FireVibe {
             // 没带（没编过）才退回让用户装 BlackHole。
             let have = firevibe_core::audiodriver::bundled().is_some();
             d.child(div().ml(px(6.)).child(
-                install_btn("install-drv", if have { "安装" } else { l.install() }).on_click(
+                install_btn("install-drv", l.install()).on_click(
                     cx.listener(move |this, _, _, cx| {
                         if !have {
                             let _ = std::process::Command::new("open")
                                 .arg("https://existential.audio/blackhole/")
                                 .spawn();
-                            this.toast("已打开 BlackHole 下载页");
+                            this.toast(this.l().toast_dl_opened());
                             cx.notify();
                             return;
                         }
@@ -1449,7 +1449,7 @@ impl FireVibe {
                         .cursor_pointer()
                         .hover(|s| s.bg(c(MENU_HOVER)))
                         .child(div().text_color(c(INK3)).child(icon("pencil", 13.)))
-                        .child(SharedString::from("重命名"))
+                        .child(SharedString::from(l.rename()))
                         .on_click(cx.listener(|this, _, window, cx| {
                             let cur = this.rt.cfg.read().profile().name.clone();
                             let input = crate::cards::new_line_input(&cur, window, cx);
@@ -1603,7 +1603,7 @@ impl FireVibe {
             .map(|i| i.read(cx).value().trim().to_string())
             .unwrap_or_default();
         if name.is_empty() {
-            self.toast("名字不能为空");
+            self.toast(self.l().toast_name_empty());
             return;
         }
         self.rt.cfg.write().profile_mut().name = name;
@@ -1617,6 +1617,7 @@ impl FireVibe {
         let Some(input) = self.renaming.clone() else {
             return div().into_any_element();
         };
+        let l = self.l();
         crate::cards::overlay()
             .child(
                 div()
@@ -1636,7 +1637,7 @@ impl FireVibe {
                         div()
                             .text_size(px(15.))
                             .font_weight(w(640.))
-                            .child("方案重命名"),
+                            .child(l.rename_title()),
                     )
                     .child(gpui_component::input::Input::new(&input))
                     .child(
@@ -1644,13 +1645,13 @@ impl FireVibe {
                             .flex()
                             .justify_end()
                             .gap(px(8.))
-                            .child(mini2("rn-no", "取消").on_click(cx.listener(
+                            .child(mini2("rn-no", l.cancel()).on_click(cx.listener(
                                 |this, _, _, cx| {
                                     this.renaming = None;
                                     cx.notify();
                                 },
                             )))
-                            .child(primary_btn("rn-ok", "保存").on_click(cx.listener(
+                            .child(primary_btn("rn-ok", l.save()).on_click(cx.listener(
                                 |this, _, _, cx| this.commit_rename(cx),
                             ))),
                     ),
@@ -1664,6 +1665,7 @@ impl FireVibe {
     fn onboarding_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let card_ready = self.loopback.is_ready();
         let paired = self.connected();
+        let l = self.l();
 
         // 一步 = 彩色图标块 + 标题/说明 + 右侧（完成徽章 或 操作按钮）
         fn step(
@@ -1671,6 +1673,7 @@ impl FireVibe {
             badge: (u32, u32, u32),
             title: &str,
             desc: &str,
+            ready_label: &'static str,
             done: bool,
             action: Option<gpui::AnyElement>,
             last: bool,
@@ -1685,7 +1688,7 @@ impl FireVibe {
                     .text_size(px(11.5))
                     .font_weight(w(560.))
                     .child(icon("circle-check", 14.))
-                    .child(SharedString::from("已就绪"))
+                    .child(SharedString::from(ready_label))
                     .into_any_element()
             } else if let Some(a) = action {
                 a
@@ -1754,8 +1757,8 @@ impl FireVibe {
                         .flex()
                         .flex_col()
                         .gap(px(4.))
-                        .child(div().text_size(px(18.)).font_weight(w(680.)).text_color(c(INK)).child("欢迎使用 FireVibe"))
-                        .child(div().text_size(px(12.5)).text_color(c(INK2)).line_height(relative(1.5)).child("把 Fire TV 语音遥控器变成 Mac 的遥控器 + 麦克风。开始前配好下面几项：")),
+                        .child(div().text_size(px(18.)).font_weight(w(680.)).text_color(c(INK)).child(l.onb_title()))
+                        .child(div().text_size(px(12.5)).text_color(c(INK2)).line_height(relative(1.5)).child(l.onb_subtitle())),
                 )
                 // 步骤列表（带边框分组）
                 .child(
@@ -1768,36 +1771,39 @@ impl FireVibe {
                         .overflow_hidden()
                         .child(step(
                             "tv", BADGE_DEFAULT,
-                            "配对遥控器",
-                            "系统设置 › 蓝牙 里把遥控器和 Mac 配上（长按遥控器 home 键进配对）。",
+                            l.onb_pair(),
+                            l.onb_pair_desc(),
+                            l.onb_ready(),
                             paired,
-                            Some(open_url("onb-bt", "打开蓝牙", "x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth", cx)),
+                            Some(open_url("onb-bt", l.onb_open_bt(), "x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth", cx)),
                             false,
                         ))
                         .child(step(
                             "keyboard", BADGE_DEFAULT,
-                            "开启「输入监控」权限",
-                            "系统设置 › 隐私与安全性 › 输入监控 → 勾上 FireVibe。读按键和麦克风都要它。",
+                            l.onb_im(),
+                            l.onb_im_desc(),
+                            l.onb_ready(),
                             false,
-                            Some(open_url("onb-im", "打开设置", "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent", cx)),
+                            Some(open_url("onb-im", l.onb_open_settings(), "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent", cx)),
                             false,
                         ))
                         .child(step(
                             "mic", BADGE_DEFAULT,
-                            "安装虚拟声卡「FireVibe Mic」",
-                            "语音输入靠它把遥控器麦克风喂给豆包这类工具。点安装会弹系统授权框。",
+                            l.onb_card(),
+                            l.onb_card_desc(),
+                            l.onb_ready(),
                             card_ready,
                             Some(
-                                primary_btn("onb-inst", "安装").on_click(cx.listener(|this, _, _, cx| {
+                                primary_btn("onb-inst", l.install()).on_click(cx.listener(|this, _, _, cx| {
                                     match firevibe_core::audiodriver::install() {
                                         Ok(()) => {
                                             this.rt.cfg.write().voice.device = firevibe_core::audiodriver::DEVICE_NAME.into();
                                             this.save();
                                             this.loopback = firevibe_core::voice::LoopbackStatus::Unknown;
                                             this.loopback_at = Instant::now() - Duration::from_secs(10);
-                                            this.toast("声卡装好了");
+                                            this.toast(this.l().toast_card_installed());
                                         }
-                                        Err(e) => this.toast(format!("安装失败：{e}")),
+                                        Err(e) => { let m = this.l().toast_install_failed(&e.to_string()); this.toast(m); }
                                     }
                                     cx.notify();
                                 })).into_any_element(),
@@ -1806,8 +1812,9 @@ impl FireVibe {
                         ))
                         .child(step(
                             "battery-full", BADGE_DEFAULT,
-                            "允许蓝牙（可选，用于显示电量）",
-                            "首次读电量会弹「FireVibe 想使用蓝牙」，点允许即可；不需要电量可跳过。",
+                            l.onb_bt(),
+                            l.onb_bt_desc(),
+                            l.onb_ready(),
                             false,
                             None,
                             true,
@@ -1821,8 +1828,8 @@ impl FireVibe {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child(div().text_size(px(11.5)).text_color(c(INK3)).child("这些随时能在「设置」里再弄"))
-                        .child(primary_btn("onb-done", "开始使用").on_click(cx.listener(|this, _, _, cx| {
+                        .child(div().text_size(px(11.5)).text_color(c(INK3)).child(l.onb_footer()))
+                        .child(primary_btn("onb-done", l.onb_start()).on_click(cx.listener(|this, _, _, cx| {
                             this.onboarding = false;
                             this.rt.cfg.write().settings.onboarded = true;
                             this.save();
@@ -1834,6 +1841,7 @@ impl FireVibe {
 
     fn install_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let dev = firevibe_core::audiodriver::DEVICE_NAME;
+        let l = self.l();
         crate::cards::overlay().child(
             div()
                 .id("inst")
@@ -1852,32 +1860,27 @@ impl FireVibe {
                     div()
                         .text_size(px(15.5))
                         .font_weight(w(640.))
-                        .child(SharedString::from(format!("安装虚拟声卡「{dev}」"))),
+                        .child(SharedString::from(l.install_title(dev))),
                 )
                 .child(
                     div()
                         .text_size(px(12.5))
                         .text_color(c(INK2))
                         .line_height(relative(1.6))
-                        .child(
-                            "虚拟声卡是一块只存在于软件里的声卡。遥控器麦克风的音频写进它，\
-                             第三方语音输入工具就能把它当麦克风来听。\n\n\
-                             它要装到系统的音频插件目录，所以需要管理员权限 —— \
-                             接下来会弹一个系统自带的授权框。",
-                        ),
+                        .child(l.install_body()),
                 )
                 .child(
                     div()
                         .flex()
                         .justify_end()
                         .gap(px(8.))
-                        .child(mini2("inst-no", "取消").on_click(cx.listener(
+                        .child(mini2("inst-no", l.cancel()).on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.install_confirm = false;
                                 cx.notify();
                             },
                         )))
-                        .child(primary_btn("inst-go", "继续安装").on_click(cx.listener(
+                        .child(primary_btn("inst-go", l.install_continue()).on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.install_confirm = false;
                                 match firevibe_core::audiodriver::install() {
@@ -1889,9 +1892,9 @@ impl FireVibe {
                                             firevibe_core::voice::LoopbackStatus::Unknown;
                                         this.loopback_at =
                                             Instant::now() - Duration::from_secs(10);
-                                        this.toast("装好了。在语音工具里把麦克风选成 FireVibe Mic");
+                                        this.toast(this.l().toast_installed_hint(firevibe_core::audiodriver::DEVICE_NAME));
                                     }
-                                    Err(e) => this.toast(format!("安装失败：{e}")),
+                                    Err(e) => { let m = this.l().toast_install_failed(&e.to_string()); this.toast(m); }
                                 }
                                 cx.notify();
                             },
@@ -1904,6 +1907,7 @@ impl FireVibe {
         let lvl = self.rt.level();
         let frames = self.rt.status.audio_frames.load(Ordering::Relaxed) - self.test_frames0;
         let mic_on = self.rt.status.mic_on.load(Ordering::Relaxed);
+        let l = self.l();
         let cur_in = self
             .audio_cur
             .as_ref()
@@ -1962,14 +1966,14 @@ impl FireVibe {
                                         div()
                                             .text_size(px(15.))
                                             .font_weight(w(620.))
-                                            .child("测试语音输入"),
+                                            .child(l.vt_title()),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(11.5))
                                             .text_color(c(INK3))
                                             .mt(px(3.))
-                                            .child("按住下面的按钮，对着遥控器说话"),
+                                            .child(l.vt_hint()),
                                     ),
                             )
                             .child(icon_btn_sm("vt-x", "close").on_click(cx.listener(
@@ -1995,16 +1999,13 @@ impl FireVibe {
                                     .flex()
                                     .flex_col()
                                     .gap(px(6.))
-                                    .child(field_lab("电平"))
+                                    .child(field_lab(l.vt_level()))
                                     .child(meter)
                                     .child(
                                         div()
                                             .text_size(px(11.5))
                                             .text_color(c(INK3))
-                                            .child(SharedString::from(format!(
-                                                "电平 {lvl:.4}   本次收到 {frames} 帧   麦克风 {}",
-                                                if mic_on { "开" } else { "关" }
-                                            ))),
+                                            .child(SharedString::from(l.vt_level_line(lvl, frames, mic_on))),
                                     ),
                             )
                             .child(
@@ -2012,7 +2013,7 @@ impl FireVibe {
                                     .flex()
                                     .flex_col()
                                     .gap(px(4.))
-                                    .child(field_lab("系统默认输入"))
+                                    .child(field_lab(l.vt_default_input()))
                                     .child(
                                         div()
                                             .text_size(px(12.5))
@@ -2025,9 +2026,9 @@ impl FireVibe {
                                             .text_size(px(11.))
                                             .text_color(if on_loopback { c(INK3) } else { c(WARN) })
                                             .child(if on_loopback {
-                                                "跟随系统默认输入的第三方语音工具现在能听到遥控器"
+                                                l.vt_caption_on()
                                             } else {
-                                                "按住测试时会临时切到虚拟声卡，松开还原"
+                                                l.vt_caption_off()
                                             }),
                                     ),
                             )
@@ -2047,15 +2048,15 @@ impl FireVibe {
                                     .font_weight(w(600.))
                                     .child(icon("mic", 16.))
                                     .child(SharedString::from(if self.testing {
-                                        "正在收音…（松开结束）"
+                                        l.vt_recording()
                                     } else {
-                                        "按住说话"
+                                        l.vt_hold_talk()
                                     }))
                                     .on_mouse_down(
                                         gpui::MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
                                             if !this.loopback.is_ready() {
-                                                this.toast("虚拟声卡还没就绪");
+                                                this.toast(this.l().toast_card_not_ready());
                                                 return;
                                             }
                                             this.test_frames0 = this
@@ -2066,7 +2067,7 @@ impl FireVibe {
                                             if this.rt.set_talking(true) {
                                                 this.testing = true;
                                             } else {
-                                                this.toast("语音链路还没建起来，稍等一下");
+                                                this.toast(this.l().toast_link_not_ready());
                                             }
                                             cx.notify();
                                         }),
@@ -2106,9 +2107,9 @@ impl FireVibe {
                                     .font_weight(w(600.))
                                     .child(icon("case-sensitive", 16.))
                                     .child(SharedString::from(if dicting {
-                                        "正在听写…（松开出字）"
+                                        l.vt_dictating()
                                     } else {
-                                        "按住听写 · 转成文字"
+                                        l.vt_hold_dictate()
                                     }))
                                     .on_mouse_down(
                                         gpui::MouseButton::Left,
@@ -2141,7 +2142,7 @@ impl FireVibe {
                                         .flex()
                                         .flex_col()
                                         .gap(px(4.))
-                                        .child(field_lab("识别结果"))
+                                        .child(field_lab(l.vt_result()))
                                         .child(
                                             div()
                                                 .text_size(px(12.5))
@@ -2351,9 +2352,10 @@ fn main() {
         // 结果 app 彻底退不掉。这里补一个 FireVibe 菜单，含「退出」并绑 Cmd-Q。
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.bind_keys([gpui::KeyBinding::new("cmd-q", Quit, None)]);
+        let ml = i18n::L(firevibe_core::config::Config::load().settings.lang);
         cx.set_menus(vec![Menu {
             name: "FireVibe".into(),
-            items: vec![MenuItem::action("退出 FireVibe", Quit)],
+            items: vec![MenuItem::action(ml.menu_quit(), Quit)],
         }]);
 
         gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);

@@ -78,13 +78,13 @@ impl FireVibe {
                             .text_size(px(13.5))
                             .font_weight(w(590.))
                             .text_color(c(INK))
-                            .child("这套方案还没有自定义按键"),
+                            .child(l.empty_profile_title()),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
                             .text_color(c(INK3))
-                            .child("遥控器上的键保持系统原本的行为。点右上角「添加按键」挑一颗来配。"),
+                            .child(l.empty_profile_hint()),
                     )
                     .into_any_element()
             } else {
@@ -148,7 +148,7 @@ impl FireVibe {
                                     .text_size(px(13.5))
                                     .font_weight(w(590.))
                                     .text_color(c(INK))
-                                    .child(SharedString::from(card_title(slot))),
+                                    .child(SharedString::from(l.card_title(slot))),
                             )
                             .when(disabled, |d| d.child(tag_off(l.disabled_tag()))),
                     )
@@ -272,7 +272,7 @@ impl FireVibe {
     ) -> AnyElement {
         let l = self.l();
         let empty = a.kind == ActionType::None;
-        let (val, note) = describe(a);
+        let (val, note) = describe(a, l);
 
         let mut body = div()
             .flex_1()
@@ -318,7 +318,7 @@ impl FireVibe {
                     round_btn(("test", slot as usize * 2 + long as usize), "play", false)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let r = this.rt.trigger_slot(slot, long);
-                            this.toast(if r.is_empty() { "已执行".into() } else { r });
+                            this.toast(if r.is_empty() { this.l().toast_executed().into() } else { r });
                             cx.notify();
                         })),
                 );
@@ -364,7 +364,7 @@ impl FireVibe {
         let mut chips = div().flex().flex_wrap().gap(px(6.));
         for s in free {
             chips = chips.child(
-                slot_chip(s).on_click(cx.listener(
+                slot_chip(s, l).on_click(cx.listener(
                     move |this, _, window, cx| {
                         this.rt.cfg.write().profile_mut().set_short(s, Action::none());
                         this.save();
@@ -485,7 +485,7 @@ fn round_btn(id: impl Into<ElementId>, ico: &str, accent: bool) -> gpui::Statefu
 }
 
 /// 「添加按键」面板里的一颗：图标 + 名字，比纯文字好认得多
-fn slot_chip(s: Slot) -> gpui::Stateful<gpui::Div> {
+fn slot_chip(s: Slot, l: crate::i18n::L) -> gpui::Stateful<gpui::Div> {
     div()
         .id(("addslot", s as usize))
         .flex()
@@ -502,7 +502,7 @@ fn slot_chip(s: Slot) -> gpui::Stateful<gpui::Div> {
         .cursor_pointer()
         .hover(|st| st.border_color(c(INK3)).text_color(c(INK)))
         .child(div().text_color(c(INK3)).flex_none().child(slot_icon(s)))
-        .child(SharedString::from(card_title(s)))
+        .child(SharedString::from(l.card_title(s)))
 }
 
 /// 位置对应的图标。App 键用首字母，其余用实体键的图标。
@@ -547,17 +547,6 @@ fn slot_icon(s: Slot) -> AnyElement {
         13.,
     )
     .into_any_element()
-}
-
-/// 卡片标题 —— 四个 App 键按机身印字来，跟设计稿一致
-pub fn card_title(s: Slot) -> &'static str {
-    match s {
-        Slot::App1 => "Prime Video 键",
-        Slot::App2 => "NETFLIX 键",
-        Slot::App3 => "Disney+ 键",
-        Slot::App4 => "hulu 键",
-        other => other.label(),
-    }
 }
 
 /// 键徽章配色
@@ -626,87 +615,89 @@ pub fn kind_icon(k: ActionType) -> Option<&'static str> {
 
 /// 卡片上两行文案：(主行, 副行)。跟设计稿逐字对齐。
 /// 按键名 → 好看的符号。卡片上写 `rightcontrol` 太丑，写「右⌃」一眼就懂。
-pub fn key_label(key: &str) -> String {
-    let sym = match key.to_ascii_lowercase().as_str() {
-        "leftcmd" | "cmd" | "command" => "左⌘",
-        "rightcmd" => "右⌘",
-        "leftoption" | "option" | "alt" => "左⌥",
-        "rightoption" => "右⌥",
-        "leftshift" | "shift" => "左⇧",
-        "rightshift" => "右⇧",
-        "leftcontrol" | "ctrl" | "control" => "左⌃",
-        "rightcontrol" => "右⌃",
-        "fn" | "function" => "fn",
-        "space" => "空格",
-        "return" | "enter" => "⏎",
-        "tab" => "⇥",
-        "escape" | "esc" => "esc",
-        "delete" | "backspace" => "⌫",
-        "forwarddelete" => "⌦",
-        "up" => "↑",
-        "down" => "↓",
-        "left" => "←",
-        "right" => "→",
-        _ => return key.to_uppercase(),
-    };
-    sym.to_string()
+pub fn key_label(key: &str, l: crate::i18n::L) -> String {
+    let ml = l.mod_left();
+    let mr = l.mod_right();
+    match key.to_ascii_lowercase().as_str() {
+        "leftcmd" | "cmd" | "command" => format!("{ml}⌘"),
+        "rightcmd" => format!("{mr}⌘"),
+        "leftoption" | "option" | "alt" => format!("{ml}⌥"),
+        "rightoption" => format!("{mr}⌥"),
+        "leftshift" | "shift" => format!("{ml}⇧"),
+        "rightshift" => format!("{mr}⇧"),
+        "leftcontrol" | "ctrl" | "control" => format!("{ml}⌃"),
+        "rightcontrol" => format!("{mr}⌃"),
+        "fn" | "function" => "fn".into(),
+        "space" => l.key_space().to_string(),
+        "return" | "enter" => "⏎".into(),
+        "tab" => "⇥".into(),
+        "escape" | "esc" => "esc".into(),
+        "delete" | "backspace" => "⌫".into(),
+        "forwarddelete" => "⌦".into(),
+        "up" => "↑".into(),
+        "down" => "↓".into(),
+        "left" => "←".into(),
+        "right" => "→".into(),
+        _ => key.to_uppercase(),
+    }
 }
 
 /// 组合键整体的显示名，比如 ⌘⇧A
-fn combo_label(mods: &[String], key: &str) -> String {
-    let m: String = mods.iter().map(|x| key_label(x)).collect();
+fn combo_label(mods: &[String], key: &str, l: crate::i18n::L) -> String {
+    let m: String = mods.iter().map(|x| key_label(x, l)).collect();
     if key.is_empty() {
-        return if m.is_empty() { "未选".into() } else { m };
+        return if m.is_empty() { l.key_none().into() } else { m };
     }
-    format!("{m}{}", key_label(key))
+    format!("{m}{}", key_label(key, l))
 }
 
-pub fn describe(a: &Action) -> (String, String) {
+pub fn describe(a: &Action, l: crate::i18n::L) -> (String, String) {
     match a.kind {
         ActionType::None => (String::new(), String::new()),
         ActionType::Key => (
-            format!("映射按键 · {}", combo_label(&a.mods, &a.key)),
+            l.dsc_key(&combo_label(&a.mods, &a.key, l)),
             String::new(),
         ),
-        ActionType::Text => ("输入文字".into(), a.arg.clone()),
-        ActionType::OpenApp => (format!("打开 {}", app_label(&a.arg)), a.arg.clone()),
+        ActionType::Text => (l.dsc_text().into(), a.arg.clone()),
+        ActionType::OpenApp => (l.dsc_open(&app_label(&a.arg)), a.arg.clone()),
         ActionType::AppleScript => {
             let name = applescript_presets()
                 .iter()
                 .find(|(_, code)| *code == a.arg)
                 .map(|(n, _)| *n)
-                .unwrap_or("自定义");
-            (format!("AppleScript · {name}"), a.arg.clone())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| l.dsc_custom().to_string());
+            (l.dsc_applescript(&name), a.arg.clone())
         }
-        ActionType::Shell => ("执行命令".into(), a.arg.clone()),
+        ActionType::Shell => (l.dsc_shell().into(), a.arg.clone()),
         ActionType::Http => {
             let m = if a.method.is_empty() { "GET" } else { &a.method };
-            (format!("HTTP {m}"), a.arg.clone())
+            (l.dsc_http(m), a.arg.clone())
         }
         ActionType::VoiceToggle => {
-            ("开始 / 停止说话".into(), "点一下开始，再点一下停止".into())
+            (l.dsc_voice_toggle().into(), l.dsc_voice_toggle_hint().into())
         }
-        ActionType::VoicePtt => ("按住说话".into(), "按住送流，松手停止".into()),
+        ActionType::VoicePtt => (l.dsc_ptt().into(), l.dsc_ptt_hint().into()),
         ActionType::Record => (
-            "按住录音".into(),
-            "松手保存到「下载」".into(),
+            l.dsc_record().into(),
+            l.dsc_record_hint().into(),
         ),
         ActionType::VoiceDictate => (
-            "语音转文字".into(),
+            l.dsc_dictate().into(),
             if a.arg == "hold" {
-                "按住说话，松手识别并打字".into()
+                l.dsc_dictate_hold().into()
             } else {
-                "点一下开始，再点一下结束并识别".into()
+                l.dsc_dictate_tap().into()
             },
         ),
         ActionType::VoiceHotkey => {
             let mode = match a.arg.as_str() {
-                "hold" => "按住期间保持按下",
-                "double" => "双击",
-                _ => "敲一下",
+                "hold" => l.dsc_mode_hold(),
+                "double" => l.dsc_mode_double(),
+                _ => l.dsc_mode_tap(),
             };
             (
-                format!("第三方语音输入 · {}", combo_label(&a.mods, &a.key)),
+                l.dsc_hotkey(&combo_label(&a.mods, &a.key, l)),
                 mode.into(),
             )
         }

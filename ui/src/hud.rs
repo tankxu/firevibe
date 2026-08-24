@@ -43,6 +43,7 @@ impl Render for Hud {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let lvl = self.rt.level();
         let dictating = self.rt.dictating.lock().is_some();
+        let l = crate::i18n::L(self.rt.cfg.read().settings.lang);
         let bars = 22usize;
         let lit = (lvl * 60.0).min(bars as f32) as usize;
         let mut meter = div().flex().gap(px(3.)).items_center().h(px(20.));
@@ -81,7 +82,7 @@ impl Render for Hud {
                     .text_size(px(11.5))
                     .font_weight(w(560.))
                     .text_color(white(0.7))
-                    .child(SharedString::from(if dictating { "松手出字" } else { "麦克风已开" })),
+                    .child(SharedString::from(if dictating { l.hud_dictating() } else { l.hud_mic_on() })),
             )
     }
 }
