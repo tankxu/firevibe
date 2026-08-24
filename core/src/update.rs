@@ -12,6 +12,12 @@ use std::time::Duration;
 /// 当前版本，编译期从 Cargo.toml 取
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// 默认更新源：GitHub Releases API。`/releases/latest` 只返回**非预发布**的那个，
+/// 正好是 app 正式版（cli 那些是 prerelease，会被忽略）。不用自己托管清单。
+const GITHUB_LATEST: &str = "https://api.github.com/repos/tankxu/firevibe/releases/latest";
+/// 用户下载页（有新版时跳这里）
+pub const RELEASES_PAGE: &str = "https://github.com/tankxu/firevibe/releases/latest";
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum UpdateStatus {
     /// 还没查过
@@ -74,33 +80,71 @@ fn newer(remote: &str, local: &str) -> bool {
     false
 }
 
-/// 同步检查更新（调用方自己丢线程里跑）
+/// 同步检查更新（调用方自己丢线程里跑）。
+/// endpoint 非空 = 用自定义 JSON 清单；空 = 默认查 GitHub Releases。
 pub fn check(endpoint: Option<&str>) -> UpdateStatus {
-    let Some(url) = endpoint.filter(|u| !u.trim().is_empty()) else {
-        return UpdateStatus::NotConfigured;
-    };
+    match endpoint.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(url) => check_manifest(url),
+        None => check_github(),
+    }
+}
+
+fn http_get(url: &str) -> Result<String, String> {
     let resp = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(8))
         .build()
         .get(url)
+        // GitHub API 强制要 User-Agent，没有会 403
+        .set("User-Agent", "FireVibe")
+        .set("Accept", "application/vnd.github+json")
         .call();
-    let body = match resp {
-        Ok(r) => match r.into_string() {
-            Ok(b) => b,
-            Err(e) => return UpdateStatus::Failed(e.to_string()),
-        },
-        Err(e) => return UpdateStatus::Failed(short_err(&e.to_string())),
+    match resp {
+        Ok(r) => r.into_string().map_err(|e| e.to_string()),
+        Err(e) => Err(short_err(&e.to_string())),
+    }
+}
+
+/// 自定义 JSON 清单：{ "version", "url", "notes" }
+fn check_manifest(url: &str) -> UpdateStatus {
+    let body = match http_get(url) {
+        Ok(b) => b,
+        Err(e) => return UpdateStatus::Failed(e),
     };
     let m: Manifest = match serde_json::from_str(&body) {
         Ok(m) => m,
         Err(e) => return UpdateStatus::Failed(format!("清单解析失败: {e}")),
     };
     if newer(&m.version, VERSION) {
-        UpdateStatus::Available {
-            version: m.version,
-            url: m.url,
-            notes: m.notes,
-        }
+        UpdateStatus::Available { version: m.version, url: m.url, notes: m.notes }
+    } else {
+        UpdateStatus::UpToDate
+    }
+}
+
+#[derive(Deserialize)]
+struct GhRelease {
+    tag_name: String,
+    #[serde(default)]
+    html_url: String,
+    #[serde(default)]
+    body: String,
+}
+
+/// 默认：GitHub Releases/latest（tag 形如 v0.1.2）
+fn check_github() -> UpdateStatus {
+    let body = match http_get(GITHUB_LATEST) {
+        Ok(b) => b,
+        Err(e) => return UpdateStatus::Failed(e),
+    };
+    let g: GhRelease = match serde_json::from_str(&body) {
+        Ok(g) => g,
+        Err(e) => return UpdateStatus::Failed(format!("GitHub 响应解析失败: {e}")),
+    };
+    let ver = g.tag_name.trim_start_matches(['v', 'V']).to_string();
+    if newer(&ver, VERSION) {
+        let url = if g.html_url.is_empty() { RELEASES_PAGE.to_string() } else { g.html_url };
+        let notes: String = g.body.lines().take(12).collect::<Vec<_>>().join("\n");
+        UpdateStatus::Available { version: ver, url, notes }
     } else {
         UpdateStatus::UpToDate
     }

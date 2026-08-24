@@ -454,6 +454,9 @@ pub struct Settings {
     /// 说话时在屏幕底部显示那条悬浮电平条
     #[serde(default = "default_true")]
     pub show_level_hud: bool,
+    /// 是否已过首次引导（权限/声卡）。false = 下次启动弹引导弹窗。
+    #[serde(default)]
+    pub onboarded: bool,
     /// 遥控器的 USB 标识覆盖（十六进制字符串，比如 "0x0171"）。
     ///
     /// 为什么留这个口子：平替遥控器要在 Fire TV 上开机即用，就得实现 Amazon 那套
@@ -491,6 +494,7 @@ impl Default for Settings {
             prev_input_id: None,
             last_battery: None,
             show_level_hud: true,
+            onboarded: false,
             device_vid: None,
             device_pid: None,
         }

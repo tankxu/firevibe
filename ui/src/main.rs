@@ -156,6 +156,10 @@ pub struct FireVibe {
     /// 自检用：`FIREVIBE_BOOT=settings` 或 `FIREVIBE_BOOT=dialog:app1:long`
     /// 直接把界面拉到某一屏，方便截图核对设计稿。首帧消费掉。
     boot: Option<String>,
+    /// 启动后自动查一次更新（只查一次）
+    boot_update_checked: bool,
+    /// 首次引导弹窗（权限/声卡）
+    onboarding: bool,
 }
 
 impl FireVibe {
@@ -294,6 +298,7 @@ impl FireVibe {
             }
         })
         .detach();
+        let show_onb = !rt.cfg.read().settings.onboarded;
         Self {
             rt,
             rx,
@@ -337,6 +342,8 @@ impl FireVibe {
             product: String::new(),
             err: None,
             boot: std::env::var("FIREVIBE_BOOT").ok(),
+            boot_update_checked: false,
+            onboarding: show_onb,
         }
     }
 
@@ -346,6 +353,7 @@ impl FireVibe {
         let mut it = b.split(':');
         match it.next() {
             Some("settings") => self.screen = Screen::Settings,
+            Some("onboarding") => self.onboarding = true,
             Some("dialog") => {
                 let slot = it.next().unwrap_or("app1");
                 let long = it.next() == Some("long");
@@ -486,6 +494,11 @@ impl FireVibe {
     fn pump(&mut self) {
         self.poll_hotkey_grab();
         self.poll_battery();
+        // 启动后自动查一次更新（GitHub Releases），不用等用户去设置里点
+        if !self.boot_update_checked {
+            self.boot_update_checked = true;
+            self.check_update();
+        }
         // 淡出放完就把它摘掉，免得一直被当成「在动」
         if self.hover_from.is_some() && self.hover_at.elapsed() > HOVER_MS {
             self.hover_from = None;
@@ -1647,6 +1660,178 @@ impl FireVibe {
 
     /// 装虚拟声卡前的说明。系统授权框只有一句「osascript wants to make changes」，
     /// 什么都不解释就要密码是不合格的，先说清这是什么、为什么要装。
+    /// 首次引导：配对 → 权限 → 装声卡，一次讲清，带路径和一键跳转。
+    fn onboarding_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let card_ready = self.loopback.is_ready();
+        let paired = self.connected();
+
+        // 一步 = 彩色图标块 + 标题/说明 + 右侧（完成徽章 或 操作按钮）
+        fn step(
+            ic: &'static str,
+            badge: (u32, u32, u32),
+            title: &str,
+            desc: &str,
+            done: bool,
+            action: Option<gpui::AnyElement>,
+            last: bool,
+        ) -> gpui::AnyElement {
+            let right: gpui::AnyElement = if done {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .flex_none()
+                    .text_color(c(OK))
+                    .text_size(px(11.5))
+                    .font_weight(w(560.))
+                    .child(icon("circle-check", 14.))
+                    .child(SharedString::from("已就绪"))
+                    .into_any_element()
+            } else if let Some(a) = action {
+                a
+            } else {
+                div().into_any_element()
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(px(13.))
+                .px(px(16.))
+                .py(px(14.))
+                .when(!last, |d| d.border_b_1().border_color(c(LINE_SOFT)))
+                .child(
+                    div()
+                        .size(px(34.))
+                        .flex_none()
+                        .rounded(px(9.))
+                        .bg(grad(160., badge.0, badge.1))
+                        .text_color(c(badge.2))
+                        .shadow(sh1())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon(ic, 17.)),
+                )
+                .child(
+                    div()
+                        .max_w(px(340.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .line_height(relative(1.5))
+                        .child(div().text_size(px(13.5)).font_weight(w(600.)).text_color(c(INK)).child(SharedString::from(title.to_string())))
+                        .child(div().text_size(px(12.)).text_color(c(INK2)).child(SharedString::from(desc.to_string()))),
+                )
+                // 弹性空白把右侧动作推到最右，文案不至于贴着按钮
+                .child(div().flex_1().min_w(px(24.)))
+                .child(div().flex_none().child(right))
+                .into_any_element()
+        }
+
+        let open_url = |id: &'static str, label: &'static str, url: &'static str, cx: &mut Context<Self>| {
+            mini2(id, label).on_click(cx.listener(move |_, _, _, _| {
+                let _ = std::process::Command::new("open").arg(url).spawn();
+            })).into_any_element()
+        };
+
+        crate::cards::overlay().child(
+            div()
+                .id("onb")
+                .w(px(600.))
+                .bg(c(SURFACE))
+                .border_1()
+                .border_color(c(LINE))
+                .rounded(px(16.))
+                .shadow(sh3())
+                .flex()
+                .flex_col()
+                // 头部
+                .child(
+                    div()
+                        .px(px(22.))
+                        .pt(px(22.))
+                        .pb(px(14.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(div().text_size(px(18.)).font_weight(w(680.)).text_color(c(INK)).child("欢迎使用 FireVibe"))
+                        .child(div().text_size(px(12.5)).text_color(c(INK2)).line_height(relative(1.5)).child("把 Fire TV 语音遥控器变成 Mac 的遥控器 + 麦克风。开始前配好下面几项：")),
+                )
+                // 步骤列表（带边框分组）
+                .child(
+                    div()
+                        .mx(px(22.))
+                        .rounded(px(12.))
+                        .border_1()
+                        .border_color(c(LINE))
+                        .bg(c(CODE_BG))
+                        .overflow_hidden()
+                        .child(step(
+                            "tv", BADGE_DEFAULT,
+                            "配对遥控器",
+                            "系统设置 › 蓝牙 里把遥控器和 Mac 配上（长按遥控器 home 键进配对）。",
+                            paired,
+                            Some(open_url("onb-bt", "打开蓝牙", "x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth", cx)),
+                            false,
+                        ))
+                        .child(step(
+                            "keyboard", BADGE_DEFAULT,
+                            "开启「输入监控」权限",
+                            "系统设置 › 隐私与安全性 › 输入监控 → 勾上 FireVibe。读按键和麦克风都要它。",
+                            false,
+                            Some(open_url("onb-im", "打开设置", "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent", cx)),
+                            false,
+                        ))
+                        .child(step(
+                            "mic", BADGE_DEFAULT,
+                            "安装虚拟声卡「FireVibe Mic」",
+                            "语音输入靠它把遥控器麦克风喂给豆包这类工具。点安装会弹系统授权框。",
+                            card_ready,
+                            Some(
+                                primary_btn("onb-inst", "安装").on_click(cx.listener(|this, _, _, cx| {
+                                    match firevibe_core::audiodriver::install() {
+                                        Ok(()) => {
+                                            this.rt.cfg.write().voice.device = firevibe_core::audiodriver::DEVICE_NAME.into();
+                                            this.save();
+                                            this.loopback = firevibe_core::voice::LoopbackStatus::Unknown;
+                                            this.loopback_at = Instant::now() - Duration::from_secs(10);
+                                            this.toast("声卡装好了");
+                                        }
+                                        Err(e) => this.toast(format!("安装失败：{e}")),
+                                    }
+                                    cx.notify();
+                                })).into_any_element(),
+                            ),
+                            false,
+                        ))
+                        .child(step(
+                            "battery-full", BADGE_DEFAULT,
+                            "允许蓝牙（可选，用于显示电量）",
+                            "首次读电量会弹「FireVibe 想使用蓝牙」，点允许即可；不需要电量可跳过。",
+                            false,
+                            None,
+                            true,
+                        )),
+                )
+                // 底部
+                .child(
+                    div()
+                        .px(px(22.))
+                        .py(px(16.))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(div().text_size(px(11.5)).text_color(c(INK3)).child("这些随时能在「设置」里再弄"))
+                        .child(primary_btn("onb-done", "开始使用").on_click(cx.listener(|this, _, _, cx| {
+                            this.onboarding = false;
+                            this.rt.cfg.write().settings.onboarded = true;
+                            this.save();
+                            cx.notify();
+                        }))),
+                ),
+        )
+    }
+
     fn install_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let dev = firevibe_core::audiodriver::DEVICE_NAME;
         crate::cards::overlay().child(
@@ -2103,6 +2288,9 @@ impl Render for FireVibe {
             )
             .child(body);
 
+        if self.onboarding {
+            root = root.child(self.onboarding_panel(cx));
+        }
         if self.renaming.is_some() {
             root = root.child(self.rename_panel(cx));
         }

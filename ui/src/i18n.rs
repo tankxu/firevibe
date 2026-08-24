@@ -21,6 +21,9 @@ impl L {
     // 菜单栏（tray）
     pub fn tray_show(&self) -> &'static str { t!(self.0, "显示窗口", "Show Window") }
     pub fn tray_quit(&self) -> &'static str { t!(self.0, "退出", "Quit") }
+    pub fn cli_tool(&self) -> &'static str { t!(self.0, "命令行工具 firectl", "Command-line tool (firectl)") }
+    pub fn cli_tool_sub(&self) -> &'static str { t!(self.0, "配新遥控器 / 排障用", "For setting up a new remote / diagnostics") }
+    pub fn download(&self) -> &'static str { t!(self.0, "下载", "Download") }
 
     // 状态条
     pub fn paired(&self) -> &'static str { t!(self.0, "已配对", "Paired") }
