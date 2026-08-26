@@ -2304,7 +2304,8 @@ impl FireVibe {
         let dicting = self.rt.dictating.lock().is_some();
 
         // 电平条：24 格
-        let bars = (lvl * 60.0).min(1.0_f32.max(24.0)) as usize;
+        // lvl 是 0..1 的电平表刻度（core::voice::meter_norm），24 格直接铺
+        let bars = (lvl * 24.0).round().min(24.0) as usize;
         let mut meter = div().flex().gap(px(3.)).h(px(28.)).items_end();
         for i in 0..24 {
             let lit = i < bars;

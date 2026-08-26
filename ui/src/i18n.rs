@@ -465,7 +465,7 @@ impl L {
     pub fn recording_time(&self, mm: u64, ss: u64) -> String {
         t!(self.0, format!("录音中 {mm:02}:{ss:02}"), format!("Recording {mm:02}:{ss:02}"))
     }
-    pub fn recording_stop_hint(&self) -> &'static str { t!(self.0, "再按一下那个键停止", "Press that key again to stop") }
+    pub fn recording_stop_hint(&self) -> &'static str { t!(self.0, "松手保存到「下载」", "Release to save to Downloads") }
 
     // 方案改名
     pub fn rename(&self) -> &'static str { t!(self.0, "重命名", "Rename") }

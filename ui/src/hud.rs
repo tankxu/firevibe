@@ -45,7 +45,9 @@ impl Render for Hud {
         let dictating = self.rt.dictating.lock().is_some();
         let l = crate::i18n::L(self.rt.cfg.read().settings.lang);
         let bars = 22usize;
-        let lit = (lvl * 60.0).min(bars as f32) as usize;
+        // lvl 已经是 0..1 的电平表刻度（core::voice::meter_norm），直接铺满格数。
+        // 以前是 `线性RMS × 60`，正常说话只点得亮 2 格。
+        let lit = (lvl * bars as f32).round().min(bars as f32) as usize;
         let mut meter = div().flex().gap(px(3.)).items_center().h(px(20.));
         for i in 0..bars {
             // 中间高两头低，像个纺锤，静音时是一条细线

@@ -76,6 +76,31 @@ pub fn list_output_devices() -> Vec<String> {
     }
 }
 
+
+/// 线性 RMS → 0..1 的电平表刻度。
+///
+/// 线性刻度对语音根本不能用：正常说话 RMS 只有 -27 dBFS ≈ 线性 0.045，
+/// 22 格的表里点不亮 2 格，而且音节之间的停顿会直接掉到 0 —— 看着就是
+/// 「抖两下又平了」。人耳是对数的，电平表也得是。
+///
+/// 映射：-55 dBFS → 空，-3 dBFS → 满。正常说话落在六成左右。
+pub fn meter_norm(rms: f32) -> f32 {
+    if rms <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * rms.max(1e-5).log10();
+    ((db + 55.0) / 52.0).clamp(0.0, 1.0)
+}
+
+/// 快起慢落。上升立刻跟手，下降拖一下，不然每 20ms 一帧的停顿都会画出来。
+pub fn meter_smooth(prev: f32, now: f32) -> f32 {
+    if now > prev {
+        now
+    } else {
+        prev * 0.82 + now * 0.18
+    }
+}
+
 impl VoiceSink {
     pub fn start(device_prefix: &str, gain: f32) -> Result<Self> {
         let host = cpal::default_host();
@@ -197,16 +222,19 @@ impl VoiceSink {
         let g = self.gain();
         let ratio = self.out_rate as f64 / OPUS_RATE as f64;
 
-        // RMS 电平给 UI
+        // 电平给 UI —— 算的是**加完增益之后**的值，也就是真正送出去的那份。
+        // 分贝刻度 + 快起慢落，见 meter_norm / meter_smooth 的说明。
         let sum: f64 = pcm
             .iter()
             .map(|&s| {
-                let x = s as f64 / 32768.0;
+                let x = s as f64 / 32768.0 * g as f64;
                 x * x
             })
             .sum();
         let rms = (sum / pcm.len() as f64).sqrt() as f32;
-        self.sh.level.store(f32_to_bits(rms), Ordering::Relaxed);
+        let prev = bits_to_f32(self.sh.level.load(Ordering::Relaxed));
+        let lv = meter_smooth(prev, meter_norm(rms));
+        self.sh.level.store(f32_to_bits(lv), Ordering::Relaxed);
 
         let mut ring = self.sh.ring.lock();
         let mut pos = self.rs_pos.lock();

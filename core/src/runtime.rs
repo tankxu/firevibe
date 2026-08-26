@@ -958,6 +958,32 @@ impl Runtime {
             return "已禁用".into();
         }
         if let Some(act) = act {
+            // 「测试一次」只发按下、没有松开。按住类动作因此会一直挂着 ——
+            // 录音会开一个永不结束的会话，按住说话会把麦克风永久开着（费电）。
+            // 给它们补一次 2 秒后的松开，等于「试 2 秒」。
+            const TRY: Duration = Duration::from_secs(2);
+            if act.kind == ActionType::Record {
+                let r = run_record(&self.status, &self.recording, &self.tx, true);
+                let (st, rec, tx) =
+                    (self.status.clone(), self.recording.clone(), self.tx.clone());
+                std::thread::spawn(move || {
+                    std::thread::sleep(TRY);
+                    let _ = run_record(&st, &rec, &tx, false);
+                });
+                return if r.is_empty() { "试录 2 秒".into() } else { format!("{r} · 2 秒") };
+            }
+            if act.kind == ActionType::VoicePtt {
+                let r = self.run_action(&act, true);
+                if let Some(sink) = self.voice.lock().clone() {
+                    let (cfg, st, prev) =
+                        (self.cfg.clone(), self.status.clone(), self.prev_input.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(TRY);
+                        gate_voice(&cfg, &st, &sink, &prev, false, false);
+                    });
+                }
+                return format!("{r} · 2 秒");
+            }
             return self.run_action(&act, true);
         }
         // 没配就走默认直通：方向键 / OK / 返回 / 音量 / 静音 / 播放 / 快进快退
@@ -1014,7 +1040,7 @@ impl Runtime {
             // 听写要吃松开事件（松手才去识别），必须在 `!down` 短路之前。
             // 长按 = 按住说话；短按 = 点一下开始、再点一下结束。
             ActionType::Record => {
-                return toggle_record(&self.status, &self.recording, &self.tx, down);
+                return run_record(&self.status, &self.recording, &self.tx, down);
             }
             ActionType::VoiceDictate => {
                 let long = act.arg == "hold";
@@ -1302,13 +1328,21 @@ fn dispatch(
         };
     }
 
+    // 录音是按住语义：按下开始、**松手保存**。所以它必须在 `!down` 短路之前 ——
+    // 以前排在后面，松开事件被吃掉，录音根本停不下来（再按一次会撞上
+    // 「已经在录就别重开」直接返回，计时器一直涨）。
+    if act.kind == ActionType::Record {
+        return run_record(status, recording, tx, down);
+    }
+
     if !down {
         return String::new(); // 其余动作只在按下时触发
     }
 
     match act.kind {
         ActionType::None => "未设置".into(),
-        ActionType::Record => toggle_record(status, recording, tx, down),
+        // 上面已经提前返回了，这条只是让 match 穷尽
+        ActionType::Record => String::new(),
         ActionType::Key => match inj.key_stroke(&act.key, &act.mods) {
             Ok(_) => act.describe(),
             Err(e) => format!("失败: {e}"),
@@ -1857,7 +1891,7 @@ fn record_battery(status: &Arc<Status>, cfg: &Arc<RwLock<Config>>, b: i32, how: 
 /// 所以录音只能跟着按住的那段时间走，配在麦克风键上才有意义。
 ///
 /// 录的是遥控器麦克风解码后的 PCM（和听写共用同一路），不碰系统输入设备。
-fn toggle_record(
+fn run_record(
     status: &Arc<Status>,
     recording: &Arc<Mutex<Option<crate::recorder::Rec>>>,
     tx: &Sender<Event>,

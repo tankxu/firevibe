@@ -42,16 +42,21 @@ impl Rec {
     }
 
     pub fn push(&mut self, pcm: &[i16]) {
-        let pk = pcm
+        // 和虚拟声卡那条路用同一套刻度（RMS → 分贝 → 0..1 + 快起慢落），
+        // 否则「麦克风已开」和「听写中」两个电平表读数不可比。
+        let sum: f64 = pcm
             .iter()
-            .map(|v| (*v as f32 / 32768.0).abs())
-            .fold(0.0_f32, f32::max);
-        // 上升立刻跟，下降慢一点，界面上的电平才看得清
-        self.peak = if pk > self.peak {
-            pk
+            .map(|v| {
+                let x = *v as f64 / 32768.0;
+                x * x
+            })
+            .sum();
+        let rms = if pcm.is_empty() {
+            0.0
         } else {
-            self.peak * 0.82 + pk * 0.18
+            (sum / pcm.len() as f64).sqrt() as f32
         };
+        self.peak = crate::voice::meter_smooth(self.peak, crate::voice::meter_norm(rms));
         if let Some(f) = self.file.as_mut() {
             let mut buf = Vec::with_capacity(pcm.len() * 2);
             for s in pcm {

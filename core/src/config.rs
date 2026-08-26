@@ -66,7 +66,7 @@ pub enum ActionType {
     /// `arg` 存模式，跟着短按/长按走：`"tap"` = 敲一下（短按），
     /// `"hold"` = 按住期间一直按着（长按）
     VoiceHotkey,
-    /// 录音到「下载」：按一下开始，再按一下停止
+    /// 录音到「下载」：**按住**录、松手保存。录的是遥控器麦克风
     Record,
 }
 impl ActionType {
