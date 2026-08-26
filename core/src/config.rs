@@ -10,6 +10,30 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+// ---------------- 遥控器开麦模型 ----------------
+
+/// 两派行为是反的，用错了一帧音频也收不到。
+///
+/// 判据很干净：**松开麦克风键之后音频还继不继续**。热麦克风压根不看按键，
+/// PTT 松手立停。
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MicModel {
+    /// 还没探过
+    #[default]
+    Unknown,
+    /// 主机发 `MIC_ON` 就一直吐流，跟物理按键无关（如 0x0421）
+    Hot,
+    /// 只在物理麦克风键按住期间出流，`MIC_ON` 无效（如 0x0425）
+    Ptt,
+}
+
+impl MicModel {
+    pub fn is_ptt(self) -> bool {
+        matches!(self, MicModel::Ptt)
+    }
+}
+
 // ---------------- 动作 ----------------
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
@@ -293,6 +317,20 @@ impl Profile {
             .map(|sa| !sa.disabled && sa.long.kind != ActionType::None)
             .unwrap_or(false)
     }
+    /// 长按动作该不该「按下即触发」，而不是等阈值。
+    ///
+    /// 条件：这个槽配了长按、但**短按是空的**。没有短按要区分，等阈值就纯是延迟；
+    /// 对 PTT 遥控器的麦克风键尤其要命 —— 长按 = 按住说话，等 400ms 才开闸，
+    /// 开头那截话就丢进虚拟声卡外面了。
+    pub fn long_fires_on_press(&self, s: Slot) -> bool {
+        self.get(s)
+            .map(|sa| {
+                !sa.disabled
+                    && sa.long.kind != ActionType::None
+                    && sa.short.kind == ActionType::None
+            })
+            .unwrap_or(false)
+    }
     pub fn is_disabled(&self, s: Slot) -> bool {
         self.get(s).map(|sa| sa.disabled).unwrap_or(false)
     }
@@ -467,6 +505,10 @@ pub struct Settings {
     pub device_vid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_pid: Option<String>,
+
+    /// 当前遥控器的开麦模型。连上后自动探一次就存下来，换设备时清掉重探。
+    #[serde(default)]
+    pub mic_model: MicModel,
 }
 fn default_true() -> bool {
     true
@@ -497,6 +539,7 @@ impl Default for Settings {
             onboarded: false,
             device_vid: None,
             device_pid: None,
+            mic_model: MicModel::Unknown,
         }
     }
 }

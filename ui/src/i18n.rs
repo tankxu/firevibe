@@ -394,6 +394,20 @@ impl L {
     pub fn pair_likely(&self) -> &'static str { t!(self.0, "像遥控器", "likely remote") }
     pub fn pair_current(&self) -> &'static str { t!(self.0, "当前", "current") }
     pub fn pair_rescan(&self) -> &'static str { t!(self.0, "重新扫描", "Rescan") }
+    // ── PTT 遥控器提醒 ──
+    pub fn ptt_hint(&self) -> &'static str {
+        t!(self.0,
+           "这台遥控器只有按住麦克风键时才出声，语音要配在「长按」里",
+           "This remote only streams while the mic key is held — configure voice under Long press")
+    }
+    pub fn ptt_fix(&self) -> &'static str { t!(self.0, "移到长按", "Move to long press") }
+    pub fn ptt_fixed(&self) -> &'static str { t!(self.0, "已移到长按", "Moved to long press") }
+    pub fn ptt_short_note(&self) -> &'static str {
+        t!(self.0,
+           "这台遥控器的麦克风只支持按住 —— 点一下松手就没有音频了，所以短按这里不提供语音动作。请到「长按」里配置。",
+           "This remote's mic only works while held — a tap produces no audio, so voice actions aren't offered here. Configure them under Long press.")
+    }
+
     pub fn pair_ok(&self) -> &'static str { t!(self.0, "已连上新遥控器", "Connected to the new remote") }
     pub fn pair_saved(&self) -> &'static str { t!(self.0, "已保存设备，按一下遥控器唤醒它就会连上", "Device saved — press a key on the remote to connect") }
     pub fn repair_toast(&self) -> &'static str {

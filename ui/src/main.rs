@@ -22,6 +22,7 @@ use firevibe_core::{
     voice::{loopback_status, LoopbackStatus},
 };
 use gpui::{
+    AnyElement,
     deferred, div, prelude::*, px, relative, size, App, Application, Bounds, Context, Entity,
     Menu, MenuItem, SharedString, Window, WindowBounds, WindowOptions,
 };
@@ -846,14 +847,16 @@ impl FireVibe {
                 .into_any_element();
         }
 
-        match &self.err {
-            None => cards.into_any_element(),
-            Some(e) => div()
+        let ptt = self.ptt_hint_bar(cx);
+        match (&self.err, ptt) {
+            (None, None) => cards.into_any_element(),
+            (e, p) => div()
                 .flex()
                 .flex_col()
                 .gap(px(10.))
                 .child(cards)
-                .child(self.err_bar(e.clone(), cx))
+                .when_some(e.clone(), |d, e| d.child(self.err_bar(e, cx)))
+                .when_some(p, |d, p| d.child(p))
                 .into_any_element(),
         }
     }
@@ -1223,6 +1226,8 @@ impl FireVibe {
             let mut c = self.rt.cfg.write();
             c.settings.device_vid = Some(format!("0x{vid:04x}"));
             c.settings.device_pid = Some(format!("0x{pid:04x}"));
+            // 换了设备，旧的开麦模型作废 —— 置回 Unknown，runtime 起来会重探一次
+            c.settings.mic_model = firevibe_core::config::MicModel::Unknown;
             let _ = c.save();
         }
         firevibe_core::hidremap::set_ids(vid, pid);
@@ -1371,6 +1376,117 @@ impl FireVibe {
                         ),
                 ),
         )
+    }
+
+    /// PTT 遥控器 + 麦克风键绑成「点一下」时的提醒条（带一键改）。
+    ///
+    /// 不偷改用户配置 —— 只提示 + 给个按钮。判型见 runtime 启动时的探测。
+    fn ptt_hint_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let c0 = self.rt.cfg.read();
+        if !c0.settings.mic_model.is_ptt() {
+            return None;
+        }
+        // PTT 上语音必须配在**长按**里（按住语义）。短按槽里的语音动作是摆设。
+        // 两种情况不用提醒：长按里已经配好了；或者麦克风键压根没配语音。
+        use firevibe_core::config::ActionType as AT;
+        let voice = |k: AT| {
+            matches!(
+                k,
+                AT::VoicePtt | AT::VoiceToggle | AT::VoiceDictate | AT::VoiceHotkey
+            )
+        };
+        let mut long_ok = false;
+        let mut short_voice = false;
+        for a in &c0.profile().actions {
+            if a.slot != firevibe_core::layout::Slot::Mic || a.disabled {
+                continue;
+            }
+            if voice(a.long.kind) {
+                long_ok = true;
+            }
+            if voice(a.short.kind) {
+                short_voice = true;
+            }
+        }
+        let ok = long_ok || !short_voice;
+        drop(c0);
+        if ok {
+            return None;
+        }
+        let l = self.l();
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .w_full()
+                .px(px(12.))
+                .py(px(9.))
+                .rounded(px(R))
+                .border_1()
+                .border_color(c(WARN_LINE))
+                .bg(c(WARN_BG))
+                .child(div().text_color(c(WARN)).flex_none().child(icon("mic", 15.)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_size(px(12.))
+                        .text_color(c(INK))
+                        .child(SharedString::from(l.ptt_hint())),
+                )
+                .child(
+                    mini2("ptt-fix", l.ptt_fix()).h(px(32.)).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.make_mic_hold();
+                            let m = this.l().ptt_fixed();
+                            this.toast(m);
+                            cx.notify();
+                        },
+                    )),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// 把麦克风键的语音动作从短按槽挪到长按槽，并设成按住语义。
+    ///
+    /// PTT 遥控器上短按槽里的语音动作是摆设 —— 点一下松手，遥控器一帧都不出。
+    /// 长按 = 按住，语义也更直白。开头那点延迟由 runtime 补掉：麦克风键短按槽为空时
+    /// 长按动作按下即触发，不等阈值（见 runtime 的长按状态机）。
+    fn make_mic_hold(&mut self) {
+        use firevibe_core::config::ActionType as AT;
+        {
+            let mut c = self.rt.cfg.write();
+            let idx = c.active;
+            if let Some(p) = c.profiles.get_mut(idx) {
+                for a in p.actions.iter_mut() {
+                    if a.slot != firevibe_core::layout::Slot::Mic {
+                        continue;
+                    }
+                    let voice = |k: AT| {
+                        matches!(
+                            k,
+                            AT::VoicePtt | AT::VoiceToggle | AT::VoiceDictate | AT::VoiceHotkey
+                        )
+                    };
+                    if voice(a.short.kind) && !voice(a.long.kind) {
+                        a.long = a.short.clone();
+                        a.short = Default::default();
+                        // 「开始/停止说话」是点一下翻转，挂长按上没意义 —— 换成按住说话
+                        if a.long.kind == AT::VoiceToggle {
+                            a.long.kind = AT::VoicePtt;
+                        }
+                    }
+                    if voice(a.long.kind) && a.long.kind != AT::VoicePtt {
+                        a.long.arg = "hold".into();
+                    }
+                }
+            }
+            let _ = c.save();
+        }
+        // 绑定变了，硬件层映射跟着重下
+        let _ = self.rt.sync_hid_remap();
     }
 
     fn err_bar(&self, msg: String, cx: &mut Context<Self>) -> impl IntoElement {

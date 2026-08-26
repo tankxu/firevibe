@@ -96,6 +96,13 @@ impl FireVibe {
             },
             key_id
         );
+        // PTT 遥控器（只在物理麦克风键按住期间出流）：麦克风键的**短按**槽里
+        // 语音类动作全都是摆设 —— 点一下就松手，遥控器那边一帧都不出。
+        // 干脆不给选，改成一行说明让用户去长按里配。
+        let ptt_short_mic = d.slot == firevibe_core::layout::Slot::Mic
+            && !d.long
+            && self.rt.cfg.read().settings.mic_model.is_ptt();
+
         // 动作类型
         let mut types = div().flex().flex_wrap().gap(px(6.));
         for k in ActionType::ALL {
@@ -105,6 +112,18 @@ impl FireVibe {
                 continue;
             }
             if d.long && k == ActionType::VoiceToggle {
+                continue;
+            }
+            if ptt_short_mic
+                && matches!(
+                    k,
+                    ActionType::VoicePtt
+                        | ActionType::VoiceToggle
+                        | ActionType::VoiceDictate
+                        | ActionType::VoiceHotkey
+                        | ActionType::Record
+                )
+            {
                 continue;
             }
             types = types.child(chip(("kind", k as usize), k.label(), k == d.kind).on_click(
@@ -133,7 +152,21 @@ impl FireVibe {
             .px(px(18.))
             .pt(px(2.))
             .pb(px(18.))
-            .child(div().child(field_lab(l.action_type())).child(types));
+            .child(div().child(field_lab(l.action_type())).child(types))
+            .when(ptt_short_mic, |b| {
+                b.child(
+                    div()
+                        .px(px(10.))
+                        .py(px(8.))
+                        .rounded(px(R))
+                        .border_1()
+                        .border_color(c(WARN_LINE))
+                        .bg(c(WARN_BG))
+                        .text_size(px(11.5))
+                        .text_color(c(INK2))
+                        .child(SharedString::from(l.ptt_short_note())),
+                )
+            });
         // 参数区，按类型不同
         match d.kind {
             ActionType::Key => {

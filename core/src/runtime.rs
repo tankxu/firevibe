@@ -438,6 +438,7 @@ impl Runtime {
         let hid_key_held = self.hid_key_held.clone();
         let seen_rids = self.seen_rids.clone();
         let raw_all = self.raw_all.clone();
+        let auto_mic_off = self.auto_mic_off.clone();
         let trace_keys = self.trace_keys.clone();
         let pending_writes = self.pending_writes.clone();
         let dictating = self.dictating.clone();
@@ -462,6 +463,51 @@ impl Runtime {
                 // 一两天吃掉 30% 电；而 `mic_now != mic_was` 两边都 false 时不触发，不补关不掉。
                 // （关麦命令有效，前提是本进程有「输入监控」授权 —— 见 device.rs。）
                 let _ = dev.write(&MIC_OFF);
+
+                // ── 探一次开麦模型 ──
+                // 判据：**没人碰遥控器的时候发 MIC_ON，出不出流**。
+                // 出流 = 热麦克风（它压根不看按键）；不出流 = PTT（只有按住才出）。
+                // 结果存进配置，换设备时会被清掉重探（见 UI 的 pick_device）。
+                //
+                // ⚠️ 判成 PTT 之后**照样继续发 MIC_ON/keepalive** —— 对 PTT 无害，
+                // 而万一判错（比如探测时遥控器正好睡着了）也不会把热麦克风弄瘫。
+                // 判型只用来关掉那个没意义的自愈关麦、和在界面上提醒绑定方式。
+                if cfg.read().settings.mic_model == crate::config::MicModel::Unknown {
+                    let base = status.audio_frames.load(Ordering::Relaxed);
+                    let _ = dev.write(&MIC_ON);
+                    let t0 = Instant::now();
+                    let mut n = 0u32;
+                    let mut b = [0u8; 128];
+                    while t0.elapsed() < Duration::from_millis(1500) {
+                        if let Ok(len) = dev.read_timeout(&mut b, 50) {
+                            if len > 0 && b[0] == RID_AUDIO {
+                                n += 1;
+                            }
+                        }
+                    }
+                    let _ = dev.write(&MIC_OFF);
+                    let model = if n > 3 {
+                        crate::config::MicModel::Hot
+                    } else {
+                        crate::config::MicModel::Ptt
+                    };
+                    {
+                        let mut c = cfg.write();
+                        c.settings.mic_model = model;
+                        let _ = c.save();
+                    }
+                    let _ = tx.send(Event::Log(format!(
+                        "开麦模型：{}（静默发 MIC_ON 收到 {n} 帧）",
+                        match model {
+                            crate::config::MicModel::Hot => "热麦克风 —— 发命令就一直出流",
+                            crate::config::MicModel::Ptt =>
+                                "按住才出流 —— 麦克风键要绑「按住」模式",
+                            _ => "未知",
+                        }
+                    )));
+                    status.audio_frames.store(base, Ordering::Relaxed);
+                }
+
                 let mut mic_was = false;
                 let mut last_ka = Instant::now();
                 let mut idle_frames = status.audio_frames.load(Ordering::Relaxed);
@@ -504,8 +550,13 @@ impl Runtime {
                         let _ = dev.write(&MIC_ON);
                         last_ka = Instant::now();
                     }
-                    // 自愈：没开麦却还在收音频 → 设备侧还热着（上次强杀、或没收到命令），补关麦
-                    if !mic_now && idle_at.elapsed() >= Duration::from_secs(2) {
+                    // 自愈：没开麦却还在收音频 → 设备侧还热着（上次强杀、或没收到命令），补关麦。
+                    // PTT 遥控器上这是误触发 —— 它本来就是「按住才出流」，没开麦时收到音频
+                    // 完全正常，补关麦既没用又每 2 秒来一次。auto_mic_off 是诊断时的开关
+                    // （probe-all 会关掉它），以前只存不读，等于没接上。
+                    let self_heal = auto_mic_off.load(Ordering::Relaxed)
+                        && !cfg.read().settings.mic_model.is_ptt();
+                    if self_heal && !mic_now && idle_at.elapsed() >= Duration::from_secs(2) {
                         let now_frames = status.audio_frames.load(Ordering::Relaxed);
                         if now_frames > idle_frames + 5 {
                             let _ = dev.write(&MIC_OFF);
@@ -672,11 +723,52 @@ impl Runtime {
                                 }
                                 if down {
                                     // 配了长按才起定时器；没配就等松手直接走短按
-                                    let has_long = cfg
-                                        .read()
-                                        .key_slot(k)
-                                        .map(|s| cfg.read().profile().has_long(s))
-                                        .unwrap_or(false);
+                                    let slot = cfg.read().key_slot(k);
+                                    let (has_long, at_once) = slot
+                                        .map(|s| {
+                                            let c = cfg.read();
+                                            (
+                                                c.profile().has_long(s),
+                                                c.profile().long_fires_on_press(s),
+                                            )
+                                        })
+                                        .unwrap_or((false, false));
+                                    // 短按是空的 -> 没有要区分的东西，等阈值纯是延迟。
+                                    // PTT 遥控器的麦克风键就靠这条：长按=按住说话，
+                                    // 按下立刻开闸，开头那截话才不会丢。
+                                    if has_long && at_once {
+                                        held.insert(k, (Instant::now(), true)); // 标记已触发
+                                        let r = dispatch(
+                                            &cfg,
+                                            &status,
+                                            &inj,
+                                            &dictating,
+                                            &recording,
+                                            &tx,
+                                            &voice,
+                                            &prev_input,
+                                            k,
+                                            true,
+                                            true, // long
+                                        );
+                                        if !r.is_empty() {
+                                            if let Some(l) = learn_suppress_codes(
+                                                &cfg,
+                                                &recent_ev,
+                                                &learned_codes,
+                                            ) {
+                                                let _ = tx.send(Event::Log(format!(
+                                                    "已学到要屏蔽的系统键码: {l:?}"
+                                                )));
+                                            }
+                                            let _ = tx.send(Event::Key {
+                                                key: k,
+                                                down: true,
+                                                result: r,
+                                            });
+                                        }
+                                        continue;
+                                    }
                                     if has_long {
                                         held.insert(k, (Instant::now(), false));
                                         continue; // 按下先不动作，等长按到时或松手
