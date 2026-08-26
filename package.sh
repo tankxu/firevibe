@@ -12,7 +12,11 @@ cd "$(dirname "$0")"
 
 APP="target/FireVibe.app"
 BIN="target/release/firevibe-ui"
-VER=$(sed -n 's/^version = "\(.*\)"/\1/p' ui/Cargo.toml | head -1)
+# 版本号只有一个来源：根 Cargo.toml 的 [workspace.package]。
+# 以前读 ui/Cargo.toml，而更新检查用的是 core 的版本（= workspace）——
+# 两边能各说各话：装着的包自称 0.1.2-beta.1，更新检查却拿 0.1.3 去比。
+VER=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+[ -n "$VER" ] || { echo "✗ 读不到版本号"; exit 1; }
 
 echo "▸ 构建 release"
 cargo build --release -p firevibe-ui
