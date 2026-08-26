@@ -100,7 +100,14 @@ impl L {
     pub fn key_none(&self) -> &'static str { t!(self.0, "未选", "None") }
 
     // 启动/语音链路错误 toast
-    pub fn toast_block_failed(&self, e: &str) -> String { t!(self.0, format!("屏蔽系统默认行为失败: {e}"), format!("Couldn't block the system default action: {e}")) }
+    pub fn toast_block_failed(&self, e: &str) -> String {
+        if e.contains("EVENT_TAP_FAILED") {
+            return t!(self.0,
+                "无法屏蔽系统默认行为 —— 多半是缺「辅助功能」权限".to_string(),
+                "Couldn't suppress system default keys — likely missing Accessibility permission".to_string());
+        }
+        t!(self.0, format!("屏蔽系统默认行为失败: {e}"), format!("Couldn't block the system default action: {e}"))
+    }
     pub fn toast_voice_start_failed(&self, e: &str) -> String { t!(self.0, format!("语音链路启动失败: {e}"), format!("Voice pipeline failed to start: {e}")) }
     // 更新状态里的版本行
     pub fn update_available_ver(&self, cur: &str, new: &str) -> String { t!(self.0, format!("{cur} → {new} 可更新"), format!("{cur} → {new} available")) }
@@ -374,6 +381,26 @@ impl L {
     // 错误条（HID / 输入监控）
     pub fn hid_no_perm(&self) -> &'static str { t!(self.0, "遥控器打不开：缺「输入监控」权限", "Can't open the remote: missing Input Monitoring") }
     pub fn hid_not_connected(&self) -> &'static str { t!(self.0, "遥控器没连上", "Remote isn't connected") }
+    pub fn hid_not_found_hint(&self) -> &'static str {
+        t!(self.0,
+           "没找到匹配的遥控器。按一下遥控器任意键唤醒它；换了新遥控器就点「重新配对」按型号重新适配。",
+           "No matching remote found. Press any key on it to wake it; if you switched remotes, tap “Re-pair” to set up the new one.")
+    }
+    pub fn re_pair(&self) -> &'static str { t!(self.0, "配对新遥控器", "Pair new remote") }
+    pub fn pair_title(&self) -> &'static str { t!(self.0, "配对新遥控器", "Pair a new remote") }
+    pub fn pair_hint(&self) -> &'static str { t!(self.0, "先在 系统设置 › 蓝牙 里连上遥控器（按一下它任意键唤醒），再从下面选中它。", "Connect the remote in System Settings › Bluetooth first (press any key to wake it), then pick it below.") }
+    pub fn pair_scanning(&self) -> &'static str { t!(self.0, "正在扫描设备…", "Scanning devices…") }
+    pub fn pair_none(&self) -> &'static str { t!(self.0, "没扫到设备。确认遥控器已在蓝牙里连上、按一下它唤醒，再「重新扫描」。", "No devices found. Make sure the remote is connected in Bluetooth and awake, then Rescan.") }
+    pub fn pair_likely(&self) -> &'static str { t!(self.0, "像遥控器", "likely remote") }
+    pub fn pair_current(&self) -> &'static str { t!(self.0, "当前", "current") }
+    pub fn pair_rescan(&self) -> &'static str { t!(self.0, "重新扫描", "Rescan") }
+    pub fn pair_ok(&self) -> &'static str { t!(self.0, "已连上新遥控器", "Connected to the new remote") }
+    pub fn pair_saved(&self) -> &'static str { t!(self.0, "已保存设备，按一下遥控器唤醒它就会连上", "Device saved — press a key on the remote to connect") }
+    pub fn repair_toast(&self) -> &'static str {
+        t!(self.0,
+           "在终端跑：firectl --probe-all（跟着提示走，会把新遥控器写进配置）",
+           "Run in Terminal: firectl --probe-all (follow the prompts to set up the new remote)")
+    }
     pub fn hid_open_failed(&self) -> &'static str { t!(self.0, "遥控器打不开", "Can't open the remote") }
     pub fn hid_perm_hint(&self) -> &'static str {
         t!(self.0,

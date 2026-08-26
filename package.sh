@@ -18,23 +18,35 @@ echo "▸ 构建 release"
 cargo build --release -p firevibe-ui
 
 echo "▸ 生成图标"
-python3 design/icon/gen.py
-CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-# ⚠️ 必须加 timeout + 独立的 user-data-dir：共用默认 profile 时，
-# 上一次没退干净的实例会持有锁，新实例就一直挂着不返回（踩过，整条打包卡死，
-# 而且会攒下一堆僵尸 chrome 进程）。渲不出来就沿用现有图标，不阻塞打包。
-if [ -x "$CHROME" ]; then
-  CHROME_TMP=$(mktemp -d)
-  if ! timeout 60 "$CHROME" --headless --disable-gpu --hide-scrollbars \
+# icon-1024.png 是提交在 git 里的成品，默认直接用它。
+# ⚠️ 不要每次都用 Chrome 从 SVG 重渲：Chrome 常在 SVG 没加载完就截图，
+#    渲出个几乎空白的坏图**还会覆盖好图**（踩过：dock 图标变成占位方块）。
+#    只有图**真的缺失**时才用 Chrome 兜底生成，且渲完校验大小，坏了就丢弃。
+python3 design/icon/gen.py   # 只重生成 svg（无副作用），png 不动
+PNG="design/icon/icon-1024.png"
+if [ ! -s "$PNG" ] || [ "$(wc -c < "$PNG")" -lt 100000 ]; then
+  echo "  icon-1024.png 缺失/异常，尝试用 Chrome 从 SVG 生成…"
+  CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  if [ -x "$CHROME" ]; then
+    CHROME_TMP=$(mktemp -d)
+    OUT="$PNG.new"
+    timeout 60 "$CHROME" --headless --disable-gpu --hide-scrollbars \
       --no-first-run --no-default-browser-check \
       --user-data-dir="$CHROME_TMP" --default-background-color=00000000 \
-      --window-size=1024,1024 --screenshot="design/icon/icon-1024.png" \
-      "file://$PWD/design/icon/_render.html" 2>/dev/null; then
-    echo "  (Chrome 渲图标失败或超时，沿用现有 icon-1024.png)"
+      --window-size=1024,1024 --screenshot="$OUT" \
+      "file://$PWD/design/icon/_render.html" 2>/dev/null || true
+    # 只有渲出来够大（不是空白坏图）才采用
+    if [ -s "$OUT" ] && [ "$(wc -c < "$OUT")" -ge 100000 ]; then
+      mv "$OUT" "$PNG"; echo "  已生成新图标"
+    else
+      rm -f "$OUT"; echo "  ⚠ Chrome 渲出的图不可用，保留现有 png"
+    fi
+    rm -rf "$CHROME_TMP"
+  else
+    echo "  ⚠ 没有 Chrome 也没有现成图标"
   fi
-  rm -rf "$CHROME_TMP"
 else
-  echo "  (没有 Chrome，沿用现有 icon-1024.png)"
+  echo "  用现有 icon-1024.png（$(wc -c < "$PNG") 字节）"
 fi
 
 ICONSET=$(mktemp -d)/icon.iconset; mkdir -p "$ICONSET"

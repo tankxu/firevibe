@@ -568,81 +568,76 @@ fn hold_round(
     got
 }
 
-/// 麦克风探测：先走标准路径（主机发开麦 `[F2,01,01]` → 遥控器在 0xF0 吐 Opus），
-/// 出流就说明和原厂同一条通路、能用；不出流再「只按键、不发命令」观察一轮，
-/// 把它实际发的所有报文 id 打出来，看语音是不是走了别的 report。
+/// 麦克风探测 —— **不用碰遥控器**。
 ///
-/// 返回 (标准路出的帧, 探索路出的帧, 探索路见到的报文 id 列表)
-fn step4_mic(r: &mut Report, rt: &Runtime, rx: &Receiver<Event>) -> (u64, u64, Vec<u8>) {
-    r.say("\n───── ③ 试试语音输入（要按住麦克风键说话）─────");
-    r.say("  这台遥控器是「按住说话」硬件：主机发开麦命令只是允许它上报音频，");
-    r.say("  真正采音要**物理按住麦克风键**（松开就停）—— 所以这一步得你按一下。");
-    r.say("  已临时把麦克风键映射成「右 Option」，按它**不会弹 Spotlight**；这一步结束自动还原。");
+/// 走和界面「按住说话」完全一样的路径：先 `ensure_voice()` 建虚拟声卡 sink，
+/// 再 `set_talking(true)`（内部 `set_passing` + 置 `mic_on`，读线程随即发
+/// `MIC_ON [F2,01,01]` 并每秒 keepalive）。麦克风是「热」的 —— 命令一发就出流，
+/// 不需要物理按住那颗键。
+/// ⚠️ 早先这一步要求用户按住麦克风键，是因为当时没建 sink：
+/// `push_pcm` 在 `passing=false` 时直接丢弃，看着就像「不按就没声音」。
+///
+/// 返回 (收到的 0xF0 帧数, 峰值电平, 见到的报文 id)
+fn step4_mic(r: &mut Report, rt: &Runtime, rx: &Receiver<Event>) -> (u64, f32, Vec<u8>) {
+    r.say("\n───── ③ 试试语音输入 ─────");
+    r.say("  主机发开麦命令，看遥控器吐不吐音频 —— **不用你按遥控器**。");
     // 诊断期间别让 app 逻辑自己发关麦干扰
     rt.auto_mic_off.store(false, Ordering::Relaxed);
-    // 临时重映射：麦克风键(AC Search)→右⌥，避免按下弹 Spotlight。测完在函数末尾清掉。
-    let _ = firevibe_core::hidremap::apply("rightoption");
 
-    // ── 标准路径：按住说话时发开麦，并**每秒补发一次**保持热麦 ──
-    // ⚠️ 开麦命令会过期：单发一次、等用户几秒后才按键，到时早失效了（原厂遥控器
-    //    实测就这么 0 帧）。app 靠每秒 keepalive 保持，这里照做。
-    r.say("\n  [标准路径] 按住麦克风键期间，主机每秒补发一次开麦 F2 01 01");
+    // 建语音链路（虚拟声卡 sink）。没有它 push_pcm 会被丢弃，等于测不到。
+    if let Err(e) = rt.ensure_voice() {
+        r.say(format!("  ⚠ 语音链路建不起来：{e:#}"));
+        r.say("    多半是虚拟声卡「FireVibe Mic」没装 —— 在 FireVibe 里装一下再来。");
+        r.fact("语音", format!("链路失败: {e}"));
+        rt.auto_mic_off.store(true, Ordering::Relaxed);
+        return (0, 0.0, Vec::new());
+    }
+
     rt.seen_rids.lock().clear();
-    while rx.try_recv().is_ok() {}
-    wait_enter("  按回车，然后**按住麦克风键说话、一直按住别松**，8 秒… ");
     while rx.try_recv().is_ok() {}
     let t0 = Instant::now();
     let a0 = rt.status.audio_frames.load(Ordering::Relaxed);
+
+    if !rt.set_talking(true) {
+        r.say("  ⚠ 开不了麦（语音链路没就绪）");
+        rt.auto_mic_off.store(true, Ordering::Relaxed);
+        return (0, 0.0, Vec::new());
+    }
+    r.say("  已开麦，收 8 秒…（想验电平就对着遥控器说话，不说也能看出流没流）");
+
+    // 收 8 秒，顺带记峰值电平
+    let mut peak = 0.0f32;
     for _ in 0..8 {
-        rt.send_report(vec![0xF2, 0x01, 0x01]); // keepalive
         watch(r, rt, rx, 1, t0);
+        let lv = rt.level();
+        if lv > peak {
+            peak = lv;
+        }
     }
-    println!("  ↑ 松开麦克风键");
-    watch(r, rt, rx, 2, t0);
-    let std_frames = rt.status.audio_frames.load(Ordering::Relaxed) - a0;
-    r.say(format!("  标准路径收到 {std_frames} 帧 0xF0 音频"));
+    let frames = rt.status.audio_frames.load(Ordering::Relaxed) - a0;
 
-    let mut explore_frames = 0u64;
-    let mut explore_ids: Vec<u8> = Vec::new();
-    if std_frames > 0 {
-        r.say("  ✓ 出流了 —— 和原厂同一条通路，麦克风能用。");
-    } else {
-        r.say("  标准路径没出流。再来一轮：**这次不发任何命令**，只按住说话，");
-        r.say("  把它实际发出来的每种报文都打出来 —— 看语音是不是走了别的 report。");
-        rt.send_report(vec![0xF2, 0x00]); // 先确保关麦，排除上一轮残留
-        std::thread::sleep(Duration::from_millis(400));
-        rt.seen_rids.lock().clear();
-        while rx.try_recv().is_ok() {}
-        let t1 = Instant::now();
-        let b0 = rt.status.audio_frames.load(Ordering::Relaxed);
-        wait_enter("  按回车，再**按住麦克风键说话**，8 秒… ");
-        while rx.try_recv().is_ok() {}
-        watch(r, rt, rx, 8, t1);
-        println!("  ↑ 松开麦克风键");
-        watch(r, rt, rx, 2, t1);
-        explore_frames = rt.status.audio_frames.load(Ordering::Relaxed) - b0;
-        explore_ids = rt.seen_rids.lock().keys().copied().collect();
-    }
-
-    // 收尾：关麦 + 还原按键映射（别把系统状态留下）
+    // 收尾：关麦（热麦克风一直开着很费电）
+    rt.set_talking(false);
+    std::thread::sleep(Duration::from_millis(300));
     rt.send_report(vec![0xF2, 0x00]);
-    std::thread::sleep(Duration::from_millis(400));
+    std::thread::sleep(Duration::from_millis(300));
     rt.auto_mic_off.store(true, Ordering::Relaxed);
-    firevibe_core::hidremap::clear();
 
-    if !explore_ids.is_empty() {
-        r.say("\n  探索轮见到的报文类型：");
-        for rid in &explore_ids {
+    let ids: Vec<u8> = rt.seen_rids.lock().keys().copied().collect();
+    r.say(format!("  收到 {frames} 帧 0xF0 音频，峰值电平 {peak:.3}"));
+    if !ids.is_empty() {
+        r.say("  期间见到的报文类型：");
+        for rid in &ids {
             r.say(format!("    0x{rid:02X}  {}", rid_zh(*rid)));
         }
     }
-    r.fact("麦克风_标准路帧", std_frames.to_string());
-    r.fact("麦克风_探索路帧", explore_frames.to_string());
+    r.fact("麦克风_帧数", frames.to_string());
+    r.fact("麦克风_峰值电平", format!("{peak:.3}"));
     r.fact(
-        "探索路报文id",
-        explore_ids.iter().map(|k| format!("0x{k:02X}")).collect::<Vec<_>>().join(" "),
+        "报文id",
+        ids.iter().map(|k| format!("0x{k:02X}")).collect::<Vec<_>>().join(" "),
     );
-    (std_frames, explore_frames, explore_ids)
+    (frames, peak, ids)
 }
 
 fn step6_battery(r: &mut Report, rt: &Runtime, rx: &Receiver<Event>) {
@@ -658,32 +653,29 @@ fn step6_battery(r: &mut Report, rt: &Runtime, rx: &Receiver<Event>) {
 }
 
 // ── 结论 ──
-fn step7_verdict(r: &mut Report, mic: (u64, u64, Vec<u8>), key_count: usize) {
-    let (std_frames, explore_frames, explore_ids) = mic;
+fn step7_verdict(r: &mut Report, mic: (u64, f32, Vec<u8>), key_count: usize) {
+    let (frames, peak, ids) = mic;
     r.say("\n───── 结论 ─────");
 
-    // 语音
-    if std_frames > 0 {
-        r.say(format!("  ✓ 语音可用：标准路径（F2 01 01 → 0xF0）收到 {std_frames} 帧，和原厂同一条通路。"));
-        r.say("    这台遥控器的麦克风功能在 FireVibe 里能直接用。");
-        r.fact("语音", "可用（标准通路）");
-    } else if explore_frames > 0 {
-        r.say(format!("  ✓ 语音可能可用：不发命令、只按键时也在 0xF0 上收到 {explore_frames} 帧。"));
-        r.say("    这台是「按键即热麦」型，和原厂略有不同，但音频通路一致，应该能用。");
-        r.fact("语音", "可用（按键即热麦）");
-    } else if explore_ids.iter().any(|id| *id >= 0xE0 && *id != 0xF2) {
-        let list: Vec<String> = explore_ids.iter().filter(|id| **id >= 0xE0).map(|id| format!("0x{id:02X}")).collect();
-        r.say("  ? 0xF0 上没有音频，但按住麦克风键时有别的厂商私有报文出现：");
+    if frames > 0 {
+        r.say(format!("  ✓ 语音可用：开麦后收到 {frames} 帧 0xF0 音频（峰值电平 {peak:.3}），"));
+        r.say("    和原装 Fire TV 遥控器同一条通路，麦克风能在 FireVibe 里用。");
+        if peak < 0.005 {
+            r.say("    （电平很低是正常的 —— 刚才没人对着它说话，出流本身就说明通路是好的。）");
+        }
+        r.fact("语音", "可用");
+    } else if ids.iter().any(|id| *id >= 0xE0 && *id != 0xF2) {
+        let list: Vec<String> = ids.iter().filter(|id| **id >= 0xE0).map(|id| format!("0x{id:02X}")).collect();
+        r.say("  ? 0xF0 上没有音频，但见到了别的厂商私有报文：");
         r.say(format!("    {}", list.join(" ")));
-        r.say("    语音也许走了别的 report id —— 把这份报告发回来，能进一步定位。");
-        r.fact("语音", "待定位（有其他私有报文）");
+        r.say("    语音也许走了别的 report id —— 把这份报告发回来能进一步定位。");
+        r.fact("语音", "待定位");
     } else {
-        r.say("  ✗ 语音用不了：两轮都没在 0xF0 收到音频，也没见到别的音频类报文。");
-        r.say("    先确认按的确实是麦克风键再重跑一次；仍为零，就是这台在 HID 层没实现语音。");
+        r.say("  ✗ 语音用不了：开麦命令发出去了，但一帧 0xF0 都没收到。");
+        r.say("    这台在 HID 层大概没实现 Amazon 那套语音通路。");
         r.fact("语音", "不可用");
     }
 
-    // 按键
     if key_count > 0 {
         r.say(format!("  ✓ 按键：认到 {key_count} 个（末尾可选择写进配置）。"));
     } else {

@@ -36,6 +36,11 @@ pub fn needs_bluetooth_permission() -> bool {
     NO_AUTH.load(Ordering::Relaxed)
 }
 
+/// 忘掉已读到的电量（换遥控器时调）—— 否则界面会显示上一个设备的陈旧值
+pub fn forget() {
+    LEVEL.store(-1, Ordering::Relaxed);
+}
+
 /// 最近一次读到的电量（1~100）
 pub fn last() -> Option<i32> {
     let v = LEVEL.load(Ordering::Relaxed);
@@ -96,20 +101,56 @@ pub fn read_blocking(name_contains: &str) -> Option<i32> {
     None
 }
 
+/// 要读哪台设备的电量（按蓝牙名字模糊匹配）。**换遥控器要跟着改** ——
+/// 早先写死 "Amazon"，换成别的牌子（比如 BLE_TEST_412）就永远读不到、
+/// 界面一直显示上一台的陈旧电量。
+static TARGET: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// 目标一变就 +1，tracker 看到变化立刻重读（否则要等下一个 5 分钟周期）
+static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 设定要读哪台设备（连上遥控器 / 配对新遥控器时调）。名字空就不读。
+pub fn set_target(name_contains: &str) {
+    if let Ok(mut g) = TARGET.lock() {
+        if *g != name_contains {
+            *g = name_contains.to_string();
+            // 换目标了，旧值作废，并催 tracker 立刻重读
+            LEVEL.store(-1, Ordering::Relaxed);
+            GEN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// 起一个后台线程定时读。`every_secs` 建议 300（电量变化慢，别频繁连蓝牙）。
-pub fn spawn_tracker(name_contains: &str, every_secs: u64) {
+/// 读哪台设备看 `set_target()`，每轮重新取 —— 中途换遥控器也能跟上。
+pub fn spawn_tracker(every_secs: u64) {
     if probe_path().is_none() {
         eprintln!("[batt] 没找到 battprobe，跳过电量读取");
         return;
     }
-    let want = name_contains.to_string();
     std::thread::Builder::new()
         .name("firevibe-batt".into())
-        .spawn(move || loop {
-            if let Some(v) = read_blocking(&want) {
-                eprintln!("[batt] 蓝牙读到 {v}%");
+        .spawn(move || {
+            let mut seen_gen = u64::MAX; // 首轮必读
+            loop {
+                let g = GEN.load(Ordering::Relaxed);
+                let want = TARGET.lock().ok().map(|t| t.clone()).unwrap_or_default();
+                if !want.is_empty() {
+                    if let Some(v) = read_blocking(&want) {
+                        eprintln!("[batt] 蓝牙读到 {v}%（{want}）");
+                    } else {
+                        eprintln!("[batt] 没读到（找 {want}）");
+                    }
+                }
+                seen_gen = g;
+                // 分片睡：目标一变（GEN 变了）立刻醒来重读，不用等满一个周期
+                let total = every_secs.max(60);
+                for _ in 0..total {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if GEN.load(Ordering::Relaxed) != seen_gen {
+                        break;
+                    }
+                }
             }
-            std::thread::sleep(std::time::Duration::from_secs(every_secs.max(60)));
         })
         .ok();
 }

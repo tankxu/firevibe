@@ -203,7 +203,7 @@ pub fn spawn(
             )
         };
         if port.is_null() {
-            let _ = tx.send(Err("建 event tap 失败 —— 大概缺「辅助功能」权限".into()));
+            let _ = tx.send(Err("EVENT_TAP_FAILED".into()));
             return;
         }
         unsafe {

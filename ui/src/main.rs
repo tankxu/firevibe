@@ -131,6 +131,11 @@ pub struct FireVibe {
     /// 方案改名弹窗：装着输入框，None = 没在改
     pub renaming: Option<Entity<InputState>>,
     pub install_confirm: bool,
+    /// 「配对新遥控器」弹窗开着
+    pub pairing: bool,
+    /// 扫到的 HID 设备列表（后台线程填）；None=还在扫
+    pair_devices: Option<Vec<firevibe_core::device::HidDev>>,
+    pair_rx: Option<std::sync::mpsc::Receiver<Vec<firevibe_core::device::HidDev>>>,
     /// 「测试输入」面板是否打开
     pub voice_test: bool,
     /// 面板里正在按住测试（送流到虚拟声卡）
@@ -168,6 +173,8 @@ pub struct FireVibe {
     boot: Option<String>,
     /// 启动后自动查一次更新（只查一次）
     boot_update_checked: bool,
+    /// 用户主动触发的错误（点 Connect 失败）——后台自动重连不清它，用户手动关才清
+    err_sticky: bool,
     /// 首次引导弹窗（权限/声卡）
     onboarding: bool,
 }
@@ -336,6 +343,9 @@ impl FireVibe {
             batt_started: false,
             renaming: None,
             install_confirm: false,
+            pairing: false,
+            pair_devices: None,
+            pair_rx: None,
             voice_test: false,
             testing: false,
             dictating: false,
@@ -358,6 +368,7 @@ impl FireVibe {
             err: None,
             boot: std::env::var("FIREVIBE_BOOT").ok(),
             boot_update_checked: false,
+            err_sticky: false,
             onboarding: show_onb,
         }
     }
@@ -509,6 +520,21 @@ impl FireVibe {
     }
 
     fn pump(&mut self) {
+        // 临时自测：FIREVIBE_PAIRTEST=1 时启动 2 秒后自动开配对（模拟真实点击时机）
+        if std::env::var_os("FIREVIBE_PAIRTEST").is_some()
+            && !self.pairing && self.pair_devices.is_none()
+            && self.started
+        {
+            // 复用 boot_update_checked 之外的一次性——用 pairing 本身没触发过判断
+            static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                // 这里没有 cx，只能置标志 + 起线程，模拟 open_pairing 的效果
+                self.pairing = true;
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.pair_rx = Some(rx);
+                std::thread::spawn(move || { let _ = tx.send(firevibe_core::device::list_hid()); });
+            }
+        }
         self.poll_hotkey_grab();
         self.poll_battery();
         self.poll_config_file_io();
@@ -540,11 +566,17 @@ impl FireVibe {
             self.started = true;
             self.hid_try_at = Instant::now();
             match self.rt.start() {
-                Ok(_) => self.err = None,
+                Ok(_) => {
+                    self.err = None;
+                    self.err_sticky = false; // 连上了，清掉主动错误
+                }
                 Err(e) => {
-                    let m = format!("{e:#}");
-                    // 只有真错误才报；没连上就安静等
-                    self.err = if m.starts_with("HID_NOT_FOUND") { None } else { Some(m) };
+                    // 用户主动点过 Connect 报的错要留着；后台自动重连不覆盖、不清
+                    if !self.err_sticky {
+                        let m = format!("{e:#}");
+                        // 只有真错误才报；没连上就安静等
+                        self.err = if m.starts_with("HID_NOT_FOUND") { None } else { Some(m) };
+                    }
                 }
             }
             if first {
@@ -560,7 +592,7 @@ impl FireVibe {
                 if !self.batt_started {
                     self.batt_started = true;
                     // 每 5 分钟读一次 —— 电量变化慢，没必要频繁连蓝牙
-                    firevibe_core::battery::spawn_tracker("Amazon", 300);
+                    firevibe_core::battery::spawn_tracker(300);
                 }
                 // 按配置重下 HID 层映射：设了就下（幂等，顺带盖掉上次残留），没设就清
                 if let Some(m) = self.rt.sync_hid_remap() {
@@ -591,6 +623,13 @@ impl FireVibe {
             std::thread::spawn(move || {
                 let _ = tx.send(rt.ensure_voice().map_err(|e| format!("{e:#}")));
             });
+        }
+        // 配对弹窗的设备扫描结果
+        if let Some(rx) = &self.pair_rx {
+            if let Ok(devs) = rx.try_recv() {
+                self.pair_devices = Some(devs);
+                self.pair_rx = None;
+            }
         }
         // 虚拟声卡状态：cpal 枚举 CoreAudio 是同步阻塞且会跑 run loop 的，
         // 丢后台线程，结果走 channel 回来
@@ -641,7 +680,12 @@ impl FireVibe {
                         self.toast(result);
                     }
                 }
-                Event::Connected { product, .. } => self.product = product,
+                Event::Connected { product, .. } => {
+                    // 电量按连上的这台设备的名字读 —— 换了遥控器要跟着换目标，
+                    // 否则一直读不到、界面显示上一台的陈旧电量
+                    firevibe_core::battery::set_target(&product);
+                    self.product = product;
+                }
                 Event::Disconnected(e) => self.err = Some(e),
                 Event::Log(s) => {
                     if let Some(t) = s.strip_prefix("听写（").and_then(|r| r.split_once("）：")) {
@@ -895,6 +939,7 @@ impl FireVibe {
                                     this.rt.stop();
                                 } else if let Err(e) = this.rt.start() {
                                     this.err = Some(format!("{e:#}"));
+                                    this.err_sticky = true; // 用户主动连的，留住别自动消失
                                 }
                                 cx.notify();
                             }),
@@ -1174,6 +1219,175 @@ impl FireVibe {
     }
 
     /// 连接/权限出问题时的警示条。权限类问题不会自己好，所以常驻而不是 toast。
+    /// 打开「配对新遥控器」弹窗：后台线程扫 HID 设备（list_hid 会跑 run loop，
+    /// 不能在主线程/绘制期调），扫完通过 channel 回来。
+    fn open_pairing(&mut self, cx: &mut Context<Self>) {
+        self.pairing = true;
+        self.pair_devices = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pair_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(firevibe_core::device::list_hid());
+        });
+        cx.notify();
+    }
+
+    /// 选定一个设备作为遥控器：写进配置的 device_vid/pid，重连。
+    fn pick_device(&mut self, vid: u16, pid: u16, cx: &mut Context<Self>) {
+        {
+            let mut c = self.rt.cfg.write();
+            c.settings.device_vid = Some(format!("0x{vid:04x}"));
+            c.settings.device_pid = Some(format!("0x{pid:04x}"));
+            let _ = c.save();
+        }
+        firevibe_core::hidremap::set_ids(vid, pid);
+        // 换了设备，旧电量作废 —— 不清的话界面会一直显示上一个遥控器的电量
+        {
+            let mut c = self.rt.cfg.write();
+            c.settings.last_battery = None;
+            let _ = c.save();
+        }
+        self.rt.status.battery.store(0, Ordering::Relaxed);
+        firevibe_core::battery::forget();
+        self.pairing = false;
+        self.pair_devices = None;
+        self.pair_rx = None;
+        self.err = None;
+        self.err_sticky = false;
+        // 停掉旧连接再按新 ID 连
+        self.rt.stop();
+        match self.rt.start() {
+            Ok(_) => self.toast(self.l().pair_ok()),
+            Err(e) => {
+                let m = format!("{e:#}");
+                if !m.starts_with("HID_NOT_FOUND") {
+                    self.err = Some(m);
+                }
+                self.toast(self.l().pair_saved());
+            }
+        }
+        cx.notify();
+    }
+
+    /// 「配对新遥控器」弹窗
+    fn pair_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let l = self.l();
+        let (cur_vid, cur_pid) = self.rt.cfg.read().device_ids();
+
+        let mut body = div().flex().flex_col().gap(px(6.));
+        match &self.pair_devices {
+            None => {
+                body = body.child(
+                    div()
+                        .py(px(20.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(8.))
+                        .text_color(c(INK3))
+                        .text_size(px(12.5))
+                        .child(icon("loader-circle", 15.))
+                        .child(SharedString::from(l.pair_scanning())),
+                );
+            }
+            Some(devs) if devs.is_empty() => {
+                body = body.child(
+                    div().py(px(18.)).text_center().text_size(px(12.5)).text_color(c(INK2))
+                        .child(SharedString::from(l.pair_none())),
+                );
+            }
+            Some(devs) => {
+                for d in devs {
+                    let (vid, pid) = (d.vid, d.pid);
+                    let is_cur = vid == cur_vid && pid == cur_pid;
+                    // Fire TV 系 VID 0x0171 或名字带 remote 的高亮为「像遥控器」
+                    let likely = vid == 0x0171 || d.label().to_lowercase().contains("remote");
+                    let label = d.label();
+                    let vendor = if d.vendor.is_empty() { String::new() } else { d.vendor.clone() };
+                    let ids = d.ids();
+                    body = body.child(
+                        div()
+                            .id(SharedString::from(format!("pd-{vid:04x}-{pid:04x}")))
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .px(px(12.))
+                            .py(px(10.))
+                            .rounded(px(9.))
+                            .border_1()
+                            .border_color(if is_cur { c(ACCENT) } else { c(LINE) })
+                            .bg(if is_cur { c(ACCENT_SOFT) } else { c(SURFACE) })
+                            .hover(|s| s.bg(c(LINE_SOFT)))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| this.pick_device(vid, pid, cx)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(1.))
+                                    .child(
+                                        div().flex().items_center().gap(px(6.))
+                                            .child(div().text_size(px(13.)).font_weight(w(560.)).text_color(c(INK)).child(SharedString::from(label)))
+                                            .when(likely, |d| d.child(
+                                                div().text_size(px(10.5)).text_color(c(ACCENT_INK)).child(SharedString::from(l.pair_likely()))
+                                            )),
+                                    )
+                                    .child(div().text_size(px(11.)).text_color(c(INK3)).child(SharedString::from(
+                                        if vendor.is_empty() { ids.clone() } else { format!("{ids}  ·  {vendor}") }
+                                    ))),
+                            )
+                            .when(is_cur, |d| d.child(
+                                div().flex_none().text_size(px(11.)).text_color(c(ACCENT_INK)).child(SharedString::from(l.pair_current()))
+                            )),
+                    );
+                }
+            }
+        }
+
+        crate::cards::overlay().child(
+            div()
+                .id("pair")
+                .w(px(460.))
+                .max_h(px(560.))
+                .bg(c(SURFACE))
+                .border_1()
+                .border_color(c(LINE))
+                .rounded(px(14.))
+                .shadow(sh3())
+                .px(px(20.))
+                .py(px(18.))
+                .flex()
+                .flex_col()
+                .gap(px(12.))
+                .child(div().text_size(px(15.5)).font_weight(w(640.)).child(SharedString::from(l.pair_title())))
+                .child(div().text_size(px(12.)).text_color(c(INK2)).line_height(relative(1.55)).child(SharedString::from(l.pair_hint())))
+                .child(
+                    div()
+                        .id("pair-list")
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_y_scroll()
+                        .child(body),
+                )
+                .child(
+                    div().flex().justify_between().items_center()
+                        .child(
+                            mini2("pair-rescan", l.pair_rescan()).on_click(cx.listener(|this, _, _, cx| this.open_pairing(cx))),
+                        )
+                        .child(
+                            mini2("pair-close", l.cancel()).on_click(cx.listener(|this, _, _, cx| {
+                                this.pairing = false;
+                                this.pair_devices = None;
+                                this.pair_rx = None;
+                                cx.notify();
+                            })),
+                        ),
+                ),
+        )
+    }
+
     fn err_bar(&self, msg: String, cx: &mut Context<Self>) -> impl IntoElement {
         // 按 core 给的 ASCII 前缀分类。别再用中文子串判断 ——
         // 之前错误消息里永远带「输入监控」，任何打不开设备都被误报成权限问题。
@@ -1218,6 +1432,8 @@ impl FireVibe {
                             .mt(px(1.))
                             .child(SharedString::from(if perm {
                                 l.hid_perm_hint().to_string()
+                            } else if not_found {
+                                l.hid_not_found_hint().to_string()
                             } else {
                                 msg.clone()
                             })),
@@ -1235,11 +1451,20 @@ impl FireVibe {
                             |this, _, _, cx| {
                                 this.err = None;
                                 match this.rt.start() {
-                                    Ok(_) => this.toast(this.l().toast_connected()),
-                                    Err(e) => this.err = Some(format!("{e:#}")),
+                                    Ok(_) => {
+                                        this.err_sticky = false;
+                                        this.toast(this.l().toast_connected());
+                                    }
+                                    Err(e) => {
+                                        this.err = Some(format!("{e:#}"));
+                                        this.err_sticky = true;
+                                    }
                                 }
                                 cx.notify();
                             },
+                        )))
+                        .child(mini2("hid-repair", l.re_pair()).h(px(32.)).on_click(cx.listener(
+                            |this, _, _, cx| this.open_pairing(cx),
                         )))
                     })
                     .when(perm, |d| {
@@ -1275,6 +1500,7 @@ impl FireVibe {
                     .child(icon_btn_px("err-x", "close", 32., 15., 8.).on_click(cx.listener(
                         |this, _, _, cx| {
                             this.err = None;
+                            this.err_sticky = false;
                             cx.notify();
                         },
                     ))),
@@ -2380,6 +2606,9 @@ impl Render for FireVibe {
         }
         if self.install_confirm {
             root = root.child(self.install_panel(cx));
+        }
+        if self.pairing {
+            root = root.child(self.pair_panel(cx));
         }
         if self.voice_test {
             root = root.child(self.voice_test_panel(cx));
