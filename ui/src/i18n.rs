@@ -463,11 +463,6 @@ impl L {
     pub fn toast_name_empty(&self) -> &'static str { t!(self.0, "名字不能为空", "Name can't be empty") }
 
     // 编辑弹窗 · 硬件修饰键 / 触发方式 / HTTP / 听写
-    pub fn hw_modifier_note(&self) -> &'static str {
-        t!(self.0,
-           "这颗键会在硬件层直接变成这个修饰键 —— 系统收到的和你按真键盘完全一样，所以那些只认硬件按键的语音工具也能收到。应用退出时会自动还原。",
-           "This key becomes the modifier at the hardware level — the system sees it exactly like a real keyboard, so tools that only trust hardware keys will get it too. It's restored automatically on quit.")
-    }
     pub fn trigger_mode(&self) -> &'static str { t!(self.0, "触发方式", "Trigger") }
     pub fn single_tap(&self) -> &'static str { t!(self.0, "单击一下", "Single tap") }
     pub fn double_tap(&self) -> &'static str { t!(self.0, "双击", "Double tap") }

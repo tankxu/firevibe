@@ -2748,6 +2748,23 @@ impl Render for FireVibe {
 }
 
 fn main() {
+    // 被信号杀掉时也要清掉 HID 设备层映射。
+    //
+    // `cx.on_app_quit` 只在 AppKit 走正常退出流程时跑；`kill`（SIGTERM）、
+    // 终端里 Ctrl-C、注销时的 SIGHUP 都绕过它，映射就留在系统里 —— 遥控器那颗
+    // 麦克风键会一直是右⌥：app 明明没开，按一下第三方语音工具照样被唤起，
+    // 而没人往虚拟声卡里灌音频、也没人切默认输入，于是「能触发、但没有声音」。
+    // SIGKILL 拦不住，但那三个能拦。
+    #[cfg(unix)]
+    unsafe {
+        extern "C" fn on_term(sig: i32) {
+            firevibe_core::hidremap::clear();
+            std::process::exit(128 + sig);
+        }
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::signal(sig, on_term as libc::sighandler_t);
+        }
+    }
     let app = Application::new().with_assets(assets::Assets);
     // 从 Finder 再次打开应用时重新唤出窗口，并恢复普通应用的 Dock 图标。
     app.on_reopen(|cx| {

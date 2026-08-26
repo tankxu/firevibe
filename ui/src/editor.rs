@@ -179,23 +179,8 @@ impl FireVibe {
             ActionType::VoiceHotkey => {
                 // 纯修饰键会走 HID 设备层映射（见 core/src/hidremap.rs），
                 // 不是合成事件 —— 这里说清楚，因为它的行为确实不一样。
-                let hw = d.mods.is_empty()
-                    && firevibe_core::hidremap::usage_of(&d.key).is_some();
-                if hw {
-                    body = body.child(
-                        div()
-                            .px(px(12.))
-                            .py(px(9.))
-                            .rounded(px(9.))
-                            .bg(c(CODE_BG))
-                            .border_1()
-                            .border_color(c(LINE))
-                            .text_size(px(11.5))
-                            .text_color(c(INK2))
-                            .line_height(gpui::relative(1.5))
-                            .child(SharedString::from(l.hw_modifier_note())),
-                    );
-                }
+                // （原来这儿有一段解释「这颗键会在硬件层变成修饰键」的说明 ——
+                //   属于讲原理，不是当下要做的决定，挪去 README 了。）
                 let dbl = d.dbl;
                 body = body.child(
 div().child(field_lab(l.hotkey())).child(self.hotkey_field(d, cx))).when(!d.long, |b| b.child(

@@ -4,6 +4,7 @@ edition = "2021"
 version = "0.1.2-beta.1"
 
 [dependencies]
+libc = "0.2.189"
 firevibe-core = { path = "../core" }
 anyhow = "1"
 gpui = "0.2"
