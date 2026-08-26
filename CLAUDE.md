@@ -309,10 +309,10 @@ AppKit 透明标题栏的真实拖拽区，不是 window_control_area 起作用�
 
 ## 遥控器有两种开麦模型（2026-08-26 实测）
 
-支持的不是「一种遥控器」。亚马逊自家就有 11 个 PID
-（`0x413 414 415 418 41e 421 423 424 425 42f 431`，来自 Fire TV 固件
-`BluetoothKeyMapLib` 的 `kml_supported_amazon_ble_remote_pids`），HID 报告描述符
-**完全相同**，但开麦方式分两派：
+支持的不是「一种遥控器」。Fire TV 固件里能查到 **16 个** `0x0171` PID
+（两份名单的并集：`ConnectivityControllerService` 的 `res/raw/remote_config.json`
+型号档案 13 个 + `BluetoothKeyMapLib` 的 `kml_supported_amazon_ble_remote_pids`
+按键映射白名单 11 个，互相不是子集）。HID 报告描述符**完全相同**，但开麦方式分两派：
 
 - **热麦克风**（已知：`0x0421`）：主机写 `SetReport(Output,0xF2,[01,01,…])`，
   之后一直吐流，**跟物理按键无关**；必须发 `[F2,00]` 才停。

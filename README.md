@@ -23,10 +23,13 @@
 | **PID `0x0425`**（同样自称 Fire TV Remote） | ✅ 已实测。按键与 0x0421 完全一致；麦克风是「按住才出声」型（见下） |
 | 其它 Fire TV 遥控器 | ⚠️ 未实测，但大概率能用 —— 在应用里「配对新遥控器」，或跑 `firectl --probe-all` 走一遍引导 |
 
-亚马逊自家的 BLE 遥控器不止一款。Fire TV 固件（`BluetoothKeyMapLib`）里有一份
-官方 PID 名单，VID 统一 `0x0171`：
+亚马逊自家的 BLE 遥控器不止一款。Fire TV 固件里能查到 **16 个** PID，VID 统一
+`0x0171`（其中 `0x419` 是手柄）：
 
-`0x413 0x414 0x415 0x418 0x41e 0x421 0x423 0x424 0x425 0x42f 0x431`
+`0x411 0x412 0x413 0x414 0x415 0x418 0x419 0x41c 0x41e 0x420 0x421 0x423 0x424 0x425 0x42f 0x431`
+
+（来自两份名单：`ConnectivityControllerService` 的型号档案 `remote_config.json`
+和 `BluetoothKeyMapLib` 的按键映射白名单 —— 两份互相不是子集，「支持」是分层的。）
 
 ⚠️ **PID 不代表机器。** 名单里每个 PID 各带一张按键表，`0x0421` 那张正好 21 项、
 与官方 3rd Gen 的 21 颗实体键一一对应；而 `0x0425` 那张有 45 项（多出数字键盘、
