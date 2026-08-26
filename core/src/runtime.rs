@@ -1078,7 +1078,7 @@ fn dispatch(
     }
     // usage -> 图上位置 -> 当前 profile 里该触发方式配的动作
     let found = cfg.read().action_for(k, long);
-    let Some((_slot, act)) = found else {
+    let Some((slot, act)) = found else {
         // 该位置没配动作（或 usage 还没绑到任何位置）-> 自动直通
         return match passthrough(k) {
             Some(name) if down => match inj.key_stroke(name, &[]) {
@@ -1090,6 +1090,24 @@ fn dispatch(
             None => String::new(),
         };
     };
+
+    // 统一记一次使用统计：只在按下时记，每个动作一次，不管后面走哪条分支。
+    // VoiceToggle/Dictate 的「再点一下停止」也是一次 down，会重复记 —— 可接受
+    //（统计的是「触发次数」，开一次+关一次算两次触发，语义上也说得过去）。
+    if down && act.kind != ActionType::None {
+        let is_voice = matches!(
+            act.kind,
+            ActionType::VoicePtt
+                | ActionType::VoiceToggle
+                | ActionType::VoiceDictate
+                | ActionType::VoiceHotkey
+        );
+        let slot_id = slot.id();
+        let action_dbg = format!("{:?}", act.kind);
+        let mut c = cfg.write();
+        c.stats.record(slot_id, &action_dbg, is_voice, 0.0);
+        let _ = c.save();
+    }
 
     // 按住说话要处理按下和松开两个方向
     if act.kind == ActionType::VoicePtt {
@@ -1533,6 +1551,10 @@ fn spawn_shell(cmd: &str) {
 /// 发一个 HTTP 请求。用 `curl` 直接传**参数向量**（不过 shell），所以 URL、
 /// 请求体里的引号/空格/换行都不会被拆断（用户拿 shell+curl 就栽在换行上）。
 /// `--retry` / `--max-time` 是 curl 原生的。结果（HTTP 状态码或错误）回报到 Event::Log。
+///
+/// macOS 自带 curl 的异步解析器在部分仅发布 IPv4 的 mDNS 设备上会卡在双栈查询：
+/// 系统解析器和 ping 都能解析 `.local`，curl 默认模式却一直等到超时。局域网里的这类
+/// 地址强制走 IPv4；普通域名和显式 IPv6 地址仍保留 curl 的默认行为。
 fn spawn_http(act: &Action, tx: Sender<Event>) {
     let url = act.arg.trim().to_string();
     if url.is_empty() {
@@ -1560,6 +1582,9 @@ fn spawn_http(act: &Action, tx: Sender<Event>) {
             .arg(format!("{:.2}", timeout_ms as f64 / 1000.0))
             .arg("--retry")
             .arg(retries.to_string());
+        if is_mdns_url(&url) {
+            cmd.arg("--ipv4");
+        }
         if method == "POST" && !body.is_empty() {
             cmd.arg("-d").arg(&body);
         }
@@ -1578,6 +1603,56 @@ fn spawn_http(act: &Action, tx: Sender<Event>) {
             }
         }
     });
+}
+
+/// URL 的主机名是不是 Bonjour/mDNS 的 `.local` 名称。
+///
+/// 只检查 authority 里的 hostname，避免把路径、查询参数或 userinfo 中碰巧出现的
+/// `.local` 当成主机名；末尾带 DNS 根点的 `device.local.` 也接受。
+fn is_mdns_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.trim().split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = rest
+        .split(&['/', '?', '#'][..])
+        .next()
+        .unwrap_or_default();
+    let host_port = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    // 方括号表示显式 IPv6 literal，不是 mDNS hostname。
+    if host_port.starts_with('[') {
+        return false;
+    }
+    let host = host_port
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(host_port)
+        .trim_end_matches('.');
+    !host.is_empty() && host.to_ascii_lowercase().ends_with(".local")
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::is_mdns_url;
+
+    #[test]
+    fn detects_mdns_http_hosts() {
+        assert!(is_mdns_url("http://ble-remote.local/api/status"));
+        assert!(is_mdns_url("HTTPS://BLE-REMOTE.LOCAL:8443/path"));
+        assert!(is_mdns_url("http://user:pass@device.local./path"));
+    }
+
+    #[test]
+    fn leaves_non_mdns_and_ipv6_urls_alone() {
+        assert!(!is_mdns_url("http://example.com/local"));
+        assert!(!is_mdns_url("http://device.local.example/path"));
+        assert!(!is_mdns_url("http://local/path"));
+        assert!(!is_mdns_url("http://[fe80::1]/path"));
+        assert!(!is_mdns_url("ftp://device.local/file"));
+        assert!(!is_mdns_url("not a url"));
+    }
 }
 
 /// 供 UI 用：预设的 AppleScript 例子

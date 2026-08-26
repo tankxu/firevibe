@@ -23,6 +23,37 @@ impl L {
     // 菜单栏（tray）
     pub fn tray_show(&self) -> &'static str { t!(self.0, "显示窗口", "Show Window") }
     pub fn tray_quit(&self) -> &'static str { t!(self.0, "退出", "Quit") }
+    // 使用统计
+    pub fn stats_title(&self) -> &'static str { t!(self.0, "使用统计", "Usage") }
+    pub fn stats_empty(&self) -> &'static str { t!(self.0, "还没有使用记录 —— 按几下遥控器就有了", "No usage yet — press a few keys to get started") }
+    pub fn stats_overview(&self) -> &'static str { t!(self.0, "总览", "OVERVIEW") }
+    pub fn stats_total(&self) -> String { t!(self.0, "总触发", "Total presses").into() }
+    pub fn stats_today(&self) -> String { t!(self.0, "今天", "Today").into() }
+    pub fn stats_active_days(&self) -> String { t!(self.0, "活跃天数", "Active days").into() }
+    pub fn stats_since(&self) -> String { t!(self.0, "起始", "Since").into() }
+    pub fn stats_by_key(&self) -> &'static str { t!(self.0, "按键排行", "BY KEY") }
+    pub fn stats_by_action(&self) -> &'static str { t!(self.0, "动作类型", "BY ACTION") }
+    pub fn stats_voice(&self) -> &'static str { t!(self.0, "语音", "VOICE") }
+    pub fn stats_voice_count(&self) -> String { t!(self.0, "语音次数", "Voice uses").into() }
+    pub fn stats_voice_dur(&self) -> String { t!(self.0, "累计时长", "Total time").into() }
+    pub fn stats_battery(&self) -> String { t!(self.0, "当前电量", "Battery").into() }
+    /// ActionType 的 Debug 名 -> 界面显示
+    pub fn action_type_name(&self, dbg: &str) -> String {
+        match dbg {
+            "Key" => t!(self.0, "映射按键", "Key"),
+            "Text" => t!(self.0, "输入文字", "Type text"),
+            "OpenApp" => t!(self.0, "打开应用", "Open app"),
+            "AppleScript" => "AppleScript",
+            "Shell" => t!(self.0, "执行命令", "Shell"),
+            "Http" => t!(self.0, "HTTP 请求", "HTTP request"),
+            "VoicePtt" => t!(self.0, "按住说话", "Push to talk"),
+            "VoiceToggle" => t!(self.0, "开关说话", "Toggle talk"),
+            "VoiceDictate" => t!(self.0, "语音转文字", "Dictation"),
+            "VoiceHotkey" => t!(self.0, "第三方语音输入", "Third-party voice"),
+            "Record" => t!(self.0, "录音", "Record"),
+            other => other,
+        }.to_string()
+    }
     pub fn menu_quit(&self) -> &'static str { t!(self.0, "退出 FireVibe", "Quit FireVibe") }
     // 悬浮电平条 HUD
     pub fn hud_dictating(&self) -> &'static str { t!(self.0, "松手出字", "Release to type") }
@@ -181,7 +212,34 @@ impl L {
 
     // 设置页
     pub fn general(&self) -> &'static str { t!(self.0, "通用", "GENERAL") }
+    pub fn configuration(&self) -> &'static str { t!(self.0, "配置文件", "CONFIGURATION") }
     pub fn about(&self) -> &'static str { t!(self.0, "关于", "ABOUT") }
+    pub fn config_location(&self) -> &'static str { t!(self.0, "配置文件位置", "Configuration file") }
+    pub fn config_manage(&self) -> &'static str { t!(self.0, "导入与导出", "Import and export") }
+    pub fn config_manage_hint(&self) -> &'static str {
+        t!(self.0, "导入前会把当前配置备份为 config.backup.json", "The current configuration is backed up as config.backup.json before importing")
+    }
+    pub fn reload_config(&self) -> &'static str { t!(self.0, "重新加载", "Reload") }
+    pub fn reveal_finder(&self) -> &'static str { t!(self.0, "在 Finder 中显示", "Show in Finder") }
+    pub fn import_config(&self) -> &'static str { t!(self.0, "导入", "Import") }
+    pub fn export_config(&self) -> &'static str { t!(self.0, "导出", "Export") }
+    pub fn import_config_title(&self) -> &'static str { t!(self.0, "导入 FireVibe 配置", "Import FireVibe Configuration") }
+    pub fn export_config_title(&self) -> &'static str { t!(self.0, "导出 FireVibe 配置", "Export FireVibe Configuration") }
+    pub fn toast_config_reloaded(&self) -> &'static str { t!(self.0, "配置已重新加载并生效", "Configuration reloaded and applied") }
+    pub fn toast_config_reload_failed(&self, e: &str) -> String {
+        t!(self.0, format!("重新加载失败：{e}"), format!("Reload failed: {e}"))
+    }
+    pub fn toast_config_imported(&self) -> &'static str { t!(self.0, "配置已导入并生效", "Configuration imported and applied") }
+    pub fn toast_config_exported(&self) -> &'static str { t!(self.0, "配置已导出", "Configuration exported") }
+    pub fn toast_config_import_failed(&self, e: &str) -> String {
+        t!(self.0, format!("导入失败：{e}"), format!("Import failed: {e}"))
+    }
+    pub fn toast_config_export_failed(&self, e: &str) -> String {
+        t!(self.0, format!("导出失败：{e}"), format!("Export failed: {e}"))
+    }
+    pub fn toast_config_reveal_failed(&self, e: &str) -> String {
+        t!(self.0, format!("无法打开配置位置：{e}"), format!("Couldn't reveal the configuration file: {e}"))
+    }
     pub fn launch_at_login(&self) -> &'static str { t!(self.0, "开机启动", "Launch at login") }
     pub fn launch_hint(&self) -> &'static str {
         t!(self.0, "登录时自动在后台启动", "Start in the background at login")

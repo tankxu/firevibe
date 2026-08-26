@@ -8,6 +8,7 @@ mod hud;
 mod i18n;
 mod remote;
 mod settings;
+mod stats;
 mod theme;
 mod widget;
 
@@ -50,6 +51,7 @@ use widget::*;
 pub enum Screen {
     Main,
     Settings,
+    Stats,
 }
 
 /// 编辑弹窗的临时状态。保存时才写回配置。
@@ -117,6 +119,10 @@ pub struct FireVibe {
     audio_at: Instant,
     /// 系统输入下拉是否展开
     pub input_open: bool,
+    /// 设置页里的语音识别语言下拉是否展开；语言列表来自 Speech.framework，
+    /// 与 FireVibe 自己的中/英文界面语言完全独立。
+    pub stt_locale_open: bool,
+    pub stt_locales: Vec<firevibe_core::stt::SpeechLocale>,
     /// 装虚拟声卡前的说明弹窗。系统那个授权框只写「osascript wants to
     /// make changes」，署名还是个陌生进程 —— 直接弹给人输密码是不合格的，
     /// 先把要做什么讲清楚。
@@ -149,6 +155,10 @@ pub struct FireVibe {
     hud: Option<gpui::WindowHandle<hud::Hud>>,
     pub update: UpdateStatus,
     update_rx: Option<Receiver<UpdateStatus>>,
+    /// 原生文件面板异步返回的配置导入/导出路径。同步 runModal 会启动嵌套
+    /// AppKit 事件循环并让 GPUI 退出，所以结果统一在 pump 里消费。
+    pub config_import_rx: Option<Receiver<Option<std::path::PathBuf>>>,
+    pub config_export_rx: Option<Receiver<Option<std::path::PathBuf>>>,
     /// 一次性提示
     pub toast: Option<(String, Instant)>,
     pub product: String,
@@ -165,6 +175,7 @@ pub struct FireVibe {
 impl FireVibe {
     fn new(cx: &mut Context<Self>) -> Self {
         let cfg = Config::load();
+        let stt_locales = firevibe_core::stt::supported_locales();
         let (rt, rx) = Runtime::new(cfg);
         let rt = Arc::new(rt);
         // 自测钩子：FIREVIBE_REC_TEST=<延迟秒>,<时长秒> —— 到点自己录一段再停
@@ -320,6 +331,8 @@ impl FireVibe {
             audio_rx: None,
             audio_at: Instant::now() - Duration::from_secs(10),
             input_open: false,
+            stt_locale_open: false,
+            stt_locales,
             batt_started: false,
             renaming: None,
             install_confirm: false,
@@ -338,6 +351,8 @@ impl FireVibe {
             hud: None,
             update: UpdateStatus::Idle,
             update_rx: None,
+            config_import_rx: None,
+            config_export_rx: None,
             toast: None,
             product: String::new(),
             err: None,
@@ -353,6 +368,7 @@ impl FireVibe {
         let mut it = b.split(':');
         match it.next() {
             Some("settings") => self.screen = Screen::Settings,
+            Some("stats") => self.screen = Screen::Stats,
             Some("onboarding") => self.onboarding = true,
             Some("dialog") => {
                 let slot = it.next().unwrap_or("app1");
@@ -453,6 +469,7 @@ impl FireVibe {
         self.profile_open = false;
         self.menu_open = None;
         self.input_open = false;
+        self.stt_locale_open = false;
         self.dismiss_at = Instant::now();
     }
 
@@ -494,6 +511,7 @@ impl FireVibe {
     fn pump(&mut self) {
         self.poll_hotkey_grab();
         self.poll_battery();
+        self.poll_config_file_io();
         // 启动后自动查一次更新（GitHub Releases），不用等用户去设置里点
         if !self.boot_update_checked {
             self.boot_update_checked = true;
@@ -811,7 +829,7 @@ impl FireVibe {
         }
     }
 
-    // ── 状态卡：配对状态 + 虚拟声卡，两张等高 ──
+    // ── 状态卡：按内容宽度排列，空间不足时自然换行 ──
     fn status_cards(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let l = self.l();
         let on = self.connected();
@@ -930,21 +948,36 @@ impl FireVibe {
             );
         }
 
-        // 不写 items_start，用 flex 默认的 stretch —— 配对状态卡只有一行、
-        // 虚拟声卡卡两行，要拉到一样高
+        // 只保留一棵稳定的元素树。窗口缩放时由 flex-wrap 自然换行，避免跨断点
+        // 替换整棵状态栏元素；每张卡片都 flex-none，宽度只由自身内容决定。
+        let primary = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            // 三张卡在默认英文窗口里刚好临界；8px 留出像素取整余量，输入卡便能
+            // 留在首行并由 ml_auto 贴住最右侧。
+            .gap(px(8.))
+            .w_full()
+            .child(pair)
+            .child(self.loopback_card(cx))
+            // 同行时由这个零基宽占位项吸收剩余空间，把输入卡推到最右；空间不足
+            // 时只有输入卡换到下一行，它成为该行第一个元素，因此自然左对齐。
+            .child(div().flex_1().min_w(px(0.)))
+            .child(self.input_switch(cx));
+
+        // ⚠️ 先把值取出来再建元素。写成
+        // `.when(self.rt.recording.lock().is_some(), |d| d.child(self.recording_card()))`
+        // 会死锁：判据里那个临时 guard 活到整条语句结束，闭包里又在同一线程
+        // 上锁一次，而 parking_lot::Mutex 不可重入 —— UI 线程永久持锁，
+        // 连 HID 线程都被拖死。录音状态另起一行，也不会继续挤压主状态行。
         div()
             .flex()
+            .flex_col()
             .gap(px(10.))
-            .child(pair)
-            // ⚠️ 先把值取出来再建元素。写成
-            // `.when(self.rt.recording.lock().is_some(), |d| d.child(self.recording_card()))`
-            // 会死锁：判据里那个临时 guard 活到整条语句结束，闭包里又在同一线程
-            // 上锁一次，而 parking_lot::Mutex 不可重入 —— UI 线程永久持锁，
-            // 连 HID 线程都被拖死。
-            .when_some(rec_state, |d, (secs, lvl)| d.child(Self::recording_card(secs, lvl, l)))
-            .child(self.loopback_card(cx))
-            .child(spacer())
-            .child(self.input_switch(cx))
+            .child(primary)
+            .when_some(rec_state, |d, (secs, lvl)| {
+                d.child(Self::recording_card(secs, lvl, l))
+            })
     }
 
     /// 录音中的状态卡。**只在本应用窗口里显示** —— 不弹任何系统界面。
@@ -1015,9 +1048,9 @@ impl FireVibe {
         let head = div()
             .id("input-switch")
             .flex()
+            .w_full()
             .items_center()
             .gap(px(7.))
-            .flex_none()
             .rounded(px(R))
             .px(px(12.))
             .py(px(9.))
@@ -1036,15 +1069,20 @@ impl FireVibe {
             .child(
                 div()
                     .text_color(if on_loopback { c(ACCENT) } else { c(INK2) })
+                    .flex_none()
                     .child(icon("mic", 15.)),
             )
             .child(
                 div()
+                    .flex_1()
+                    .min_w(px(0.))
                     .flex()
                     .flex_col()
                     .line_height(relative(1.25))
                     .child(
                         div()
+                            .overflow_hidden()
+                            .text_ellipsis()
                             .text_size(px(12.5))
                             .font_weight(w(580.))
                             .text_color(if on_loopback { c(ACCENT_INK) } else { c(INK) })
@@ -1057,9 +1095,21 @@ impl FireVibe {
                             .child(SharedString::from(l.system_input())),
                     ),
             )
-            .child(div().text_color(c(INK3)).child(icon("chevron-down", 14.)));
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(c(INK3))
+                    .child(icon("chevron-down", 14.)),
+            );
 
-        let mut wrap = div().relative().flex_none().child(head);
+        // 内容宽度，不参与剩余空间分配；外层右槽负责把它贴到最右。
+        // 设备名过长时最多占 220px，完整名称仍可在下拉菜单里查看。
+        let mut wrap = div()
+            .relative()
+            .flex_none()
+            .min_w(px(0.))
+            .max_w(px(220.))
+            .child(head);
         if self.input_open {
             let cur_id = cur.as_ref().map(|d| d.id);
             let mut menu = div()
@@ -1241,6 +1291,7 @@ impl FireVibe {
 
         let mut card = div()
             .flex()
+            .flex_none()
             .items_center()
             .gap(px(7.))
             .rounded(px(R))
@@ -1256,6 +1307,7 @@ impl FireVibe {
 
         card.child(
             div()
+                .flex_none()
                 .text_color(if ready || unknown { c(INK2) } else { c(WARN) })
                 .child(icon(
                     if unknown {
@@ -1270,11 +1322,15 @@ impl FireVibe {
         )
         .child(
             div()
+                .flex_1()
+                .min_w(px(0.))
                 .flex()
                 .flex_col()
                 .line_height(relative(1.25))
                 .child(
                     div()
+                        .overflow_hidden()
+                        .text_ellipsis()
                         .text_size(px(12.5))
                         .font_weight(w(580.))
                         .text_color(c(INK))
@@ -1282,6 +1338,8 @@ impl FireVibe {
                 )
                 .child(
                     div()
+                        .overflow_hidden()
+                        .text_ellipsis()
                         .text_size(px(11.))
                         .text_color(if ready || unknown { c(INK3) } else { c(WARN) })
                         .child(SharedString::from(if unknown {
@@ -1294,7 +1352,7 @@ impl FireVibe {
                 ),
         )
         .when(ready, |d| {
-            d.child(div().ml(px(6.)).child(
+            d.child(div().ml(px(6.)).flex_none().child(
                 ghost_btn("voice-test", l.test()).on_click(cx.listener(|this, _, _, cx| {
                     this.voice_test = true;
                     this.test_frames0 = this.rt.status.audio_frames.load(Ordering::Relaxed);
@@ -1306,7 +1364,7 @@ impl FireVibe {
             // 自己带着驱动就直接装（弹系统原生管理员授权框，密码不经过我们）；
             // 没带（没编过）才退回让用户装 BlackHole。
             let have = firevibe_core::audiodriver::bundled().is_some();
-            d.child(div().ml(px(6.)).child(
+            d.child(div().ml(px(6.)).flex_none().child(
                 install_btn("install-drv", l.install()).on_click(
                     cx.listener(move |this, _, _, cx| {
                         if !have {
@@ -2159,10 +2217,28 @@ impl FireVibe {
 impl Render for FireVibe {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.consume_boot(window, cx);
-
         // 顶栏与左侧遥控栏都固定不滑，只有右侧那列滚 —— 遥控栏自己也带滚动，
         // 但只在窗口矮到装不下它时才起作用。
         let body: gpui::AnyElement = match self.screen {
+            Screen::Stats => div()
+                .id("stats-scroll")
+                .flex_1()
+                .w_full()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .items_center()
+                .px(px(32.))
+                .pb(px(48.))
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(720.))
+                        .flex_none()
+                        .child(self.stats_page(cx)),
+                )
+                .into_any_element(),
             Screen::Settings => div()
                 .id("set-scroll")
                 .flex_1()
@@ -2228,6 +2304,13 @@ impl Render for FireVibe {
                                                 .text_center()
                                                 .line_height(relative(1.55))
                                                 .child(SharedString::from(self.l().remote_hint())),
+                                        )
+                                        .child(
+                                            mini2_ico("go-stats", "chart-pie", self.l().stats_title())
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.screen = Screen::Stats;
+                                                    cx.notify();
+                                                })),
                                         ),
                                 )
                                 // 右：状态 / 方案 / 操作，这一列才滚
@@ -2336,8 +2419,11 @@ impl Render for FireVibe {
 
 fn main() {
     let app = Application::new().with_assets(assets::Assets);
-    // 点 Dock 图标（关窗隐藏后）重新唤出窗口
-    app.on_reopen(|cx| cx.activate(true));
+    // 从 Finder 再次打开应用时重新唤出窗口，并恢复普通应用的 Dock 图标。
+    app.on_reopen(|cx| {
+        firevibe_core::tray::show_from_tray();
+        cx.activate(true);
+    });
     app.run(|cx: &mut App| {
         gpui_component::init(cx);
         // HID 设备层映射是**进程外的系统状态** —— 我们退出了它还在，
@@ -2382,14 +2468,14 @@ fn main() {
                 KeyBinding::new("ctrl-k", DeleteToEndOfLine, IN),
             ]);
         }
-        // 自检时可以用 FIREVIBE_WIN=1060x1400 把窗口撑高，一次截全长页面
+        // 自检时可以用 FIREVIBE_WIN=1100x1400 把窗口撑高，一次截全长页面
         let (ww, wh) = std::env::var("FIREVIBE_WIN")
             .ok()
             .and_then(|v| {
                 let (a, b) = v.split_once('x')?;
                 Some((a.trim().parse::<f32>().ok()?, b.trim().parse::<f32>().ok()?))
             })
-            .unwrap_or((1060., 820.));
+            .unwrap_or((1100., 820.));
         let bounds = Bounds::centered(None, size(px(ww), px(wh)), cx);
         cx.open_window(
             WindowOptions {
@@ -2407,10 +2493,11 @@ fn main() {
             |window, cx| {
                 // 点红叉 = 隐藏到后台，**不**走 GPUI 默认关闭 —— 默认会 drop 掉最后一个
                 // 窗口，触发主线程死循环（关窗后卡死、要 force quit 的根因）。返回 false
-                // 阻止关闭，改为 hide()；点 Dock 图标可重新唤出，Cmd-Q 才真正退出
+                // 阻止关闭，改为纯菜单栏模式：隐藏窗口和 Dock 图标，只保留 tray。
+                // tray 的“显示窗口”会恢复窗口与 Dock；Cmd-Q 才真正退出
                 //（退出会跑 on_app_quit 清掉 hidremap）。
-                window.on_window_should_close(cx, |_window, cx| {
-                    cx.hide();
+                window.on_window_should_close(cx, |_window, _cx| {
+                    firevibe_core::tray::hide_to_tray();
                     false
                 });
                 let view = cx.new(FireVibe::new);

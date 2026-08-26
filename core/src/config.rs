@@ -6,9 +6,9 @@
 
 use crate::keys::Key;
 use crate::layout::{default_slots, Slot, SlotBinding};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ---------------- 动作 ----------------
 
@@ -504,6 +504,63 @@ impl Default for Settings {
 /// 配置结构版本。加一次就会触发一次迁移。
 /// 1 = 21 个 HID usage 全部实测完成，旧文件里的猜测值必须刷掉
 pub const SCHEMA: u32 = 4;
+/// 使用统计（持久化在配置里）。动作真执行时累加，按天记活跃。
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct Stats {
+    /// 各键位触发次数：slot id -> 次数
+    #[serde(default)]
+    pub by_slot: std::collections::BTreeMap<String, u64>,
+    /// 各动作类型触发次数：ActionType 的 debug 名 -> 次数
+    #[serde(default)]
+    pub by_action: std::collections::BTreeMap<String, u64>,
+    /// 语音输入（PTT/Toggle/Dictate/Hotkey）触发次数
+    #[serde(default)]
+    pub voice_count: u64,
+    /// 语音累计秒数（说话时长，尽力而为）
+    #[serde(default)]
+    pub voice_seconds: f64,
+    /// 总触发次数
+    #[serde(default)]
+    pub total: u64,
+    /// 各天是否活跃：YYYY-MM-DD -> 当天触发次数
+    #[serde(default)]
+    pub by_day: std::collections::BTreeMap<String, u64>,
+    /// 开始统计的日期 YYYY-MM-DD（第一次记录时写入）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub since: String,
+}
+
+/// 今天 YYYY-MM-DD（用 `date` 命令，和别处一致，避免自己算历法/时区）
+fn today() -> String {
+    std::process::Command::new("date")
+        .arg("+%Y-%m-%d")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+impl Stats {
+    /// 记一次动作触发：slot、动作类型是否语音、（可选）语音秒数。
+    pub fn record(&mut self, slot_id: &str, action_dbg: &str, is_voice: bool, voice_secs: f64) {
+        let d = today();
+        if self.since.is_empty() {
+            self.since = d.clone();
+        }
+        self.total += 1;
+        *self.by_slot.entry(slot_id.to_string()).or_default() += 1;
+        *self.by_action.entry(action_dbg.to_string()).or_default() += 1;
+        if !d.is_empty() {
+            *self.by_day.entry(d).or_default() += 1;
+        }
+        if is_voice {
+            self.voice_count += 1;
+            self.voice_seconds += voice_secs.max(0.0);
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Config {
     /// 见 [`SCHEMA`]
@@ -522,6 +579,8 @@ pub struct Config {
     pub active: usize,
     #[serde(default)]
     pub settings: Settings,
+    #[serde(default)]
+    pub stats: Stats,
 }
 fn default_profiles() -> Vec<Profile> {
     vec![blank_profile(), vibe_profile()]
@@ -533,6 +592,7 @@ impl Default for Config {
             voice: VoiceConfig::default(),
             exclusive: false,
             slots: default_slots(),
+            stats: Stats::default(),
             profiles: default_profiles(),
             // 新装默认选 Vibe（预配好的那套），不然开箱什么都不会动
             active: 1,
@@ -599,10 +659,35 @@ impl Config {
     }
 
     pub fn load() -> Self {
-        let mut c: Config = std::fs::read_to_string(config_path())
+        let c: Config = std::fs::read_to_string(config_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        let (c, migrated) = Self::normalize(c);
+        if migrated {
+            let _ = c.save();
+        }
+        c
+    }
+
+    /// 从任意 JSON 文件导入配置。解析失败会明确报错，不会像启动加载那样静默
+    /// 回退到默认配置；旧 schema 会在内存里完成同样的迁移。
+    pub fn load_from(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("读取配置失败：{}", path.display()))?;
+        Self::from_json(&text)
+            .with_context(|| format!("JSON 格式不正确：{}", path.display()))
+    }
+
+    /// 解析配置文本，供导入和测试共用。
+    pub fn from_json(text: &str) -> Result<Self> {
+        let parsed: Config = serde_json::from_str(text)?;
+        Ok(Self::normalize(parsed).0)
+    }
+
+    /// 补默认值并迁移旧 schema。返回值表示是否发生了需要落盘的 schema 迁移。
+    fn normalize(mut c: Config) -> (Config, bool) {
+        let mut migrated = false;
 
         if c.voice.gain <= 0.0 {
             c.voice.gain = 1.0;
@@ -623,6 +708,7 @@ impl Config {
         // 现在 21 个全部实测过了，整表刷新。
 
         if c.schema < SCHEMA {
+            migrated = true;
             if c.schema < 1 {
                 c.slots = default_slots();
             }
@@ -649,18 +735,21 @@ impl Config {
                 }
             }
             c.schema = SCHEMA;
-            let _ = c.save();
         }
         // 兜底：任何停在旧默认值 "BlackHole" 的配置都指向我们自己那块 ——
         // 真 BlackHole 传输类型 Virtual，豆包滤得掉、喂不进（见 preferred_voice_device）。
         if c.voice.device == "BlackHole" {
             c.voice.device = crate::audiodriver::DEVICE_NAME.into();
         }
-        c
+        (c, migrated)
     }
 
     pub fn save(&self) -> Result<()> {
-        let p = config_path();
+        self.save_to(&config_path())
+    }
+
+    /// 导出到指定路径；也由 `save` 用来写实际配置文件。
+    pub fn save_to(&self, p: &Path) -> Result<()> {
 
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d)?;
@@ -727,5 +816,24 @@ impl Config {
 
     pub fn long_press_ms(&self) -> u64 {
         self.settings.long_press_ms.max(120)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, SCHEMA};
+
+    #[test]
+    fn imported_json_is_validated_instead_of_silently_defaulting() {
+        assert!(Config::from_json("{ definitely not json }").is_err());
+    }
+
+    #[test]
+    fn imported_old_config_is_normalized_and_migrated() {
+        let cfg = Config::from_json(r#"{"schema":0,"profiles":[],"active":99}"#).unwrap();
+        assert_eq!(cfg.schema, SCHEMA);
+        assert!(!cfg.profiles.is_empty());
+        assert!(cfg.active < cfg.profiles.len());
+        assert!(cfg.voice.gain > 0.0);
     }
 }

@@ -11,6 +11,15 @@
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
+/// 系统语音识别实际支持的语言。名称预先按中英文界面各生成一份，UI 切换语言时
+/// 不需要重新查询 Speech.framework。
+#[derive(Clone, Debug)]
+pub struct SpeechLocale {
+    pub identifier: String,
+    pub zh_name: String,
+    pub en_name: String,
+}
+
 /// 攒 PCM 的缓冲。16 kHz 单声道 i16，和遥控器解码出来的一致。
 #[derive(Default)]
 pub struct Recorder {
@@ -119,6 +128,49 @@ mod imp {
         st == SFSpeechRecognizerAuthorizationStatus::Authorized
     }
 
+    /// 直接取 Speech.framework 在当前系统上公布的语言列表，而不是在界面里写死
+    /// 中英文两个选项。不同 macOS 版本、地区和已安装听写资源会得到不同集合。
+    pub fn supported_locales() -> Vec<SpeechLocale> {
+        unsafe {
+            let zh = NSLocale::initWithLocaleIdentifier(
+                NSLocale::alloc(),
+                &NSString::from_str("zh-CN"),
+            );
+            let en = NSLocale::initWithLocaleIdentifier(
+                NSLocale::alloc(),
+                &NSString::from_str("en-US"),
+            );
+            let mut locales = SFSpeechRecognizer::supportedLocales()
+                .iter()
+                .map(|locale| {
+                    let identifier = locale.localeIdentifier();
+                    let identifier_text = identifier.to_string();
+                    let zh_name = zh
+                        .localizedStringForLocaleIdentifier(&identifier)
+                        .to_string();
+                    let en_name = en
+                        .localizedStringForLocaleIdentifier(&identifier)
+                        .to_string();
+                    SpeechLocale {
+                        identifier: identifier_text.clone(),
+                        zh_name: if zh_name.trim().is_empty() {
+                            identifier_text.clone()
+                        } else {
+                            zh_name
+                        },
+                        en_name: if en_name.trim().is_empty() {
+                            identifier_text
+                        } else {
+                            en_name
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            locales.sort_by(|a, b| a.en_name.cmp(&b.en_name));
+            locales
+        }
+    }
+
     /// 请求授权（首次会弹系统框）。等最多 60 秒。
     pub fn request_auth() -> Result<bool> {
         if authorized() {
@@ -204,12 +256,26 @@ mod imp {
     pub fn request_auth() -> Result<bool> {
         Ok(false)
     }
+    pub fn supported_locales() -> Vec<SpeechLocale> {
+        vec![
+            SpeechLocale {
+                identifier: "zh-CN".into(),
+                zh_name: "简体中文（中国大陆）".into(),
+                en_name: "Chinese (China mainland)".into(),
+            },
+            SpeechLocale {
+                identifier: "en-US".into(),
+                zh_name: "英语（美国）".into(),
+                en_name: "English (United States)".into(),
+            },
+        ]
+    }
     pub fn transcribe_file(_p: &Path, _l: &str, _d: bool) -> Result<String> {
         Err(anyhow!("这个平台没有自带语音识别"))
     }
 }
 
-pub use imp::{auth_status, authorized, request_auth, transcribe_file};
+pub use imp::{auth_status, authorized, request_auth, supported_locales, transcribe_file};
 
 #[cfg(test)]
 mod tests {

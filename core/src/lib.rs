@@ -4,6 +4,7 @@ pub mod autostart;
 pub mod battery;
 pub mod config;
 pub mod device;
+pub mod file_dialog;
 pub mod frontapp;
 pub mod hidremap;
 pub mod hotkey;

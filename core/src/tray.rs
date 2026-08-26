@@ -20,11 +20,13 @@ define_class!(
     impl TrayTarget {
         #[unsafe(method(fvShow:))]
         fn fv_show(&self, _sender: Option<&AnyObject>) {
-            use objc2_app_kit::NSApplication;
+            use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
             let mtm = self.mtm();
             let app = NSApplication::sharedApplication(mtm);
-            unsafe { app.unhide(None) };
-            app.activateIgnoringOtherApps(true);
+            // 从托盘恢复窗口时重新成为普通应用，Dock 图标也跟着回来。
+            app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+            app.unhide(None);
+            app.activate();
         }
 
         #[unsafe(method(fvQuit:))]
@@ -109,6 +111,38 @@ pub fn install(_icon_png: &[u8], _show_label: &str, _quit_label: &str) {}
 /// NSView，整个内容被当背景 —— 在输入框里拖拽会变成拖窗、没法选文本。改用 header
 /// 上的 `start_window_drag()`（performWindowDragWithEvent）精准拖。留空壳兼容旧调用。
 pub fn make_windows_draggable() {}
+
+/// 主窗口关闭后进入纯菜单栏模式：进程和状态栏图标继续存在，但不占 Dock。
+/// 从托盘选择“显示窗口”时，`fv_show` 会把 activation policy 恢复为 Regular。
+#[cfg(target_os = "macos")]
+pub fn hide_to_tray() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    app.hide(None);
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn hide_to_tray() {}
+
+/// 通过 Finder/Dock 的 reopen 事件恢复时，也确保重新显示 Dock 图标。
+#[cfg(target_os = "macos")]
+pub fn show_from_tray() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    app.unhide(None);
+    app.activate();
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn show_from_tray() {}
 
 /// 从当前鼠标事件开始拖窗 —— 挂在 header 的 on_mouse_down 上。用 AppKit 原生的
 /// performWindowDragWithEvent，只有 header 触发，输入框等交互元素不受影响。
