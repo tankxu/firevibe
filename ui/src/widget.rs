@@ -232,28 +232,43 @@ pub fn chip(id: impl Into<gpui::ElementId>, label: impl Into<SharedString>, on: 
     }
 }
 
-/// 和 `chip` 一样，但**未选中**时用强调色底 + 描边 —— 给「这一堆里最该先看的那个」用。
+/// 带图标的 chip。图标用来给同一排选项分类 —— 比一堆纯文字里挑一个高亮好懂。
 ///
-/// 麦克风键的动作类型有十种，第三方语音输入夹在中间，第一次用的人根本找不到。
-/// 选中之后回到普通选中态，不再特殊。
-pub fn chip_hi(id: impl Into<gpui::ElementId>, label: impl Into<SharedString>, on: bool) -> Stateful<Div> {
-    if on {
-        return chip(id, label, true);
-    }
-    div()
+/// ⚠️ gpui 的 svg 颜色**不从父级级联**，得在包着它的那层显式 `text_color`。
+pub fn chip_icon(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    on: bool,
+    ico: &str,
+    tint: u32,
+) -> Stateful<Div> {
+    let base = div()
         .id(id)
-        .px(px(11.))
+        .flex()
+        .items_center()
+        .gap(px(5.))
+        .px(px(10.))
         .py(px(5.))
         .rounded(px(R_SM))
         .border_1()
         .text_size(px(12.))
         .cursor_pointer()
-        .bg(c(ACCENT_SOFT))
-        .border_color(c(ACCENT))
-        .text_color(c(ACCENT_INK))
-        .font_weight(w(550.))
-        .hover(|s| s.bg(c(SURFACE)))
-        .child(label.into())
+        // 选中时是蓝底白字，图标跟着变白才看得清
+        .child(
+            div()
+                .flex_none()
+                .text_color(c(if on { SURFACE } else { tint }))
+                .child(icon(ico, 13.)),
+        )
+        .child(label.into());
+    if on {
+        base.bg(c(ACCENT)).border_color(c(ACCENT)).text_color(c(SURFACE)).font_weight(w(550.))
+    } else {
+        base.bg(c(SURFACE))
+            .border_color(c(LINE_STRONG))
+            .text_color(c(INK2))
+            .hover(|s| s.border_color(c(INK3)).text_color(c(INK)))
+    }
 }
 
 pub fn chip_sm(

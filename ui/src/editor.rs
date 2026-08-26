@@ -129,14 +129,18 @@ impl FireVibe {
             {
                 continue;
             }
-            // 麦克风键上把「第三方语音输入」标出来 —— 十个选项里它埋在中间，
-            // 第一次用的人找不到，而这恰恰是接豆包那类工具的入口。
-            let mk = if is_mic && k == ActionType::VoiceHotkey {
-                chip_hi
+            // 用麦克风的那几个动作挂个琥珀色麦克风图标 —— 十个纯文字选项里
+            // 挑不出来哪些跟语音有关，图标比高亮好认。
+            let voiced = matches!(
+                k,
+                ActionType::VoicePtt | ActionType::VoiceHotkey | ActionType::VoiceDictate
+            );
+            let el = if voiced {
+                chip_icon(("kind", k as usize), k.label(), k == d.kind, "mic", MIC_MARK)
             } else {
-                chip
+                chip(("kind", k as usize), k.label(), k == d.kind)
             };
-            types = types.child(mk(("kind", k as usize), k.label(), k == d.kind).on_click(
+            types = types.child(el.on_click(
                 cx.listener(move |this, _, window, cx| {
                     if let Some(dd) = &mut this.dialog {
                         dd.kind = k;
