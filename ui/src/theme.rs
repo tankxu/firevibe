@@ -26,13 +26,12 @@ pub const ACCENT_HOVER: u32 = 0x0093c6;
 pub const ACCENT_SOFT: u32 = 0xe4f5fd;
 pub const ACCENT_INK: u32 = 0x0080ad;
 
-/// 语音类动作的标记色（琥珀）—— 只用来在动作类型列表里把「要用麦克风的那几个」
-/// 一眼挑出来。选中态下图标改用 SURFACE，蓝底上才看得清。
-pub const MIC_MARK: u32 = 0xe0a020;
-
 // ── 语义色 ──
 pub const OK: u32 = 0x12a150;
 pub const OK_SOFT: u32 = 0xe8f6ee;
+/// 语音类动作的标记色 —— 只用来在动作类型列表里把「要用麦克风的那几个」一眼挑出来。
+/// 直接复用调色板里的绿，不另立一个色。选中态下图标改用 SURFACE，蓝底上才看得清。
+pub const MIC_MARK: u32 = OK;
 pub const WARN: u32 = 0xb4690e;
 pub const WARN_LINE: u32 = 0xf0dcae;
 pub const WARN_BG: u32 = 0xfffdf6;
