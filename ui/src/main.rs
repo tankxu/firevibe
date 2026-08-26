@@ -520,21 +520,6 @@ impl FireVibe {
     }
 
     fn pump(&mut self) {
-        // 临时自测：FIREVIBE_PAIRTEST=1 时启动 2 秒后自动开配对（模拟真实点击时机）
-        if std::env::var_os("FIREVIBE_PAIRTEST").is_some()
-            && !self.pairing && self.pair_devices.is_none()
-            && self.started
-        {
-            // 复用 boot_update_checked 之外的一次性——用 pairing 本身没触发过判断
-            static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                // 这里没有 cx，只能置标志 + 起线程，模拟 open_pairing 的效果
-                self.pairing = true;
-                let (tx, rx) = std::sync::mpsc::channel();
-                self.pair_rx = Some(rx);
-                std::thread::spawn(move || { let _ = tx.send(firevibe_core::device::list_hid()); });
-            }
-        }
         self.poll_hotkey_grab();
         self.poll_battery();
         self.poll_config_file_io();

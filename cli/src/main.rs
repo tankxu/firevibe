@@ -377,6 +377,329 @@ fn key_trace() -> anyhow::Result<()> {
     Ok(())
 }
 
+
+/// 开麦载荷探测 —— 这台遥控器描述符和原厂一样、却不吃原厂开麦命令时用。
+///
+/// ⚠️ **只在已知的命令通道 `0xF2` 上试**，载荷都是原厂那套的变体
+/// （`01 01` 系列 + 单字节 `01`）。**不碰 `0xF3`**（10 字节 OUTPUT、语义未知），
+/// 也**不做 opcode 盲扫** —— 对不明设备扫厂商命令可能干出不可逆的事。
+/// 逐个 collection 试开麦。
+///
+/// macOS 把一份含多个 top-level Application Collection 的报告描述符拆成**多个
+/// IOHIDDevice**，VID/PID 一模一样。音频输入报告 0xF0 和开麦命令 0xF2 都只在
+/// Vendor FF00 那个 collection 上。`hidapi::open(vid, pid)` 取枚举里第一个 ——
+/// 挑错了 SetReport 照样返回成功（macOS 不校验 report id 属不属于这个 collection），
+/// 但 0xF0 永远收不到。0x0421 能用、0x0425 不能用，很可能就差在这。
+///
+/// 只发已验证的 MIC_ON / MIC_OFF，不做厂商 opcode 扫描。
+fn collection_test() -> anyhow::Result<()> {
+    use firevibe_core::device::{MIC_OFF, MIC_ON};
+    use std::time::{Duration, Instant};
+
+    let cfg = firevibe_core::config::Config::load();
+    let (vid, pid) = cfg.device_ids();
+    let api = hidapi::HidApi::new()?;
+    #[cfg(target_os = "macos")]
+    api.set_open_exclusive(false);
+
+    let hits: Vec<_> = api
+        .device_list()
+        .filter(|d| d.vendor_id() == vid && d.product_id() == pid)
+        .collect();
+    if hits.is_empty() {
+        println!("没找到 0x{vid:04x}/0x{pid:04x} —— 遥控器没连上？");
+        return Ok(());
+    }
+    println!("0x{vid:04x}/0x{pid:04x} 共 {} 个 collection：\n", hits.len());
+
+    let mut best: Option<(u16, u16, u32)> = None;
+    for (i, d) in hits.iter().enumerate() {
+        let (up, u) = (d.usage_page(), d.usage());
+        print!("[{}/{}] usage_page 0x{up:04x} usage 0x{u:02x} … ", i + 1, hits.len());
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+
+        let dev = match api.open_path(d.path()) {
+            Ok(x) => x,
+            Err(e) => {
+                println!("打不开：{e}");
+                continue;
+            }
+        };
+        dev.set_blocking_mode(false).ok();
+
+        if let Err(e) = dev.write(&MIC_ON) {
+            println!("写 MIC_ON 失败：{e}");
+            continue;
+        }
+        // 数 3 秒 0xF0，中途每秒补一次 keepalive（开麦命令会过期）
+        let mut buf = [0u8; 128];
+        let (mut frames, mut others) = (0u32, Vec::<u8>::new());
+        let start = Instant::now();
+        let mut next_ka = start + Duration::from_secs(1);
+        while start.elapsed() < Duration::from_secs(3) {
+            if Instant::now() >= next_ka {
+                let _ = dev.write(&MIC_ON);
+                next_ka += Duration::from_secs(1);
+            }
+            if let Ok(len) = dev.read_timeout(&mut buf, 50) {
+                if len > 0 {
+                    if buf[0] == 0xF0 {
+                        frames += 1;
+                    } else if !others.contains(&buf[0]) {
+                        others.push(buf[0]);
+                    }
+                }
+            }
+        }
+        let _ = dev.write(&MIC_OFF);
+
+        let extra = if others.is_empty() {
+            String::new()
+        } else {
+            format!("，另见 report {:02x?}", others)
+        };
+        println!("{frames} 帧 0xF0{extra}");
+        if frames > 0 && best.map_or(true, |(_, _, n)| frames > n) {
+            best = Some((up, u, frames));
+        }
+    }
+
+    println!();
+    match best {
+        Some((up, u, n)) => {
+            println!("★ 出流的是 usage_page 0x{up:04x} / usage 0x{u:02x}（{n} 帧）");
+            println!("  → FireVibe 打开设备时要认准这个 collection，不能用 open(vid,pid)。");
+        }
+        None => println!("所有 collection 都是 0 帧 —— 不是选错 collection 的问题。"),
+    }
+    Ok(())
+}
+
+/// 开着麦克风蹲 20 秒，把**所有**收到的 report id 按数量列出来。
+///
+/// 用来分两种情况：
+///   - 除了 0xF0 还能收到别的 vendor 输入（0xF1 / 0xEF / 电池 0x03）→ 订阅通的，
+///     问题在遥控器不肯出音频；
+///   - 一条都收不到 → macOS 没给这个 collection 的输入报告开 CCCD 订阅。
+/// 同时也测「是不是必须真按住麦克风键」—— 官方那台是热麦克风，按不按都出流。
+fn mic_listen() -> anyhow::Result<()> {
+    use firevibe_core::device::{MIC_OFF, MIC_ON};
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
+
+    let cfg = firevibe_core::config::Config::load();
+    let (vid, pid) = cfg.device_ids();
+    let api = hidapi::HidApi::new()?;
+    #[cfg(target_os = "macos")]
+    api.set_open_exclusive(false);
+
+    // 遥控器空闲几十秒就休眠掉线，所以在这儿等它上线，别让用户去掐时间。
+    // 认准 vendor collection（描述符里 06 ff 00 → usage page 0x00ff，usage 0x00）
+    let mut api = api;
+    let mut waited = 0u32;
+    let path = loop {
+        let pick = api
+            .device_list()
+            .find(|d| d.vendor_id() == vid && d.product_id() == pid && d.usage_page() == 0x00ff)
+            .or_else(|| {
+                api.device_list()
+                    .find(|d| d.vendor_id() == vid && d.product_id() == pid)
+            });
+        if let Some(d) = pick {
+            println!(
+                "打开 usage_page 0x{:04x} usage 0x{:02x}",
+                d.usage_page(),
+                d.usage()
+            );
+            break d.path().to_owned();
+        }
+        if waited == 0 {
+            println!("等遥控器上线 —— 按一下它上面任意一个键唤醒（最多等 90 秒）…");
+        }
+        if waited >= 90 {
+            anyhow::bail!("等了 90 秒没等到 0x{vid:04x}/0x{pid:04x}");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        waited += 1;
+        api.refresh_devices()?;
+    };
+    let info_path = path;
+    let dev = api.open_path(&info_path)?;
+    dev.set_blocking_mode(false).ok();
+
+    // --no-cmd：完全不发命令，只靠物理按键 —— 用来 A/B 出 MIC_ON 到底需不需要
+    let no_cmd = std::env::args().any(|a| a == "--no-cmd");
+    if no_cmd {
+        println!("【对照组】不发任何命令，只靠按住麦克风键。\n");
+    } else {
+        dev.write(&MIC_ON)
+            .map_err(|e| anyhow::anyhow!("写 MIC_ON 失败（多半是没有输入监控权限）：{e}"))?;
+        println!("MIC_ON 已发。\n");
+    }
+    println!("接下来 20 秒：**按住遥控器的麦克风键说话**，按住 3 秒松开，重复几次。");
+    println!("（前 10 秒不按、后 10 秒按，正好对照热麦克风与否）\n");
+
+    let mut buf = [0u8; 128];
+    let mut tally: BTreeMap<u8, u32> = BTreeMap::new();
+    let mut first_seen: BTreeMap<u8, f32> = BTreeMap::new();
+    let start = Instant::now();
+    let mut next_ka = start + Duration::from_secs(1);
+    let mut next_tick = start + Duration::from_secs(1);
+    while start.elapsed() < Duration::from_secs(20) {
+        let now = Instant::now();
+        if now >= next_ka {
+            if !no_cmd {
+                let _ = dev.write(&MIC_ON); // keepalive：开麦命令会过期
+            }
+            next_ka += Duration::from_secs(1);
+        }
+        if now >= next_tick {
+            let t = start.elapsed().as_secs();
+            let total: u32 = tally.values().sum();
+            print!("\r  {t:>2}s  已收 {total} 条  ");
+            if t == 10 {
+                print!("← 现在开始按住麦克风键！");
+            }
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            next_tick += Duration::from_secs(1);
+        }
+        if let Ok(len) = dev.read_timeout(&mut buf, 20) {
+            if len > 0 {
+                let id = buf[0];
+                // 头一帧音频把长度和 Opus TOC 打出来 —— 确认和官方遥控器同格式
+                // （官方：81 字节 = 1 报告 ID + 80 字节包，TOC 恒为 0xB8）
+                if id == 0xF0 && !tally.contains_key(&0xF0) {
+                    println!("\n  首帧 0xF0：len={len}  TOC=0x{:02X}  前16字节={:02x?}",
+                             buf[1], &buf[..16.min(len)]);
+                }
+                *tally.entry(id).or_insert(0) += 1;
+                first_seen
+                    .entry(id)
+                    .or_insert_with(|| start.elapsed().as_secs_f32());
+            }
+        }
+    }
+    if !no_cmd {
+        let _ = dev.write(&MIC_OFF);
+    }
+    println!("\n\n──────── 收到的 report ────────");
+    if tally.is_empty() {
+        println!("  一条都没有。");
+        println!("  → 这个 collection 的输入报告根本没进来（macOS 没开 CCCD 订阅，");
+        println!("    或者遥控器在这条通道上什么都不发）。");
+    } else {
+        for (id, n) in &tally {
+            let t = first_seen[id];
+            let what = match id {
+                0xF0 => "音频（Opus）",
+                0xF1 => "vendor，未知",
+                0xEF => "App 快捷键",
+                0x03 => "电池",
+                0x01 => "键盘",
+                0x02 => "Consumer（麦克风键在这）",
+                _ => "?",
+            };
+            println!("  0x{id:02X}  {n:>5} 条   首次 +{t:.1}s   {what}");
+        }
+        if tally.contains_key(&0xF0) {
+            println!("\n★ 收到音频了。");
+        } else {
+            println!("\n没有 0xF0，但别的输入报告进得来 → 订阅是通的，是遥控器不肯出音频。");
+        }
+    }
+    Ok(())
+}
+
+fn mic_probe() -> anyhow::Result<()> {
+    use std::time::{Duration, Instant};
+    let cfg = firevibe_core::config::Config::load();
+    let (vid, pid) = cfg.device_ids();
+    let api = hidapi::HidApi::new()?;
+    #[cfg(target_os = "macos")]
+    api.set_open_exclusive(false);
+    let dev = api.open(vid, pid).map_err(|e| anyhow::anyhow!("HID_NOT_PERMITTED: {e}"))?;
+    dev.set_blocking_mode(false).ok();
+    println!("已打开 0x{vid:04x}/0x{pid:04x}");
+    println!("在已知命令通道 0xF2 上逐个试开麦载荷，每个发完看 3 秒 0xF0。\n");
+
+    // 数 secs 秒内的 0xF0 帧；顺带记下见到的其它 report id
+    let probe = |dev: &hidapi::HidDevice, secs: f32| -> (u32, Vec<u8>) {
+        let mut buf = [0u8; 128];
+        let (mut n, mut ids) = (0u32, Vec::<u8>::new());
+        let end = Instant::now() + Duration::from_secs_f32(secs);
+        while Instant::now() < end {
+            if let Ok(len) = dev.read_timeout(&mut buf, 50) {
+                if len > 0 {
+                    if buf[0] == 0xF0 {
+                        n += 1;
+                    } else if !ids.contains(&buf[0]) {
+                        ids.push(buf[0]);
+                    }
+                }
+            }
+        }
+        (n, ids)
+    };
+
+    // 原厂那套的变体。第一个字节是 report id 0xF2，后面是载荷。
+    let cands: &[(&str, &[u8])] = &[
+        ("[F2 01 01]        原厂开麦", &[0xF2, 0x01, 0x01]),
+        ("[F2 01 01 +0x8]   补满 10 字节载荷", &[0xF2, 0x01, 0x01, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ("[F2 01]           单字节 01", &[0xF2, 0x01]),
+        ("[F2 02]           单字节 02", &[0xF2, 0x02]),
+        ("[F2 01 02]        第二字节 02", &[0xF2, 0x01, 0x02]),
+        ("[F2 03]           单字节 03", &[0xF2, 0x03]),
+    ];
+
+    let mut best: Option<(&str, u32)> = None;
+    for (label, cmd) in cands {
+        // 每轮先关麦，排掉上一轮残留
+        let _ = dev.write(&[0xF2, 0x00]);
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = probe(&dev, 0.4); // 清掉缓冲
+
+        let w = dev.write(cmd);
+        std::thread::sleep(Duration::from_millis(400));
+        let (n, ids) = probe(&dev, 3.0);
+        let extra = if ids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "  其它报文: {}",
+                ids.iter().map(|i| format!("0x{i:02X}")).collect::<Vec<_>>().join(" ")
+            )
+        };
+        println!(
+            "{label:34} 写={:<8} 0xF0 {n:>4} 帧{extra}",
+            w.map(|b| format!("{b}B")).unwrap_or_else(|_| "失败".into())
+        );
+        if n > 0 && best.map(|(_, bn)| n > bn).unwrap_or(true) {
+            best = Some((label, n));
+        }
+    }
+
+    // 收尾：关麦，别把它留在开着的状态
+    let _ = dev.write(&[0xF2, 0x00]);
+    std::thread::sleep(Duration::from_millis(300));
+
+    println!();
+    match best {
+        Some((label, n)) => {
+            println!("✓ 有效开麦载荷：{label}（{n} 帧）");
+            println!("  把 core/src/device.rs 的 MIC_ON 改成它即可。");
+        }
+        None => {
+            println!("✗ 试过的载荷都没起流。");
+            println!("  这台可能：① 语音走别的 report（看上面「其它报文」有没有可疑 id）");
+            println!("            ② 需要先握手/配对到电视才解锁语音");
+            println!("            ③ 固件压根没实现（描述符是照抄原厂的，声明不算数）");
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     if let Err(e) = run_cli() {
         let msg = format!("{e:#}");
@@ -436,10 +759,10 @@ fn run_cli() -> anyhow::Result<()> {
     // （那会加载 app 配置、跑起来，用户还以为在跑自己想要的命令）。
     const KNOWN: &[&str] = &[
         "--help", "-h", "--list-devices", "--exclusive", "--device", "--mode", "--gain",
-        "--no-voice", "--descriptor", "--probe-all", "--probe-mic", "--keys", "--mic-off-test",
+        "--no-voice", "--descriptor", "--probe-all", "--probe-mic", "--keys", "--mic-off-test", "--mic-probe",
         "--adapt", "--map", "--sniff", "--tap", "--watch-mods", "--modcmp", "--mic", "--hold",
         "--run", "--type", "--inputs", "--set-input", "--config", "--battery", "--hid-list",
-        "--loopback-test", "--feed-tone", "--pin-input",
+        "--loopback-test", "--feed-tone", "--pin-input", "--all", "--collection-test", "--mic-listen", "--no-cmd",
     ];
     if let Some(bad) = args.iter().find(|a| a.starts_with("--") && !KNOWN.contains(&a.as_str())) {
         eprintln!("未知选项：{bad}");
@@ -476,6 +799,7 @@ fn run_cli() -> anyhow::Result<()> {
              \x20 --gain <倍数>      覆盖增益\n\
              \x20 --no-voice         只测按键\n\
              \x20 --descriptor       打印 HID 报告描述符后退出\n\
+             \x20 --mic-probe        开麦载荷探测：在已知命令通道 0xF2 上逐个试，看哪个能起流\n\
              \x20 --probe-all        ★换遥控器就跑这个：一条命令走完全套，生成报告文件\n\
              \x20 --adapt            只做「选设备 + 逐键认键」（--probe-all 的子集）\n\
              \x20 --probe-mic        旧名，等同 --probe-all\n\
@@ -516,6 +840,24 @@ fn run_cli() -> anyhow::Result<()> {
     // 换一款遥控器的唯一入口：一条命令走完全套并落一份报告文件
     if has("--mic-off-test") {
         return mic_off_test();
+    }
+
+    if has("--mic-probe") {
+        return mic_probe();
+    }
+
+
+    if has("--collection-test") {
+        return collection_test();
+
+    }
+
+
+
+    if has("--mic-listen") {
+        return mic_listen();
+
+
     }
 
     if has("--keys") {
@@ -706,12 +1048,30 @@ fn run_cli() -> anyhow::Result<()> {
         let api = hidapi::HidApi::new()?;
         println!("{:<8} {:<8}  {:<28} {}", "VID", "PID", "产品名", "厂商");
         println!("{}", "-".repeat(72));
+        // --all：不按 VID/PID 去重，把每个 top-level collection 都列出来。
+        // macOS 会把一份多 Application Collection 的报告描述符拆成好几个 IOHIDDevice
+        // （VID/PID 完全一样），而音频报告 0xF0 和开麦命令 0xF2 只在 Vendor FF00 那个上。
+        // hidapi 的 open(vid,pid) 取枚举里第一个 —— 挑错了写入照样成功但收不到音频。
+        let show_all = has("--all");
         let mut seen = std::collections::HashSet::new();
         for d in api.device_list() {
-            if !seen.insert((d.vendor_id(), d.product_id())) {
+            if !show_all && !seen.insert((d.vendor_id(), d.product_id())) {
                 continue;
             }
             let ours = d.vendor_id() == want_vid && d.product_id() == want_pid;
+            if show_all {
+                println!(
+                    "0x{:04x}   0x{:04x}    usage_page 0x{:04x} usage 0x{:02x}  iface {:>2}  {:<20} {}",
+                    d.vendor_id(),
+                    d.product_id(),
+                    d.usage_page(),
+                    d.usage(),
+                    d.interface_number(),
+                    d.product_string().unwrap_or("?"),
+                    if ours { "← 目标 VID/PID" } else { "" }
+                );
+                continue;
+            }
             println!(
                 "0x{:04x}   0x{:04x}    {:<28} {}{}",
                 d.vendor_id(),

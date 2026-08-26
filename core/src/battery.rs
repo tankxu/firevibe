@@ -50,6 +50,14 @@ pub fn last() -> Option<i32> {
 /// 辅助程序的位置：bundle 里的 Contents/MacOS/battprobe，
 /// 开发时退回 /tmp（package.sh 会编到 bundle 里）
 fn probe_path() -> Option<PathBuf> {
+    // 诊断用：指向另一份新编的 battprobe，省得为改 helper 整包重签。蓝牙授权归责到
+    // 父进程（FireVibe.app），helper 在不在 bundle 里都行。
+    if let Ok(p) = std::env::var("FIREVIBE_PROBE") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
     let exe = std::env::current_exe().ok()?;
     let p = exe.with_file_name("battprobe");
     p.is_file().then_some(p)
@@ -130,6 +138,47 @@ pub fn spawn_tracker(every_secs: u64) {
     std::thread::Builder::new()
         .name("firevibe-batt".into())
         .spawn(move || {
+            // 诊断钩子：FIREVIBE_GATT_DUMP=<设备名> 时先枚举一次 GATT 服务，
+            // 用来判断某台遥控器的语音是不是走 GATT（HID 那条不出流时）。
+            if let Ok(name) = std::env::var("FIREVIBE_GATT_DUMP") {
+                if let Some(p) = probe_path() {
+                    eprintln!("[gatt] 枚举 {name} 的 GATT 服务…");
+                    match std::process::Command::new(&p).arg(&name).arg("--dump").output() {
+                        Ok(o) => {
+                            for line in String::from_utf8_lossy(&o.stderr).lines() {
+                                eprintln!("[gatt] {line}");
+                            }
+                            eprintln!("[gatt] 退出码 {:?}", o.status.code());
+                        }
+                        Err(e) => eprintln!("[gatt] 起不来: {e}"),
+                    }
+                }
+            }
+            // 诊断钩子：FIREVIBE_GATT_LISTEN=<设备名> 时订阅该设备**所有** notify 特征，
+            // 把推过来的字节按时间打出来（只订阅、不写任何特征）。用来验证国产遥控器的
+            // 语音是不是走它自己的私有服务（FFF0 那一系按下麦克风键就自己推流）。
+            // 时长用 FIREVIBE_GATT_LISTEN_SECS 调，默认 30 秒。
+            if let Ok(name) = std::env::var("FIREVIBE_GATT_LISTEN") {
+                if let Some(p) = probe_path() {
+                    let secs = std::env::var("FIREVIBE_GATT_LISTEN_SECS")
+                        .unwrap_or_else(|_| "30".into());
+                    eprintln!("[listen] 监听 {name} 的 GATT notify，{secs} 秒 —— 现在按住麦克风键说话");
+                    match std::process::Command::new(&p)
+                        .arg(&name)
+                        .arg("--listen")
+                        .arg(format!("--secs={secs}"))
+                        .output()
+                    {
+                        Ok(o) => {
+                            for line in String::from_utf8_lossy(&o.stderr).lines() {
+                                eprintln!("[listen] {line}");
+                            }
+                            eprintln!("[listen] 退出码 {:?}", o.status.code());
+                        }
+                        Err(e) => eprintln!("[listen] 起不来: {e}"),
+                    }
+                }
+            }
             let mut seen_gen = u64::MAX; // 首轮必读
             loop {
                 let g = GEN.load(Ordering::Relaxed);

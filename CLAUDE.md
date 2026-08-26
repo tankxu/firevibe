@@ -306,3 +306,35 @@ AppKit 透明标题栏的真实拖拽区，不是 window_control_area 起作用�
   （我踩过：合成点击测试把用户的语言改成英文、删掉了一个槽位配置）。
 - **方案顺序**：数组前面放预制（默认、Vibe），用户新建的 append 在后；
   下拉**倒序渲染**（新的在上）。`active` 存的是数组下标，动数组顺序要跟着改它。
+
+## 遥控器有两种开麦模型（2026-08-26 实测）
+
+支持的不是「一种遥控器」。亚马逊自家就有 11 个 PID
+（`0x413 414 415 418 41e 421 423 424 425 42f 431`，来自 Fire TV 固件
+`BluetoothKeyMapLib` 的 `kml_supported_amazon_ble_remote_pids`），HID 报告描述符
+**完全相同**，但开麦方式分两派：
+
+- **热麦克风**（已知：`0x0421`）：主机写 `SetReport(Output,0xF2,[01,01,…])`，
+  之后一直吐流，**跟物理按键无关**；必须发 `[F2,00]` 才停。
+- **PTT**（已知：`0x0425`）：**设备自发，只在物理麦克风键按住期间出流**，
+  松手立停；`MIC_ON` 发了完全没反应，也不需要。
+
+音频格式两派一样：report `0xF0`，81 字节，Opus 16 kHz / 20 ms。
+
+### 对配置的影响
+PTT 遥控器上，麦克风键**必须绑成按住模式**（`long` + `arg:"hold"`）。
+绑成 `short` + `arg:"tap"` 会「录了个空」—— 点一下就松手，没有音频。
+这也是 0x0425 一直「没声音」的真正原因，不是协议问题。
+
+### 诊断命令
+```
+firectl --hid-list --all      # 每个 top-level collection 都列出来（macOS 会拆成多个）
+firectl --collection-test     # 逐个 collection 发 MIC_ON，数 0xF0 帧
+firectl --mic-listen          # 开麦蹲 20 秒，按 report id 统计收到什么
+firectl --mic-listen --no-cmd # 对照组：一条命令都不发，只靠按键 → 分辨 PTT / 热麦克风
+```
+`battprobe --listen --secs=N` 是只读订阅所有 GATT notify（排查用，语音不走 GATT）。
+
+⚠️ 遥控器空闲几十秒就休眠掉线，测之前先按个键唤醒；`--mic-listen` 自带等待。
+⚠️ **别再把 probe-all 的麦克风测试改成「不用按实体按钮」** —— 对 PTT 遥控器
+那等于保证测出 0 帧。要两种都测：先不按（热麦克风），再按住（PTT）。
