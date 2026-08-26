@@ -96,12 +96,15 @@ impl FireVibe {
             },
             key_id
         );
-        // PTT 遥控器（只在物理麦克风键按住期间出流）：麦克风键的**短按**槽里
-        // 语音类动作全都是摆设 —— 点一下就松手，遥控器那边一帧都不出。
-        // 干脆不给选，改成一行说明让用户去长按里配。
-        let ptt_short_mic = d.slot == firevibe_core::layout::Slot::Mic
-            && !d.long
-            && self.rt.cfg.read().settings.mic_model.is_ptt();
+        // PTT 遥控器 = 只在**物理麦克风键**按住期间出音频。于是有两处语音动作是摆设：
+        //   · 麦克风键的**短按**槽 —— 点一下就松手，一帧都不出
+        //   · **其它任何键** —— 音频跟那些键根本没关系，按了也不会出声
+        // 两处都不给选，各给一行说明。
+        let is_mic = d.slot == firevibe_core::layout::Slot::Mic;
+        let is_ptt = self.rt.cfg.read().settings.mic_model.is_ptt();
+        let ptt_short_mic = is_ptt && is_mic && !d.long;
+        let ptt_other_key = is_ptt && !is_mic;
+        let hide_voice = ptt_short_mic || ptt_other_key;
 
         // 动作类型
         let mut types = div().flex().flex_wrap().gap(px(6.));
@@ -114,7 +117,7 @@ impl FireVibe {
             if d.long && k == ActionType::VoiceToggle {
                 continue;
             }
-            if ptt_short_mic
+            if hide_voice
                 && matches!(
                     k,
                     ActionType::VoicePtt
@@ -126,7 +129,14 @@ impl FireVibe {
             {
                 continue;
             }
-            types = types.child(chip(("kind", k as usize), k.label(), k == d.kind).on_click(
+            // 麦克风键上把「第三方语音输入」标出来 —— 十个选项里它埋在中间，
+            // 第一次用的人找不到，而这恰恰是接豆包那类工具的入口。
+            let mk = if is_mic && k == ActionType::VoiceHotkey {
+                chip_hi
+            } else {
+                chip
+            };
+            types = types.child(mk(("kind", k as usize), k.label(), k == d.kind).on_click(
                 cx.listener(move |this, _, window, cx| {
                     if let Some(dd) = &mut this.dialog {
                         dd.kind = k;
@@ -153,7 +163,7 @@ impl FireVibe {
             .pt(px(2.))
             .pb(px(18.))
             .child(div().child(field_lab(l.action_type())).child(types))
-            .when(ptt_short_mic, |b| {
+            .when(hide_voice, |b| {
                 b.child(
                     div()
                         .px(px(10.))
@@ -164,7 +174,12 @@ impl FireVibe {
                         .bg(c(WARN_BG))
                         .text_size(px(11.5))
                         .text_color(c(INK2))
-                        .child(SharedString::from(l.ptt_short_note())),
+                        .line_height(gpui::relative(1.5))
+                        .child(SharedString::from(if ptt_other_key {
+                            l.ptt_other_key_note()
+                        } else {
+                            l.ptt_short_note()
+                        })),
                 )
             });
         // 参数区，按类型不同
@@ -345,6 +360,23 @@ l.hotkey_tap_hint()
                         .text_color(c(INK2))
                         .child(SharedString::from(d.kind.hint())),
                 );
+                // 「按住说话」只灌音频、不发任何按键。想让第三方工具跟着一起开录，
+                // 得用「第三方语音输入」—— 这两个的差别不写出来很容易选错。
+                if d.kind == ActionType::VoicePtt {
+                    body = body.child(
+                        div()
+                            .px(px(10.))
+                            .py(px(8.))
+                            .rounded(px(R))
+                            .border_1()
+                            .border_color(c(ACCENT))
+                            .bg(c(ACCENT_SOFT))
+                            .text_size(px(11.5))
+                            .text_color(c(ACCENT_INK))
+                            .line_height(gpui::relative(1.5))
+                            .child(SharedString::from(l.ptt_vs_hotkey_note())),
+                    );
+                }
             }
         }
         let foot = div()

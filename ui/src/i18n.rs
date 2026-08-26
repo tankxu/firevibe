@@ -402,6 +402,16 @@ impl L {
     }
     pub fn ptt_fix(&self) -> &'static str { t!(self.0, "移到长按", "Move to long press") }
     pub fn ptt_fixed(&self) -> &'static str { t!(self.0, "已移到长按", "Moved to long press") }
+    pub fn ptt_other_key_note(&self) -> &'static str {
+        t!(self.0,
+           "这台遥控器只有按住麦克风键时才出声，其它按键跟音频没有关系 —— 所以这里不提供语音动作。语音请配在麦克风键的「长按」里。",
+           "This remote only streams while its mic key is held; other keys have nothing to do with audio, so voice actions aren't offered here. Configure voice under the mic key's Long press.")
+    }
+    pub fn ptt_vs_hotkey_note(&self) -> &'static str {
+        t!(self.0,
+           "这个动作只把音频送进虚拟声卡，不会发任何快捷键。如果还需要同时按下热键去唤起语音工具，请改用「第三方语音输入」。",
+           "This only feeds audio into the virtual mic — it sends no keystroke. If you also need a hotkey pressed to wake your voice tool, use “Third-party voice input” instead.")
+    }
     pub fn ptt_short_note(&self) -> &'static str {
         t!(self.0,
            "这台遥控器的麦克风只支持按住 —— 点一下松手就没有音频了，所以短按这里不提供语音动作。请到「长按」里配置。",
