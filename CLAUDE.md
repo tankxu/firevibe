@@ -375,3 +375,29 @@ firectl --mic-listen --no-cmd # 对照组：一条命令都不发，只靠按键
 
 ⚠️ 改了配置要**重启 app** 才生效 —— runtime 是启动时读配置建 HID 线程的。
 ⚠️ 两个进程读同一台 HID 设备时报告可能只送到一个：用 firectl 测之前先退出 app。
+
+## 发布（踩过的顺序坑）
+
+**版本号只有一个来源**：根 `Cargo.toml` 的 `[workspace.package] version`。
+`ui/Cargo.toml` 用 `version.workspace = true`，`package.sh` 从工作区读。
+（以前 package.sh 读 ui/Cargo.toml、更新检查读 core 的 `CARGO_PKG_VERSION`，
+两个能各说各话 —— 实测发生过：包自称 0.1.2-beta.1，更新检查拿 0.1.3 去比。）
+
+**构建顺序不能反**：先 `./package.sh`（app），**再** `./build-cli.sh`。
+package.sh 的工作区构建会覆盖 `target/release/firectl`，覆盖出来的是**未签名**的。
+
+**打包必须用 `ditto`**，`zip` 会破坏签名：
+```
+ditto -c -k --sequesterRsrc --keepParent target/FireVibe.app  FireVibe-<VER>-macos-arm64.zip
+ditto -c -k --sequesterRsrc target/release/firectl            firectl-macos-arm64.zip
+```
+
+**发之前逐项验签**（ad-hoc 会毁掉 TCC 授权，见 macos-adhoc-sign-tcc-trap）：
+```
+codesign --verify --deep --strict target/FireVibe.app     # 内嵌 battprobe 会一起 validated
+codesign -dv --verbose=2 target/release/firectl           # 要看到 Authority=Apple Development
+```
+发完再从 GitHub 下回来解包复验一次 —— 那才是用户真正拿到的那份。
+
+**tag 规则**：app = `vX.Y.Z`，CLI = `cli-vX.Y.Z`（CLI 发 `--prerelease`，
+因为应用的更新检查走 `/releases/latest`，那个接口会忽略预发布）。
