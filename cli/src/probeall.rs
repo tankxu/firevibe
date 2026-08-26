@@ -568,19 +568,20 @@ fn hold_round(
     got
 }
 
-/// 麦克风探测 —— **不用碰遥控器**。
+/// 麦克风探测 —— **两段对照**，因为遥控器有两种开麦模型：
 ///
-/// 走和界面「按住说话」完全一样的路径：先 `ensure_voice()` 建虚拟声卡 sink，
-/// 再 `set_talking(true)`（内部 `set_passing` + 置 `mic_on`，读线程随即发
-/// `MIC_ON [F2,01,01]` 并每秒 keepalive）。麦克风是「热」的 —— 命令一发就出流，
-/// 不需要物理按住那颗键。
-/// ⚠️ 早先这一步要求用户按住麦克风键，是因为当时没建 sink：
-/// `push_pcm` 在 `passing=false` 时直接丢弃，看着就像「不按就没声音」。
+///   A 热麦克风（如 0x0421）：主机发 `MIC_ON [F2,01,01]` 就一直吐流，**跟按键无关**。
+///   B 按住才出流 / PTT（如 0x0425）：`MIC_ON` 完全无效，**只有物理麦克风键按住时**出流。
 ///
-/// 返回 (收到的 0xF0 帧数, 峰值电平, 见到的报文 id)
+/// ⚠️ 只测其中一种必然误判：早先这步被改成「不用按实体按钮」，对 PTT 遥控器
+/// 就是保证测出 0 帧；更早只让用户按住、却没建 sink，`push_pcm` 在
+/// `passing=false` 时被丢弃，又像「按了也没声音」。两个坑都踩过，所以两段都要跑。
+///
+/// 返回 (两段合计的 0xF0 帧数, 峰值电平, 见到的报文 id)
 fn step4_mic(r: &mut Report, rt: &Runtime, rx: &Receiver<Event>) -> (u64, f32, Vec<u8>) {
     r.say("\n───── ③ 试试语音输入 ─────");
-    r.say("  主机发开麦命令，看遥控器吐不吐音频 —— **不用你按遥控器**。");
+    r.say("  分两段测：先只发命令不碰遥控器，再让你按住麦克风键。");
+    r.say("  两种遥控器的开麦方式是反的，只测一种一定会误判。");
     // 诊断期间别让 app 逻辑自己发关麦干扰
     rt.auto_mic_off.store(false, Ordering::Relaxed);
 
@@ -603,18 +604,39 @@ fn step4_mic(r: &mut Report, rt: &Runtime, rx: &Receiver<Event>) -> (u64, f32, V
         rt.auto_mic_off.store(true, Ordering::Relaxed);
         return (0, 0.0, Vec::new());
     }
-    r.say("  已开麦，收 8 秒…（想验电平就对着遥控器说话，不说也能看出流没流）");
-
-    // 收 8 秒，顺带记峰值电平
+    // ── A 段：热麦克风。命令已发，接下来 7 秒**不要碰遥控器** ──
+    r.say("\n  A 段（7 秒）：已发 MIC_ON —— 请**不要碰遥控器**。");
     let mut peak = 0.0f32;
-    for _ in 0..8 {
+    for _ in 0..7 {
         watch(r, rt, rx, 1, t0);
         let lv = rt.level();
         if lv > peak {
             peak = lv;
         }
     }
-    let frames = rt.status.audio_frames.load(Ordering::Relaxed) - a0;
+    let hot = rt.status.audio_frames.load(Ordering::Relaxed) - a0;
+    r.say(format!("  A 段收到 {hot} 帧"));
+
+    // ── B 段：按住物理麦克风键 ──
+    r.say("\n  B 段（12 秒）：请**按住遥控器的麦克风键、正常音量说话**，");
+    r.say("  按住 3 秒松开，重复三四次。");
+    wait_enter("  准备好了按回车开始… ");
+    let b0 = rt.status.audio_frames.load(Ordering::Relaxed);
+    let t1 = Instant::now();
+    for i in 0..12 {
+        watch(r, rt, rx, 1, t1);
+        let lv = rt.level();
+        if lv > peak {
+            peak = lv;
+        }
+        if i == 5 {
+            r.note("  （还剩一半，继续按）");
+        }
+    }
+    let ptt = rt.status.audio_frames.load(Ordering::Relaxed) - b0;
+    r.say(format!("  B 段收到 {ptt} 帧"));
+
+    let frames = hot + ptt;
 
     // 收尾：关麦（热麦克风一直开着很费电）
     rt.set_talking(false);
@@ -623,8 +645,36 @@ fn step4_mic(r: &mut Report, rt: &Runtime, rx: &Receiver<Event>) -> (u64, f32, V
     std::thread::sleep(Duration::from_millis(300));
     rt.auto_mic_off.store(true, Ordering::Relaxed);
 
+    // 判型 —— 这个结论直接决定麦克风键该怎么绑
+    let model = if hot > 5 && ptt <= hot / 4 {
+        "热麦克风"
+    } else if ptt > 5 && hot <= 5 {
+        "按住才出流（PTT）"
+    } else if hot > 5 && ptt > 5 {
+        "两段都出流"
+    } else {
+        "两段都没出流"
+    };
+    r.say(format!("\n  ▸ 开麦模型：**{model}**"));
+    match model {
+        "热麦克风" => r.say("    麦克风键用「点一下」模式即可。"),
+        "按住才出流（PTT）" => {
+            r.say("    麦克风键必须绑在**短按槽 + 按住模式**。");
+            r.say("    绑长按槽会漏掉按下那一下（麦克风键漏给系统会弹 Spotlight），");
+            r.say("    而且开头一截音频也丢。");
+        }
+        "两段都出流" => r.say("    按热麦克风用即可。"),
+        _ => {
+            r.say("    先确认 B 段真的**按住**了（不是点一下）；");
+            r.say("    再确认遥控器不是「蓝牙连着但 HID 管道死了」—— 重新配对一次。");
+        }
+    }
+    r.fact("开麦模型", model);
+    r.fact("麦克风_A段热麦克风帧数", hot.to_string());
+    r.fact("麦克风_B段按住帧数", ptt.to_string());
+
     let ids: Vec<u8> = rt.seen_rids.lock().keys().copied().collect();
-    r.say(format!("  收到 {frames} 帧 0xF0 音频，峰值电平 {peak:.3}"));
+    r.say(format!("  合计 {frames} 帧 0xF0 音频，峰值电平 {peak:.3}"));
     if !ids.is_empty() {
         r.say("  期间见到的报文类型：");
         for rid in &ids {

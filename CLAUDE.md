@@ -337,4 +337,19 @@ firectl --mic-listen --no-cmd # 对照组：一条命令都不发，只靠按键
 
 ⚠️ 遥控器空闲几十秒就休眠掉线，测之前先按个键唤醒；`--mic-listen` 自带等待。
 ⚠️ **别再把 probe-all 的麦克风测试改成「不用按实体按钮」** —— 对 PTT 遥控器
-那等于保证测出 0 帧。要两种都测：先不按（热麦克风），再按住（PTT）。
+那等于保证测出 0 帧。现在 `--probe-all` 的第 ③ 步已经是两段对照
+（A 段发 MIC_ON 不碰遥控器，B 段按住麦克风键），会直接判出开麦模型。
+反过来也别改成「只让用户按住」：更早那版没建 sink，`push_pcm` 在
+`passing=false` 时被丢弃，看着像「按了也没声音」。两个坑都踩过。
+
+### hidremap 认设备（踩过）
+`hidremap` 内部存着自己的一份 VID/PID，默认是出厂那台 `0x0421`。以前只有
+「配对新遥控器」流程会 `set_ids`，所以启动时按配置换过遥控器的，映射一直下发给
+一台没连的设备 —— 麦克风键没被接管：Spotlight 照弹，而且第三方语音工具拿不到
+**硬件来源**的修饰键就不干活（合成事件对它无效，见 hidremap.rs 顶部注释）。
+现在 `sync_hid_remap()` 每次都先按配置 `set_ids`。
+验证：`hidutil property --matching '{"ProductID":0x0425,"VendorID":0x0171}' --get UserKeyMapping`
+应该看到 Src `0xC00000221`(AC Search) → Dst `0x7000000E6`(右 Option)。
+
+⚠️ 改了配置要**重启 app** 才生效 —— runtime 是启动时读配置建 HID 线程的。
+⚠️ 两个进程读同一台 HID 设备时报告可能只送到一个：用 firectl 测之前先退出 app。

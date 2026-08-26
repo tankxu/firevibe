@@ -537,8 +537,18 @@ fn mic_listen() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("写 MIC_ON 失败（多半是没有输入监控权限）：{e}"))?;
         println!("MIC_ON 已发。\n");
     }
-    println!("接下来 20 秒：**按住遥控器的麦克风键说话**，按住 3 秒松开，重复几次。");
-    println!("（前 10 秒不按、后 10 秒按，正好对照热麦克风与否）\n");
+    // 窗口时长可调 —— 和用户对时间点太难，默认放长一点，什么时候按都行
+    let secs: u64 = std::env::args()
+        .find_map(|a| a.strip_prefix("--secs=").and_then(|v| v.parse().ok()))
+        .unwrap_or(20);
+    println!("接下来 {secs} 秒内**随便什么时候**按住麦克风键说话都行，按住 3 秒松开，重复几次。\n");
+
+    // 顺带解码：光数帧不够，要知道声音本身响不响 —— 电平只有一格时得分清
+    // 是「帧太少」还是「帧有但几乎静音」。
+    let mut dec = opus::Decoder::new(16_000, opus::Channels::Mono)
+        .map_err(|e| anyhow::anyhow!("opus 解码器建不起来：{e}"))?;
+    let mut pcm = vec![0i16; 320 * 6];
+    let (mut peak, mut sumsq, mut nsamp, mut decode_err) = (0i32, 0f64, 0u64, 0u32);
 
     let mut buf = [0u8; 128];
     let mut tally: BTreeMap<u8, u32> = BTreeMap::new();
@@ -546,7 +556,7 @@ fn mic_listen() -> anyhow::Result<()> {
     let start = Instant::now();
     let mut next_ka = start + Duration::from_secs(1);
     let mut next_tick = start + Duration::from_secs(1);
-    while start.elapsed() < Duration::from_secs(20) {
+    while start.elapsed() < Duration::from_secs(secs) {
         let now = Instant::now();
         if now >= next_ka {
             if !no_cmd {
@@ -558,9 +568,6 @@ fn mic_listen() -> anyhow::Result<()> {
             let t = start.elapsed().as_secs();
             let total: u32 = tally.values().sum();
             print!("\r  {t:>2}s  已收 {total} 条  ");
-            if t == 10 {
-                print!("← 现在开始按住麦克风键！");
-            }
             use std::io::Write;
             std::io::stdout().flush().ok();
             next_tick += Duration::from_secs(1);
@@ -573,6 +580,21 @@ fn mic_listen() -> anyhow::Result<()> {
                 if id == 0xF0 && !tally.contains_key(&0xF0) {
                     println!("\n  首帧 0xF0：len={len}  TOC=0x{:02X}  前16字节={:02x?}",
                              buf[1], &buf[..16.min(len)]);
+                }
+                if id == 0xF0 {
+                    match dec.decode(&buf[1..len], &mut pcm, false) {
+                        Ok(got) => {
+                            for &v in &pcm[..got] {
+                                let a = (v as i32).abs();
+                                if a > peak {
+                                    peak = a;
+                                }
+                                sumsq += (v as f64) * (v as f64);
+                            }
+                            nsamp += got as u64;
+                        }
+                        Err(_) => decode_err += 1,
+                    }
                 }
                 *tally.entry(id).or_insert(0) += 1;
                 first_seen
@@ -604,11 +626,217 @@ fn mic_listen() -> anyhow::Result<()> {
             println!("  0x{id:02X}  {n:>5} 条   首次 +{t:.1}s   {what}");
         }
         if tally.contains_key(&0xF0) {
-            println!("\n★ 收到音频了。");
+            let n = tally[&0xF0];
+            println!("\n★ 收到音频：{n} 帧 ≈ {:.2}s", n as f32 * 0.02);
+            if nsamp > 0 {
+                let rms = (sumsq / nsamp as f64).sqrt();
+                // 16 位满量程 32767；-30 dBFS 以下基本等于没说话
+                let db = 20.0 * (rms.max(1.0) / 32767.0).log10();
+                let pdb = 20.0 * ((peak.max(1) as f64) / 32767.0).log10();
+                println!(
+                    "  解出 {nsamp} 采样  RMS {rms:.0} ({db:.1} dBFS)  峰值 {peak} ({pdb:.1} dBFS)"
+                );
+                if pdb < -40.0 {
+                    println!("  ⚠ 峰值 <-40dBFS —— 遥控器送来的就是近乎静音，不是 FireVibe 的锅");
+                } else if pdb > -12.0 {
+                    println!("  音量正常，问题在下游（虚拟声卡 / 增益 / 采样率）");
+                } else {
+                    println!("  音量偏小但有内容");
+                }
+            }
+            if decode_err > 0 {
+                println!("  ⚠ {decode_err} 帧解码失败 —— 格式可能和官方那台不一样");
+            }
         } else {
             println!("\n没有 0xF0，但别的输入报告进得来 → 订阅是通的，是遥控器不肯出音频。");
         }
     }
+    Ok(())
+}
+
+/// 一条命令跑完麦克风适配检查，全程在终端里给提示和倒计时。
+///
+/// 分三段，用来把两种开麦模型和「压根不出流」区分开：
+///   ① 静默基线    —— 什么都不发、不碰遥控器
+///   ② 热麦克风     —— 发 MIC_ON，仍然不碰遥控器（0x0421 这时就该出流）
+///   ③ 按住         —— 按住物理麦克风键说话（0x0425 只有这时才出流）
+/// 顺带解码算音量，分清「没帧」和「有帧但近乎静音」。
+fn mic_check() -> anyhow::Result<()> {
+    use firevibe_core::device::{MIC_OFF, MIC_ON};
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    println!("\n  FireVibe 麦克风适配检查");
+    println!("  ─────────────────────────────────────────\n");
+
+    // app 也在读同一台设备时，报告可能只送到其中一个进程
+    let app_running = std::process::Command::new("pgrep")
+        .args(["-f", "FireVibe.app/Contents/MacOS/firevibe"])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+    if app_running {
+        println!("  ⚠ FireVibe.app 正在运行。两个进程读同一台 HID 设备时，报告可能只");
+        println!("    送到其中一个。这一步测出 0 帧的话，先退出 app 再跑一次。\n");
+    }
+
+    let cfg = firevibe_core::config::Config::load();
+    let (vid, pid) = cfg.device_ids();
+    let mut api = hidapi::HidApi::new()?;
+    #[cfg(target_os = "macos")]
+    api.set_open_exclusive(false);
+
+    // ── 等设备 ──
+    print!("  ① 等遥控器上线 —— 按一下它上面任意一个键唤醒 ");
+    std::io::stdout().flush().ok();
+    let mut waited = 0u32;
+    let (path, label) = loop {
+        let pick = api
+            .device_list()
+            .find(|d| d.vendor_id() == vid && d.product_id() == pid && d.usage_page() == 0x00ff)
+            .or_else(|| {
+                api.device_list()
+                    .find(|d| d.vendor_id() == vid && d.product_id() == pid)
+            });
+        if let Some(d) = pick {
+            break (
+                d.path().to_owned(),
+                format!(
+                    "{} 0x{vid:04x}/0x{pid:04x} usage_page 0x{:04x}",
+                    d.product_string().unwrap_or("?"),
+                    d.usage_page()
+                ),
+            );
+        }
+        if waited >= 120 {
+            println!();
+            anyhow::bail!("等了 120 秒没等到 0x{vid:04x}/0x{pid:04x}");
+        }
+        print!(".");
+        std::io::stdout().flush().ok();
+        std::thread::sleep(Duration::from_secs(1));
+        waited += 1;
+        api.refresh_devices()?;
+    };
+    println!("\n     ✓ {label}\n");
+
+    let dev = api.open_path(&path)?;
+    dev.set_blocking_mode(false).ok();
+
+    let mut dec = opus::Decoder::new(16_000, opus::Channels::Mono)
+        .map_err(|e| anyhow::anyhow!("opus 解码器建不起来：{e}"))?;
+    let mut pcm = vec![0i16; 320 * 6];
+
+    // 跑一段：secs 秒，keepalive 决定要不要每秒重发 MIC_ON。
+    // 返回 (0xF0 帧数, 峰值, RMS, 解码失败数, 见到的其它 report id)
+    let mut run = |dev: &hidapi::HidDevice,
+                   dec: &mut opus::Decoder,
+                   secs: u64,
+                   keepalive: bool,
+                   hint: &str|
+     -> (u32, i32, f64, u32, Vec<u8>) {
+        let (mut frames, mut peak, mut sumsq, mut nsamp, mut errs) = (0u32, 0i32, 0f64, 0u64, 0u32);
+        let mut others: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 128];
+        let start = Instant::now();
+        let mut next_ka = start + Duration::from_secs(1);
+        let mut next_tick = start;
+        while start.elapsed() < Duration::from_secs(secs) {
+            let now = Instant::now();
+            if keepalive && now >= next_ka {
+                let _ = dev.write(&MIC_ON);
+                next_ka += Duration::from_secs(1);
+            }
+            if now >= next_tick {
+                let left = secs - start.elapsed().as_secs().min(secs);
+                print!("\r     {hint}  还剩 {left:>2}s   已收 {frames} 帧   ");
+                std::io::stdout().flush().ok();
+                next_tick += Duration::from_secs(1);
+            }
+            if let Ok(len) = dev.read_timeout(&mut buf, 20) {
+                if len > 0 {
+                    if buf[0] == 0xF0 {
+                        frames += 1;
+                        match dec.decode(&buf[1..len], &mut pcm, false) {
+                            Ok(got) => {
+                                for &v in &pcm[..got] {
+                                    let a = (v as i32).abs();
+                                    if a > peak {
+                                        peak = a;
+                                    }
+                                    sumsq += (v as f64) * (v as f64);
+                                }
+                                nsamp += got as u64;
+                            }
+                            Err(_) => errs += 1,
+                        }
+                    } else if !others.contains(&buf[0]) {
+                        others.push(buf[0]);
+                    }
+                }
+            }
+        }
+        let rms = if nsamp > 0 {
+            (sumsq / nsamp as f64).sqrt()
+        } else {
+            0.0
+        };
+        print!("\r                                                                   \r");
+        (frames, peak, rms, errs, others)
+    };
+
+    // ── ② 静默基线 ──
+    println!("  ② 静默基线（5 秒）—— 请**不要碰遥控器**");
+    let (a_n, ..) = run(&dev, &mut dec, 5, false, "     静默中");
+    println!("     → {a_n} 帧\n");
+
+    // ── ③ 热麦克风 ──
+    println!("  ③ 热麦克风测试（6 秒）—— 发 MIC_ON，仍然**不要碰遥控器**");
+    let _ = dev.write(&MIC_ON);
+    let (b_n, b_pk, ..) = run(&dev, &mut dec, 6, true, "     已发 MIC_ON");
+    let _ = dev.write(&MIC_OFF);
+    println!("     → {b_n} 帧\n");
+
+    // ── ④ 按住 ──
+    println!("  ④ 按住测试（12 秒）—— 请**按住麦克风键，正常音量说话**");
+    println!("     按住 3 秒松开，重复三四次");
+    let (c_n, c_pk, c_rms, c_err, c_other) = run(&dev, &mut dec, 12, false, "     请按住说话");
+    println!("     → {c_n} 帧");
+    if c_n > 0 {
+        let pdb = 20.0 * ((c_pk.max(1) as f64) / 32767.0).log10();
+        let rdb = 20.0 * (c_rms.max(1.0) / 32767.0).log10();
+        println!("       ≈ {:.2}s 音频   RMS {rdb:.1} dBFS   峰值 {pdb:.1} dBFS", c_n as f32 * 0.02);
+        if c_err > 0 {
+            println!("       ⚠ {c_err} 帧解码失败 —— 音频格式可能和官方那台不一样");
+        }
+    }
+    if !c_other.is_empty() {
+        println!("       另见 report {c_other:02X?}");
+    }
+
+    // ── 结论 ──
+    println!("\n  ─────────────────────────────────────────");
+    if b_n > 5 && c_n <= b_n / 4 {
+        println!("  结论：**热麦克风** —— 发 MIC_ON 就一直出流，跟按键无关。");
+        println!("  配置：麦克风键用「点一下」模式即可。");
+    } else if c_n > 5 && b_n <= 5 {
+        println!("  结论：**按住才出流（PTT）** —— MIC_ON 无效，必须按住物理麦克风键。");
+        println!("  配置：麦克风键必须放在**短按槽 + 按住模式**；");
+        println!("        放长按槽会漏掉按下那一下（弹 Spotlight），开头音频也丢。");
+    } else if b_n > 5 && c_n > 5 {
+        println!("  结论：两种都出流。按热麦克风用即可。");
+    } else {
+        println!("  结论：**一帧都没有。** 依次排查：");
+        println!("    · 刚才第 ④ 步真的按住麦克风键了吗（不是点一下）");
+        if app_running {
+            println!("    · 退出 FireVibe.app 再跑一次（两个进程抢同一台设备）");
+        }
+        println!("    · 遥控器是不是「蓝牙连着但 HID 管道死了」—— 重新配对一次");
+        println!("    · 静默基线也是 0 帧属正常；但连按键都收不到就是链路问题");
+    }
+    let _ = dev.write(&MIC_OFF);
+    let _ = b_pk;
+    println!();
     Ok(())
 }
 
@@ -762,9 +990,14 @@ fn run_cli() -> anyhow::Result<()> {
         "--no-voice", "--descriptor", "--probe-all", "--probe-mic", "--keys", "--mic-off-test", "--mic-probe",
         "--adapt", "--map", "--sniff", "--tap", "--watch-mods", "--modcmp", "--mic", "--hold",
         "--run", "--type", "--inputs", "--set-input", "--config", "--battery", "--hid-list",
-        "--loopback-test", "--feed-tone", "--pin-input", "--all", "--collection-test", "--mic-listen", "--no-cmd",
+        "--loopback-test", "--feed-tone", "--pin-input", "--all", "--collection-test", "--mic-listen", "--no-cmd", "--secs", "--mic-check",
     ];
-    if let Some(bad) = args.iter().find(|a| a.starts_with("--") && !KNOWN.contains(&a.as_str())) {
+    if let Some(bad) = args.iter().find(|a| {
+        a.starts_with("--")
+            && !KNOWN.contains(&a.as_str())
+            // 带值的参数按前缀放行，如 --secs=30
+            && !KNOWN.iter().any(|k| a.starts_with(&format!("{k}=")))
+    }) {
         eprintln!("未知选项：{bad}");
         // 用编辑距离挑最接近的做「是不是想输」提示
         fn edit_dist(a: &str, b: &str) -> usize {
@@ -856,6 +1089,16 @@ fn run_cli() -> anyhow::Result<()> {
 
     if has("--mic-listen") {
         return mic_listen();
+
+
+    }
+
+
+
+
+    if has("--mic-check") {
+        return mic_check();
+
 
 
     }

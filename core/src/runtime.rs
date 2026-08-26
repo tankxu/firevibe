@@ -365,6 +365,12 @@ impl Runtime {
     /// 每次启动都调一次：设了就重下（幂等，顺带盖掉上次异常退出的残留），
     /// 没设就清掉。这是进程外的系统状态，不主动收拾会留给用户一颗变成修饰键的按钮。
     pub fn sync_hid_remap(&self) -> Option<String> {
+        // ⚠️ hidremap 有自己的一份 VID/PID（默认是出厂那台 0x0421），映射只对匹配的
+        // 设备生效。以前只有「配对新遥控器」的流程会 set_ids —— 启动时按配置换过
+        // 遥控器的，映射就一直下发给一台没连的设备，麦克风键没被接管、Spotlight 照弹。
+        // 在这里对齐，所有调用点就都对了。
+        let (vid, pid) = self.cfg.read().device_ids();
+        crate::hidremap::set_ids(vid, pid);
         let want = self.cfg.read().mic_remap_key();
         match want {
             Some(k) if !k.is_empty() => match crate::hidremap::apply(&k) {
