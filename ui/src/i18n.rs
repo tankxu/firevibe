@@ -399,8 +399,8 @@ impl L {
     pub fn ir_code_label(&self) -> &'static str { t!(self.0, "红外码", "IR code") }
     pub fn ir_help(&self) -> &'static str {
         t!(self.0,
-           "遥控器自带红外发射管，可以拿来控制电视、音响、投影这类设备。三种都能直接粘，自动识别：Pronto hex（0000 006D …，网上码库最常见）、抓码工具直出的原始数组（9000, 4500, …，默认按 38 kHz）、或我们的 JSON。",
-           "The remote has its own IR emitter — use it for TVs, soundbars, projectors and the like. Paste any of three, auto-detected: Pronto hex (0000 006D …, the most widely published), a raw timing array straight from a capture tool (9000, 4500, … — assumed 38 kHz), or our JSON.")
+           "遥控器自带红外发射管。三种格式都能直接粘，自动识别：Pronto hex（0000 006D …，网上码库最常见）、抓码工具直出的原始数组（9000, 4500, …，默认按 38 kHz）、或我们的 JSON。",
+           "The remote has its own IR emitter. Paste any of three formats, auto-detected: Pronto hex (0000 006D …, the most widely published), a raw timing array straight from a capture tool (9000, 4500, … — assumed 38 kHz), or our JSON.")
     }
     pub fn ir_limits(&self) -> &'static str {
         t!(self.0,

@@ -373,15 +373,17 @@ l.hotkey_tap_hint()
                             .gap(px(12.))
                             .child(
                                 div()
-                                    .flex_1()
+                                    .w(px(110.))
+                                    .flex_none()
                                     .child(field_lab(l.http_retries()))
-                                    .child(input_box(&d.retries_in)),
+                                    .child(num_box(&d.retries_in)),
                             )
                             .child(
                                 div()
-                                    .flex_1()
+                                    .w(px(140.))
+                                    .flex_none()
                                     .child(field_lab(l.http_timeout()))
-                                    .child(input_box(&d.timeout_in)),
+                                    .child(num_box(&d.timeout_in)),
                             ),
                     );
             }
@@ -796,6 +798,7 @@ fn code_field(d: &EditState) -> AnyElement {
 }
 
 /// 和 code_field 一样的外观，但吃任意 InputState（HTTP 那几个字段用）
+/// 长文本输入框（POST 请求体那种）。数字用 `num_box`，别混。
 fn input_box(input: &gpui::Entity<gpui_component::input::InputState>) -> AnyElement {
     div()
         .font_family("Menlo")
@@ -807,6 +810,27 @@ fn input_box(input: &gpui::Entity<gpui_component::input::InputState>) -> AnyElem
         .rounded(px(9.))
         .px(px(12.))
         .py(px(10.))
+        .child(Input::new(input).appearance(false))
+        .into_any_element()
+}
+
+/// 数字输入框（重试次数、超时那种）。
+///
+/// ⚠️ 别拿 `input_box` 凑合 —— 那是给长文本的（`py(10)`），
+/// 装一个「0」会撑得和 URL 框一样高。这里固定 32 高，和旁边按钮一条轴。
+fn num_box(input: &gpui::Entity<gpui_component::input::InputState>) -> AnyElement {
+    div()
+        .h(px(32.))
+        .flex()
+        .items_center()
+        .font_family("Menlo")
+        .text_size(px(12.))
+        .text_color(c(INK))
+        .bg(c(CODE_BG))
+        .border_1()
+        .border_color(c(LINE_STRONG))
+        .rounded(px(R_SM))
+        .px(px(10.))
         .child(Input::new(input).appearance(false))
         .into_any_element()
 }

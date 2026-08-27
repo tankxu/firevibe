@@ -430,7 +430,8 @@ CoreBluetooth 直接可达（和读电量同一条路）。
 - **最多 2 段**原始码（`for i in 0..<2`）
 - 时长是**有符号 int16**（`(short) data`）→ 上限 **32767 µs**
 
-→ 只适合电视/音响那类短码。**空调塞不进去**：Daikin 经典 ARC 每次发 3 帧、
+→ 限制的是**码长**不是设备类型（红外不挑设备）。NEC/RC5 这类短码没问题；
+多帧长码不行 —— **空调塞不进去**：Daikin 经典 ARC 每次发 3 帧、
 帧间隔 25~35 ms。空调交给 StackChan + `IRremoteESP8266` 的编码器，
 抓码规格见 `~/LocalDev/firetv-remote-mac/daikin-capture-spec.md`。
 

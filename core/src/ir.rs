@@ -16,8 +16,9 @@
 //!   - **最多 2 段**（`for i in 0..<2`）
 //!   - 时长是**有符号 int16**（`(short) data`）→ 上限 **32767 µs**
 //!
-//! 所以这套只适合电视/音响那类短码（NEC、RC5 之类）。空调（比如 Daikin 经典
-//! ARC 每次发 3 帧、帧间隔 25~35 ms）塞不进来 —— 详见
+//! 注意限制的是**码长**，不是设备类型 —— 红外不挑设备，能塞进这两条限制的都能发。
+//! NEC / RC5 这类短码没问题；多帧长码不行，比如 Daikin 经典 ARC 每次发 3 帧、
+//! 帧间隔 25~35 ms，两条都超。空调那边的做法详见
 //! `~/LocalDev/firetv-remote-mac/daikin-capture-spec.md`。
 
 use serde::{Deserialize, Serialize};
