@@ -309,30 +309,12 @@ l.hotkey_tap_hint()
                     })
                 };
                 body = body
-                    .child(div().child(field_lab(l.ir_help())))
+                    .child(hint_box(format!("{}\n{}", l.ir_help(), l.ir_limits())))
                     .child(div().child(field_lab(l.ir_code_label())).child(code_field(d)))
                     .when_some(verdict, |b, (ok, msg)| {
-                        b.child(
-                            div()
-                                .px(px(10.))
-                                .py(px(8.))
-                                .rounded(px(R))
-                                .border_1()
-                                .border_color(c(if ok { OK } else { WARN_LINE }))
-                                .bg(c(if ok { OK_SOFT } else { WARN_BG }))
-                                .text_size(px(11.5))
-                                .text_color(c(if ok { OK } else { INK2 }))
-                                .line_height(gpui::relative(1.5))
-                                .child(SharedString::from(msg)),
-                        )
+                        b.child(note_box(msg, if ok { Note::Ok } else { Note::Warn }))
                     })
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(c(INK3))
-                            .line_height(gpui::relative(1.5))
-                            .child(SharedString::from(l.ir_limits())),
-                    );
+                    ;
             }
             ActionType::Http => {
                 let post = d.post;
@@ -392,34 +374,11 @@ l.hotkey_tap_hint()
                 body = body.child(div().child(field_lab(l.text_arg())).child(text_field(d)));
             }
             _ if ptt_note => {
-                body = body.child(
-                    div()
-                        .px(px(12.))
-                        .py(px(10.))
-                        .rounded(px(9.))
-                        .bg(c(WARN_BG))
-                        .border_1()
-                        .border_color(c(WARN_LINE))
-                        .text_size(px(12.))
-                        .text_color(c(INK2))
-                        .line_height(gpui::relative(1.5))
-                        .child(SharedString::from(l.ptt_short_note())),
-                );
+                body = body.child(note_box(l.ptt_short_note(), Note::Warn));
             }
             _ => {
                 // 无 / 语音两种没有参数，用一行说明代替，弹窗高度不至于塌掉
-                body = body.child(
-                    div()
-                        .px(px(12.))
-                        .py(px(10.))
-                        .rounded(px(9.))
-                        .bg(c(CODE_BG))
-                        .border_1()
-                        .border_color(c(LINE))
-                        .text_size(px(12.))
-                        .text_color(c(INK2))
-                        .child(SharedString::from(d.kind.hint())),
-                );
+                body = body.child(hint_box(d.kind.hint()));
                 // 「按住说话」只灌音频、不发任何按键。想让第三方工具跟着一起开录，
                 // 得用「第三方语音输入」—— 这两个的差别不写出来很容易选错。
                 if d.kind == ActionType::VoicePtt {
@@ -783,6 +742,42 @@ fn is_modifier_name(k: &str) -> bool {
     )
 }
 /// 等宽代码框。`tall` 决定是不是 62px 起高。
+/// 弹窗里那种成块的说明/提示。三种语气共用同一套几何，只换配色 ——
+/// 以前各处手抄，padding 和圆角都对不齐。
+#[derive(Clone, Copy, PartialEq)]
+enum Note {
+    /// 中性：解释这个动作是干嘛的
+    Hint,
+    /// 警告：这么配不会生效
+    Warn,
+    /// 成功：校验通过
+    Ok,
+}
+
+fn note_box(text: impl Into<SharedString>, kind: Note) -> AnyElement {
+    let (bg, line, ink) = match kind {
+        Note::Hint => (CODE_BG, LINE, INK2),
+        Note::Warn => (WARN_BG, WARN_LINE, INK2),
+        Note::Ok => (OK_SOFT, OK, OK),
+    };
+    div()
+        .px(px(12.))
+        .py(px(10.))
+        .rounded(px(9.))
+        .bg(c(bg))
+        .border_1()
+        .border_color(c(line))
+        .text_size(px(12.))
+        .text_color(c(ink))
+        .line_height(gpui::relative(1.5))
+        .child(text.into())
+        .into_any_element()
+}
+
+fn hint_box(text: impl Into<SharedString>) -> AnyElement {
+    note_box(text, Note::Hint)
+}
+
 /// 代码类输入框：AppleScript / 命令 / URL / 红外码 —— 等宽字体 + 代码底色。
 /// padding 收到 6：这些内容常常很长，多一分留白就少一分能看见的字符。
 fn code_field(d: &EditState) -> AnyElement {

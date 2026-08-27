@@ -423,7 +423,9 @@ CoreBluetooth 直接可达（和读电量同一条路）。
 一个独立的 CoreBluetooth 小进程（照 `helper/battprobe.swift` 的架子，
 **不能在 app 进程里建 CBCentralManager**，见 battprobe 顶部注释），执行：
 `requestStartNewTable` → 订阅 BLAST → 分块写（200 字节/片）→ `commitBlast`(opcode 5) → 等 notify。
-外层 `compileAction` / `compileAsBlast` 的确切帧格式还没读完（都在反编译产物里）。
+外层帧格式**已经读完并记进 NOTES.md**（动作头 `[type][flags][u16-le len]`、
+表布局、`compileAsBlast` 去掉首字节、三个 GATT 操作的确切字节）——
+反编译产物已删，别再去电视上重拉。
 
 ### 两条硬限制（来自固件，不是我们定的）
 
