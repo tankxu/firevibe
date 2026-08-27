@@ -104,7 +104,11 @@ impl FireVibe {
         let is_ptt = self.rt.cfg.read().settings.mic_model.is_ptt();
         let ptt_short_mic = is_ptt && is_mic && !d.long;
         let ptt_other_key = is_ptt && !is_mic;
-        let hide_voice = ptt_short_mic || ptt_other_key;
+        // 其它按键：静默隐藏语音动作，不挂横幅（音频跟那些键本来就没关系，
+        // 用户不会去那儿找语音，解释一遍反而是噪音）。
+        // 麦克风键短按：四个语音动作**照常列出**，选中时用一行说明代替配置项 ——
+        // 那才是用户真会去点、且需要被告知的地方。
+        let hide_voice = ptt_other_key;
 
         // 动作类型
         let mut types = div().flex().flex_wrap().gap(px(6.));
@@ -167,27 +171,22 @@ impl FireVibe {
             .pt(px(2.))
             .pb(px(18.))
             .child(div().child(field_lab(l.action_type())).child(types))
-            .when(hide_voice, |b| {
-                b.child(
-                    div()
-                        .px(px(10.))
-                        .py(px(8.))
-                        .rounded(px(R))
-                        .border_1()
-                        .border_color(c(WARN_LINE))
-                        .bg(c(WARN_BG))
-                        .text_size(px(11.5))
-                        .text_color(c(INK2))
-                        .line_height(gpui::relative(1.5))
-                        .child(SharedString::from(if ptt_other_key {
-                            l.ptt_other_key_note()
-                        } else {
-                            l.ptt_short_note()
-                        })),
-                )
-            });
+;
+        // 麦克风键的短按上，语音动作在 PTT 遥控器上是摆设（点一下就松手，一帧都不出）。
+        // 保留选项让用户找得到，但把配置区换成一行说明，指向长按。
+        let voice_kind = matches!(
+            d.kind,
+            ActionType::VoicePtt
+                | ActionType::VoiceToggle
+                | ActionType::VoiceDictate
+                | ActionType::VoiceHotkey
+                | ActionType::Record
+        );
+        // 命中就把参数区当成「无」来渲染，兜底分支里换成一行说明
+        let ptt_note = ptt_short_mic && voice_kind;
+
         // 参数区，按类型不同
-        match d.kind {
+        match if ptt_note { ActionType::None } else { d.kind } {
             ActionType::Key => {
                 body = body.child(
                     div()
@@ -298,30 +297,34 @@ l.hotkey_tap_hint()
             ActionType::IrBlast => {
                 // 边填边校验：码对不对、多长、几段，立刻显示。不用点保存才知道。
                 let txt = d.input.read(cx).value().to_string();
-                let (ok, msg) = match firevibe_core::ir::IrCode::parse(&txt) {
-                    Ok(c) => (true, c.summary()),
-                    Err(e) => (false, e),
+                // 空着不报错 —— 刚点进来还没开始填就先甩个警告，纯属添堵。
+                // 「没填」这件事留到保存时再拦（见 save_dialog）。
+                let verdict = if txt.trim().is_empty() {
+                    None
+                } else {
+                    Some(match firevibe_core::ir::IrCode::parse(&txt) {
+                        Ok(c) => (true, format!("{}\n{}", c.summary(), l.ir_not_wired())),
+                        Err(e) => (false, e),
+                    })
                 };
                 body = body
                     .child(div().child(field_lab(l.ir_help())))
                     .child(div().child(field_lab(l.ir_code_label())).child(code_field(d)))
-                    .child(
-                        div()
-                            .px(px(10.))
-                            .py(px(8.))
-                            .rounded(px(R))
-                            .border_1()
-                            .border_color(c(if ok { OK } else { WARN_LINE }))
-                            .bg(c(if ok { OK_SOFT } else { WARN_BG }))
-                            .text_size(px(11.5))
-                            .text_color(c(if ok { OK } else { INK2 }))
-                            .line_height(gpui::relative(1.5))
-                            .child(SharedString::from(if ok {
-                                format!("{msg}\n{}", l.ir_not_wired())
-                            } else {
-                                msg
-                            })),
-                    )
+                    .when_some(verdict, |b, (ok, msg)| {
+                        b.child(
+                            div()
+                                .px(px(10.))
+                                .py(px(8.))
+                                .rounded(px(R))
+                                .border_1()
+                                .border_color(c(if ok { OK } else { WARN_LINE }))
+                                .bg(c(if ok { OK_SOFT } else { WARN_BG }))
+                                .text_size(px(11.5))
+                                .text_color(c(if ok { OK } else { INK2 }))
+                                .line_height(gpui::relative(1.5))
+                                .child(SharedString::from(msg)),
+                        )
+                    })
                     .child(
                         div()
                             .text_size(px(11.))
@@ -384,6 +387,21 @@ l.hotkey_tap_hint()
             }
             ActionType::Text => {
                 body = body.child(div().child(field_lab(l.text_arg())).child(code_field(d)));
+            }
+            _ if ptt_note => {
+                body = body.child(
+                    div()
+                        .px(px(12.))
+                        .py(px(10.))
+                        .rounded(px(9.))
+                        .bg(c(WARN_BG))
+                        .border_1()
+                        .border_color(c(WARN_LINE))
+                        .text_size(px(12.))
+                        .text_color(c(INK2))
+                        .line_height(gpui::relative(1.5))
+                        .child(SharedString::from(l.ptt_short_note())),
+                );
             }
             _ => {
                 // 无 / 语音两种没有参数，用一行说明代替，弹窗高度不至于塌掉
@@ -527,6 +545,14 @@ l.hotkey_tap_hint()
     /// 保存弹窗
     fn save_dialog(&mut self, cx: &mut Context<Self>) {
         let Some(a) = self.build_action(cx) else { return };
+        // 红外码在这儿才拦：编辑时空着不报错，但空着/写错了不给存 —— 存进去
+        // 也是个按下去只会报错的死动作。
+        if a.kind == ActionType::IrBlast {
+            if let Err(e) = firevibe_core::ir::IrCode::parse(&a.arg) {
+                self.toast(e);
+                return;
+            }
+        }
         let Some(d) = &self.dialog else { return };
         let (slot, long) = (d.slot, d.long);
         {
