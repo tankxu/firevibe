@@ -275,6 +275,42 @@ impl IrCode {
     }
 }
 
+// ───────────────────── 编译成遥控器要的「一次性发射表」 ─────────────────────
+
+/// `KeyMapActionType.IR_CODE_RAW`
+const ACTION_IR_RAW: u8 = 3;
+
+impl IrCode {
+    /// 单个动作：`[u8 类型][u8 标志][u16-le 载荷长度][载荷]`
+    /// 对应固件 `KeyMapAction.compileAction()`。
+    pub fn compile_action(&self) -> Result<Vec<u8>, String> {
+        let payload = self.compile_payload()?;
+        let mut out = vec![ACTION_IR_RAW, self.repeat_flags()];
+        out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        out.extend_from_slice(&payload);
+        Ok(out)
+    }
+
+    /// 一次性发射表（写进 BLAST 特征的那份）。
+    ///
+    /// 整张表的布局是：
+    /// ```text
+    /// [u8 行数][u8 scanId][u8 该行动作数][u16-le 动作字节总长][动作们…]
+    /// ```
+    /// 而 `compileAsBlast()` 把**第一个字节（行数）去掉** —— 所以这里直接从
+    /// scanId 开始拼，不写行数。
+    ///
+    /// `scan_id` 是这一行挂在哪个物理键上。一次性发射不经过按键，理论上无所谓，
+    /// 但格式要求有这么一个字节。
+    pub fn compile_blast(&self, scan_id: u8) -> Result<Vec<u8>, String> {
+        let action = self.compile_action()?;
+        let mut out = vec![scan_id, 1];
+        out.extend_from_slice(&(action.len() as u16).to_le_bytes());
+        out.extend_from_slice(&action);
+        Ok(out)
+    }
+}
+
 // ─────────────────────── 原始 µs 列表（ESP32 抓码直出）───────────────────────
 
 impl IrCode {
@@ -319,6 +355,11 @@ impl IrCode {
         Ok(code)
     }
 
+    /// 存进动作的文本形态。带上 label / 频率 / 重复这些 Pronto 和裸列表表达不了的字段。
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
     /// 反过来导成 Pronto hex —— 便携格式，可以存档或者贴到别的工具里。
     /// 和 `from_pronto` 是同一套换算，只是反着来。
     pub fn to_pronto(&self) -> String {
@@ -350,6 +391,34 @@ mod tests {
             toggle_bitmask: 0,
             repeat_type: "basic".into(),
         }
+    }
+
+    #[test]
+    fn 动作头是_类型_标志_长度() {
+        let a = nec_power().compile_action().unwrap();
+        assert_eq!(a[0], 3, "IR_CODE_RAW");
+        assert_eq!(a[1], 0, "Basic 的标志位是 0");
+        let len = u16::from_le_bytes([a[2], a[3]]) as usize;
+        assert_eq!(len, a.len() - 4, "长度字段要等于后面载荷的长度");
+    }
+
+    #[test]
+    fn 标志位跟着重复类型走() {
+        let mut c = nec_power();
+        c.repeat_type = "toggle".into();
+        assert_eq!(c.compile_action().unwrap()[1], 16);
+    }
+
+    #[test]
+    fn blast_表不带行数字节() {
+        let c = nec_power();
+        let action = c.compile_action().unwrap();
+        let t = c.compile_blast(7).unwrap();
+        assert_eq!(t[0], 7, "scanId");
+        assert_eq!(t[1], 1, "一行一个动作");
+        assert_eq!(u16::from_le_bytes([t[2], t[3]]) as usize, action.len());
+        assert_eq!(&t[4..], &action[..], "动作原样跟在后面");
+        assert_eq!(t.len(), 4 + action.len(), "不含「行数」那个字节");
     }
 
     #[test]

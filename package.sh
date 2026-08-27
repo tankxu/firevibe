@@ -123,6 +123,7 @@ if xcrun --find swiftc >/dev/null 2>&1; then
   # 前者 TCC 归责到 FireVibe，用它那一份蓝牙授权；后者会变成一个独立身份，
   # 需要用户再点一次「BattProbe 想使用蓝牙」，而且名字莫名其妙。
   xcrun swiftc -O -o "$APP/Contents/MacOS/battprobe" helper/battprobe.swift
+  xcrun swiftc -O -o "$APP/Contents/MacOS/irblast" helper/irblast.swift
   echo "▸ 已带上电量辅助程序"
 else
   echo "  (没有 swiftc，跳过电量辅助程序)"

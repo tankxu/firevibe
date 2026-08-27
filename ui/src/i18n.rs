@@ -396,6 +396,9 @@ impl L {
     pub fn pair_rescan(&self) -> &'static str { t!(self.0, "重新扫描", "Rescan") }
     // ── 红外遥控 ──
     pub fn dsc_ir(&self) -> &'static str { t!(self.0, "红外遥控", "IR remote") }
+    pub fn ir_lib_label(&self) -> &'static str { t!(self.0, "从内置码库找（搜品牌或型号）", "Find in the built-in library (search brand or model)") }
+    pub fn ir_lib_back(&self) -> &'static str { t!(self.0, "← 换设备", "← Back") }
+    pub fn ir_lib_none(&self) -> &'static str { t!(self.0, "没搜到。换个写法试试，比如只写品牌。", "No match — try just the brand.") }
     pub fn ir_code_label(&self) -> &'static str { t!(self.0, "红外码", "IR code") }
     pub fn ir_help(&self) -> &'static str {
         t!(self.0,
@@ -409,8 +412,8 @@ impl L {
     }
     pub fn ir_not_wired(&self) -> &'static str {
         t!(self.0,
-           "发射通道还没接通 —— 现在只校验码对不对",
-           "Transmit path isn't wired up yet — this only validates the code for now")
+           "码没问题。按下那个键就会让遥控器打出去 —— 对准设备试试。",
+           "Code looks good. Pressing that key makes the remote fire it — aim at the device and try.")
     }
 
     // ── PTT 遥控器提醒 ──

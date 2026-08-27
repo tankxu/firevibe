@@ -37,6 +37,12 @@ pub fn needs_bluetooth_permission() -> bool {
 }
 
 /// 忘掉已读到的电量（换遥控器时调）—— 否则界面会显示上一个设备的陈旧值
+/// 当前蓝牙目标设备名。红外发射也要按名字找同一台外设，共用这一个来源，
+/// 换遥控器时不会有一处忘了更新。
+pub fn target_name() -> String {
+    TARGET.lock().ok().map(|t| t.clone()).unwrap_or_default()
+}
+
 pub fn forget() {
     LEVEL.store(-1, Ordering::Relaxed);
 }

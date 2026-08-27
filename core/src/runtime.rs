@@ -1893,6 +1893,25 @@ fn record_battery(status: &Arc<Status>, cfg: &Arc<RwLock<Config>>, b: i32, how: 
 /// 所以录音只能跟着按住的那段时间走，配在麦克风键上才有意义。
 ///
 /// 录的是遥控器麦克风解码后的 PCM（和听写共用同一路），不碰系统输入设备。
+/// irblast 小进程的位置。和 battprobe 一样在可执行文件旁边；
+/// `FIREVIBE_IRBLAST` 可以指到别处，方便改了 helper 不用整包重签。
+fn ir_blaster_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("FIREVIBE_IRBLAST") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let p = exe.with_file_name("irblast");
+    p.is_file().then_some(p)
+}
+
+/// 发红外要按名字找蓝牙外设。用电量那边同一个目标名，换遥控器时会跟着更新。
+fn ir_device_name() -> String {
+    crate::battery::target_name()
+}
+
 /// 让遥控器打一发红外。
 ///
 /// 现在只做到**校验 + 编译**：把用户配的码解析出来、按固件的格式编译成载荷，
@@ -1914,14 +1933,44 @@ fn ir_blast(tx: &Sender<Event>, act: &Action) -> String {
                 let _ = tx.send(Event::Log(m.clone()));
                 m
             }
-            Ok(payload) => {
-                let _ = tx.send(Event::Log(format!(
-                    "红外码没问题（{}，载荷 {} 字节），但发射通道还没接通",
-                    code.summary(),
-                    payload.len()
-                )));
-                "红外发射通道还没接通".into()
-            }
+            Ok(_) => match code.compile_blast(0) {
+                Err(e) => {
+                    let m = format!("红外表编译失败：{e}");
+                    let _ = tx.send(Event::Log(m.clone()));
+                    m
+                }
+                Ok(table) => {
+                    // 交给独立小进程走 GATT（在本进程里建 CBCentralManager 不回调，
+                    // 和 battprobe 同一个坑）。异步跑，别卡住按键分发。
+                    let name = ir_device_name();
+                    let hex: String = table.iter().map(|b| format!("{b:02x}")).collect();
+                    let tx2 = tx.clone();
+                    let sum = code.summary();
+                    std::thread::spawn(move || {
+                        let Some(exe) = ir_blaster_path() else {
+                            let _ = tx2.send(Event::Log("找不到 irblast，重新打包一次".into()));
+                            return;
+                        };
+                        match std::process::Command::new(exe).arg(&name).arg(&hex).output() {
+                            Ok(o) if o.status.success() => {
+                                let _ = tx2.send(Event::Log(format!("红外已发射 · {sum}")));
+                            }
+                            Ok(o) => {
+                                let err = String::from_utf8_lossy(&o.stderr);
+                                let last = err.lines().last().unwrap_or("").to_string();
+                                let _ = tx2.send(Event::Log(format!(
+                                    "红外发射失败（退出码 {:?}）：{last}",
+                                    o.status.code()
+                                )));
+                            }
+                            Err(e) => {
+                                let _ = tx2.send(Event::Log(format!("红外发射起不来：{e}")));
+                            }
+                        }
+                    });
+                    format!("红外发射 · {}", code.summary())
+                }
+            },
         },
     }
 }

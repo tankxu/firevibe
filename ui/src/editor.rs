@@ -56,6 +56,8 @@ impl FireVibe {
             // 说没见过双击触发，所以只作为可选项留着，不当默认。
             dbl: a.arg == "double",
             input,
+            ir_q: new_line_input("", window, cx),
+            ir_pick: None,
             post: a.method.eq_ignore_ascii_case("POST"),
             body_in,
             retries_in,
@@ -314,6 +316,7 @@ l.hotkey_tap_hint()
                 };
                 body = body
                     .child(hint_box(format!("{}\n{}", l.ir_help(), l.ir_limits())))
+                    .child(ir_library(d, l, cx))
                     .child(div().child(field_lab(l.ir_code_label())).child(code_field(d)))
                     .when_some(verdict, |b, (ok, msg)| {
                         b.child(note_box(msg, if ok { Note::Ok } else { Note::Warn }))
@@ -780,6 +783,111 @@ fn note_box(text: impl Into<SharedString>, kind: Note) -> AnyElement {
 
 fn hint_box(text: impl Into<SharedString>) -> AnyElement {
     note_box(text, Note::Hint)
+}
+
+/// 内置红外码库的搜索区：搜品牌/型号 → 选设备 → 点按键，码直接灌进上面的输入框。
+///
+/// 为什么值得做：用户手上大概率只有「我家是大金空调」这点信息，让他去网上找
+/// Pronto 码、或者搬个 ESP32 来抓，门槛太高。库里 1400 多个设备两万多条码，
+/// 搜一下点一下就完事。
+fn ir_library(d: &EditState, l: crate::i18n::L, cx: &mut Context<FireVibe>) -> AnyElement {
+    let q = d.ir_q.read(cx).value().to_string();
+
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .child(field_lab(l.ir_lib_label()))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .h(px(32.))
+                .px(px(6.))
+                .rounded(px(R_SM))
+                .bg(c(SURFACE))
+                .border_1()
+                .border_color(c(LINE_STRONG))
+                .text_size(px(13.))
+                .text_color(c(INK))
+                .child(Input::new(&d.ir_q).appearance(false)),
+        );
+
+    // 选中某个设备后列它的按键；否则列搜索结果
+    if let Some(idx) = d.ir_pick {
+        let btns = firevibe_core::irdb::buttons_of(idx);
+        let mut row = div().flex().flex_wrap().gap(px(5.));
+        row = row.child(
+            chip_sm("ir-back", l.ir_lib_back(), false).on_click(cx.listener(|this, _, _, cx| {
+                if let Some(d) = &mut this.dialog {
+                    d.ir_pick = None;
+                }
+                cx.notify();
+            })),
+        );
+        for (i, (name, src)) in btns.into_iter().enumerate() {
+            // 合成出来的标一下来源，万一发不出去用户知道该去抓真码
+            let label = if src == "raw" { name } else { format!("{name} ·{src}") };
+            row = row.child(chip_sm(("ir-btn", i), label, false).on_click(cx.listener(
+                move |this, _, window, cx| {
+                    let Some(code) = firevibe_core::irdb::code_of(idx, i) else { return };
+                    let text = code.to_json();
+                    if let Some(d) = &this.dialog {
+                        d.input.update(cx, |s, cx| s.set_value(&text, window, cx));
+                    }
+                    cx.notify();
+                },
+            )));
+        }
+        col = col.child(row);
+    } else if !q.trim().is_empty() {
+        let hits = firevibe_core::irdb::search(&q, 8);
+        if hits.is_empty() {
+            col = col.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(c(INK3))
+                    .child(SharedString::from(l.ir_lib_none())),
+            );
+        }
+        for h in hits {
+            let idx = h.idx;
+            col = col.child(
+                div()
+                    .id(("ir-hit", idx))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(R_SM))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(c(HOVER)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(px(12.5))
+                            .text_color(c(INK))
+                            .child(SharedString::from(format!("{} {}", h.brand, h.model))),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.))
+                            .text_color(c(INK3))
+                            .child(SharedString::from(format!("{} · {} 键", h.category, h.buttons))),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(d) = &mut this.dialog {
+                            d.ir_pick = Some(idx);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+    }
+    col.into_any_element()
 }
 
 /// 代码类输入框：AppleScript / 命令 / URL / 红外码 —— 等宽字体 + 代码底色。

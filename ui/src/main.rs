@@ -81,6 +81,10 @@ pub struct EditState {
     pub focus: gpui::FocusHandle,
     /// 正在等你按组合键
     pub recording: bool,
+    /// 红外：内置码库的搜索框
+    pub ir_q: Entity<InputState>,
+    /// 红外：搜索结果里选中的设备（库里的下标），选了才列按键
+    pub ir_pick: Option<usize>,
     /// 录制期间的 tap 会话。走 tap 而不是窗口事件 —— 要录的组合键
     /// 可能已经被别的软件注册成全局热键，那样窗口这边永远收不到。
     /// drop 即停止（键盘恢复正常）。
