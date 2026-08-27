@@ -27,7 +27,12 @@ pub const MAX_DURATION_US: i32 = 32767;
 /// 设备侧最多接受几段原始码
 pub const MAX_SEQUENCES: usize = 2;
 
-/// 一条红外码。字段名和抓码侧的 JSON 对齐，用户直接粘贴即可。
+/// 一条红外码。
+///
+/// 这个 JSON **不是什么标准**，字段名照 Fire TV 固件的参数起的，只在我们自己这儿通用。
+/// 业界发布量最大的是 **Pronto hex（CCF）** —— 见 `from_pronto`，`parse` 会自动识别。
+/// 其它常见格式（Broadlink base64 / ESPHome / Flipper .ir / LIRC conf）都能先转成
+/// Pronto 或原始 µs 列表再进来。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct IrCode {
     /// 备注名，只给界面看
@@ -73,6 +78,11 @@ impl IrCode {
         let s = s.trim();
         if s.is_empty() {
             return Err("还没填红外码".into());
+        }
+        // 两种都收：我们自己的 JSON，和业界发布量最大的 Pronto hex。
+        // 不给用户加一个「格式」下拉框 —— 看第一个字符就知道是哪种。
+        if !s.starts_with('{') {
+            return Self::from_pronto(s);
         }
         let code: IrCode =
             serde_json::from_str(s).map_err(|e| format!("JSON 解析失败：{e}"))?;
@@ -161,6 +171,85 @@ impl IrCode {
     }
 }
 
+// ─────────────────────────── Pronto hex (CCF) ───────────────────────────
+
+/// Pronto 每个「载波周期」单位对应的微秒数。频率 = 1000000 / (k × 该常数)。
+const PRONTO_TICK_US: f64 = 0.241246;
+
+impl IrCode {
+    /// 解析 Pronto hex（CCF）。
+    ///
+    /// ```text
+    /// 0000 006D 0022 0002 | <once 序列> <repeat 序列>
+    ///   │     │    │    └─ repeat 段的脉冲对数
+    ///   │     │    └────── once（首发）段的脉冲对数
+    ///   │     └─────────── 载波因子 k
+    ///   └───────────────── 0000 = 原始码（0100 是预定义协议，我们不支持）
+    /// ```
+    /// 之后每个词是一段电平的长度，单位是**载波周期数**，乘周期换成微秒。
+    ///
+    /// 为什么优先支持它：发布量最大的红外码格式（RemoteCentral / irdb / 厂商文档），
+    /// 而且 **once + repeat 正好两段**，和遥控器固件的 `l[长度0][长度1]` 一一对应 ——
+    /// 那个格式看起来本来就是照 Pronto 的形状设计的。
+    pub fn from_pronto(src: &str) -> Result<Self, String> {
+        let words: Vec<u32> = src
+            .split_whitespace()
+            .map(|w| {
+                u32::from_str_radix(w.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("「{w}」不是十六进制"))
+            })
+            .collect::<Result<_, _>>()?;
+        if words.len() < 4 {
+            return Err("Pronto 码至少要 4 个词".into());
+        }
+        if words[0] != 0 {
+            return Err(format!(
+                "只支持原始码（首词 0000），这条是 {:04X} —— 预定义协议那种得先转成原始码",
+                words[0]
+            ));
+        }
+        let k = words[1];
+        if k == 0 {
+            return Err("载波因子是 0".into());
+        }
+        let period = k as f64 * PRONTO_TICK_US;
+        let freq = (1_000_000.0 / period).round() as u32;
+
+        let (n_once, n_rep) = (words[2] as usize, words[3] as usize);
+        let need = 4 + (n_once + n_rep) * 2;
+        if words.len() < need {
+            return Err(format!(
+                "词数不够：头部声明 {n_once} + {n_rep} 对，需要 {need} 个词，实际 {}",
+                words.len()
+            ));
+        }
+        let to_us = |ws: &[u32]| -> Vec<i32> {
+            ws.iter().map(|&w| (w as f64 * period).round() as i32).collect()
+        };
+        let mut sequences = Vec::new();
+        if n_once > 0 {
+            sequences.push(to_us(&words[4..4 + n_once * 2]));
+        }
+        if n_rep > 0 {
+            let a = 4 + n_once * 2;
+            sequences.push(to_us(&words[a..a + n_rep * 2]));
+        }
+
+        let code = IrCode {
+            label: String::new(),
+            frequency: freq,
+            duty_cycle: default_duty(), // Pronto 不带占空比
+            sequences,
+            repeat: 0,
+            post_delay_ms: 0,
+            toggle_bitmask: 0,
+            repeat_type: default_repeat_type(),
+        };
+        code.validate()?;
+        Ok(code)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +265,45 @@ mod tests {
             toggle_bitmask: 0,
             repeat_type: "basic".into(),
         }
+    }
+
+    #[test]
+    fn pronto_换算频率和时长() {
+        // k=0x6D=109 → 周期 26.2958 µs → 38 kHz；2 对 once + 1 对 repeat
+        let c = IrCode::from_pronto("0000 006D 0002 0001 0056 0015 0016 0015 0016 0400")
+            .unwrap();
+        assert!((c.frequency as i32 - 38028).abs() < 30, "频率 {}", c.frequency);
+        assert_eq!(c.sequences.len(), 2, "once + repeat 正好两段");
+        assert_eq!(c.sequences[0].len(), 4);
+        assert_eq!(c.sequences[1].len(), 2);
+        assert!((c.sequences[0][0] - 2261).abs() <= 1, "{:?}", c.sequences[0]);
+        assert!((c.sequences[1][1] - 26927).abs() <= 2, "{:?}", c.sequences[1]);
+    }
+
+    #[test]
+    fn pronto_只有_once_段() {
+        let c = IrCode::from_pronto("0000 006D 0001 0000 0056 0015").unwrap();
+        assert_eq!(c.sequences.len(), 1);
+    }
+
+    #[test]
+    fn pronto_预定义协议要说清不支持() {
+        let e = IrCode::from_pronto("0100 006D 0000 0001 0000 0000").unwrap_err();
+        assert!(e.contains("原始码"), "{e}");
+    }
+
+    #[test]
+    fn pronto_词数不够要报出来() {
+        let e = IrCode::from_pronto("0000 006D 0004 0000 0056 0015").unwrap_err();
+        assert!(e.contains("词数不够"), "{e}");
+    }
+
+    #[test]
+    fn parse_自动识别_pronto_和_json() {
+        assert!(IrCode::parse("0000 006D 0001 0000 0056 0015").is_ok());
+        assert!(IrCode::parse(r#"{"frequency":38000,"sequences":[[560,560]]}"#).is_ok());
+        // 既不像 JSON 也不像 hex → 按 Pronto 报错，信息要具体
+        assert!(IrCode::parse("hello world").unwrap_err().contains("不是十六进制"));
     }
 
     #[test]

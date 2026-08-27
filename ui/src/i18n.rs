@@ -396,11 +396,11 @@ impl L {
     pub fn pair_rescan(&self) -> &'static str { t!(self.0, "重新扫描", "Rescan") }
     // ── 红外遥控 ──
     pub fn dsc_ir(&self) -> &'static str { t!(self.0, "红外遥控", "IR remote") }
-    pub fn ir_code_label(&self) -> &'static str { t!(self.0, "红外码（JSON）", "IR code (JSON)") }
+    pub fn ir_code_label(&self) -> &'static str { t!(self.0, "红外码", "IR code") }
     pub fn ir_help(&self) -> &'static str {
         t!(self.0,
-           "遥控器自带红外发射管，可以拿来控制电视、音响、投影这类设备。把抓到的码按下面的格式粘进来：",
-           "The remote has its own IR emitter — use it for TVs, soundbars, projectors and the like. Paste a captured code in this shape:")
+           "遥控器自带红外发射管，可以拿来控制电视、音响、投影这类设备。粘 Pronto hex（0000 006D … 那种，网上码库最常见）或我们的 JSON 都行，自动识别。",
+           "The remote has its own IR emitter — use it for TVs, soundbars, projectors and the like. Paste either Pronto hex (0000 006D …, the most widely published format) or our JSON — both are auto-detected.")
     }
     pub fn ir_limits(&self) -> &'static str {
         t!(self.0,
