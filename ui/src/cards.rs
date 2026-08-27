@@ -740,9 +740,9 @@ pub fn new_input(
     let t = text.to_string();
     // auto_grow 而不是 multi_line：multi_line 模式的输入框是 h_full，
     // 外层没给固定高度时会塌成一行，长脚本被截断看不见。
-    // auto_grow(2, 8) 正好等于设计稿 `.code-input{min-height:62px}` 的两行起高，
-    // 内容多了自己长高，最多八行。
-    cx.new(|cx| InputState::new(window, cx).auto_grow(2, 8).default_value(t))
+    // **一行起**，内容多了自己长高，最多八行 —— 原来是两行起（对着设计稿的
+    // min-height:62px），结果连「打开应用」这种填一个 bundle id 的框都虚高一截。
+    cx.new(|cx| InputState::new(window, cx).auto_grow(1, 8).default_value(t))
 }
 
 /// 单行输入框（方案改名这类短文本用，不要 auto_grow 的多行）

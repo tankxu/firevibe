@@ -1,6 +1,6 @@
 //! 编辑操作弹窗。改的是临时状态，点保存才写回配置。
 
-use crate::cards::{new_input, to_action};
+use crate::cards::{new_input, to_action, new_line_input};
 use crate::theme::*;
 use crate::widget::*;
 use crate::{EditState, FireVibe};
@@ -38,8 +38,9 @@ impl FireVibe {
 
         let input = new_input(&a.arg, window, cx);
         let body_in = new_input(&a.body, window, cx);
-        let retries_in = new_input(&a.retries.to_string(), window, cx);
-        let timeout_in = new_input(
+        // 数字用真单行 —— new_input 是 auto_grow 的，装一个「0」也会占掉多行的高度
+        let retries_in = new_line_input(&a.retries.to_string(), window, cx);
+        let timeout_in = new_line_input(
             &(if a.timeout_ms > 0 { a.timeout_ms } else { 2000 }).to_string(),
             window,
             cx,
@@ -284,7 +285,7 @@ l.hotkey_tap_hint()
             }
             ActionType::OpenApp => {
                 body = body
-                    .child(div().child(field_lab(l.app_target())).child(code_field(d)))
+                    .child(div().child(field_lab(l.app_target())).child(text_field(d)))
                     .child(
                         div()
                             .child(field_lab(l.presets()))
@@ -388,7 +389,7 @@ l.hotkey_tap_hint()
                     );
             }
             ActionType::Text => {
-                body = body.child(div().child(field_lab(l.text_arg())).child(code_field(d)));
+                body = body.child(div().child(field_lab(l.text_arg())).child(text_field(d)));
             }
             _ if ptt_note => {
                 body = body.child(
@@ -782,6 +783,8 @@ fn is_modifier_name(k: &str) -> bool {
     )
 }
 /// 等宽代码框。`tall` 决定是不是 62px 起高。
+/// 代码类输入框：AppleScript / 命令 / URL / 红外码 —— 等宽字体 + 代码底色。
+/// padding 收到 6：这些内容常常很长，多一分留白就少一分能看见的字符。
 fn code_field(d: &EditState) -> AnyElement {
     div()
         .font_family("Menlo")
@@ -790,15 +793,31 @@ fn code_field(d: &EditState) -> AnyElement {
         .bg(c(CODE_BG))
         .border_1()
         .border_color(c(LINE_STRONG))
-        .rounded(px(9.))
-        .px(px(12.))
-        .py(px(10.))
+        .rounded(px(R_SM))
+        .px(px(6.))
+        .py(px(6.))
+        .child(Input::new(&d.input).appearance(false))
+        .into_any_element()
+}
+
+/// 普通文本输入框：要输入的文字 / 应用名 —— 用界面字体和常规底色，
+/// 一眼能和上面那种「这里填代码」区分开。
+fn text_field(d: &EditState) -> AnyElement {
+    div()
+        .text_size(px(13.))
+        .text_color(c(INK))
+        .bg(c(SURFACE))
+        .border_1()
+        .border_color(c(LINE_STRONG))
+        .rounded(px(R_SM))
+        .px(px(6.))
+        .py(px(6.))
         .child(Input::new(&d.input).appearance(false))
         .into_any_element()
 }
 
 /// 和 code_field 一样的外观，但吃任意 InputState（HTTP 那几个字段用）
-/// 长文本输入框（POST 请求体那种）。数字用 `num_box`，别混。
+/// 长文本输入框（POST 请求体那种，内容通常是 JSON）。数字用 `num_box`，别混。
 fn input_box(input: &gpui::Entity<gpui_component::input::InputState>) -> AnyElement {
     div()
         .font_family("Menlo")
@@ -807,9 +826,9 @@ fn input_box(input: &gpui::Entity<gpui_component::input::InputState>) -> AnyElem
         .bg(c(CODE_BG))
         .border_1()
         .border_color(c(LINE_STRONG))
-        .rounded(px(9.))
-        .px(px(12.))
-        .py(px(10.))
+        .rounded(px(R_SM))
+        .px(px(6.))
+        .py(px(6.))
         .child(Input::new(input).appearance(false))
         .into_any_element()
 }
@@ -830,7 +849,7 @@ fn num_box(input: &gpui::Entity<gpui_component::input::InputState>) -> AnyElemen
         .border_1()
         .border_color(c(LINE_STRONG))
         .rounded(px(R_SM))
-        .px(px(10.))
+        .px(px(6.))
         .child(Input::new(input).appearance(false))
         .into_any_element()
 }
