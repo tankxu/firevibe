@@ -138,7 +138,11 @@ impl FireVibe {
             // 挑不出来哪些跟语音有关，图标比高亮好认。
             let voiced = matches!(
                 k,
-                ActionType::VoicePtt | ActionType::VoiceHotkey | ActionType::VoiceDictate
+                ActionType::VoicePtt
+                    | ActionType::VoiceHotkey
+                    | ActionType::VoiceDictate
+                    | ActionType::VoiceToggle
+                    | ActionType::Record
             );
             let el = if voiced {
                 chip_icon(("kind", k as usize), k.label(), k == d.kind, "mic", MIC_MARK)

@@ -404,8 +404,8 @@ impl L {
     }
     pub fn ir_limits(&self) -> &'static str {
         t!(self.0,
-           "限制来自遥控器固件：最多 2 段，每个时长 ≤ 32767 µs。空调那种多帧长码放不下。",
-           "Limits come from the remote's firmware: at most 2 sequences, each duration ≤ 32767 µs. Multi-frame A/C codes won't fit.")
+           "限制来自遥控器固件：最多 2 段（Pronto 的 intro/repeat），单个时长 ≤ 32767 µs。多帧长码（比如空调）编成一段连续序列就行，帧间隔当长 space。",
+           "Limits come from the remote's firmware: at most 2 sequences (Pronto's intro/repeat) and each single duration ≤ 32767 µs. Multi-frame codes (A/C) fit as one continuous sequence — inter-frame gaps are just long spaces.")
     }
     pub fn ir_not_wired(&self) -> &'static str {
         t!(self.0,
