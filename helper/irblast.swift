@@ -89,6 +89,18 @@ let CTRL_COMMIT_BLAST: UInt8 = 5
 
 var gotState = false
 
+/// 退出前一定要断开。连了不断，攒上十几个会话之后设备就开始拒收所有写入
+/// （CONTROL 报 Unknown ATT error），只能等它自己回收或者按一下遥控器唤醒。
+/// 这是实测踩到的，别删。
+func bail(_ code: Int32) -> Never {
+    if let p = liveConn.0, let c = liveConn.1 {
+        c.cancelPeripheralConnection(p)
+        Thread.sleep(forTimeInterval: 0.15)
+    }
+    exit(code)
+}
+var liveConn: (CBPeripheral?, CBCentralManager?) = (nil, nil)
+
 final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var central: CBCentralManager!
     // ⚠️ 必须持有外设，否则 didConnect 永远不来（battprobe 踩过）
@@ -103,13 +115,13 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         gotState = true
         guard c.state == .poweredOn else {
             note("蓝牙没开或没授权 state=\(c.state.rawValue)")
-            exit(2)
+            bail(2)
         }
         let all = c.retrieveConnectedPeripherals(withServices: [SVC])
         let hit = all.filter { ($0.name ?? "").contains(wantName) }
         guard let p = hit.first else {
             note("没找到名字含「\(wantName)」且带 KeyMap 服务的设备（在线的：\(all.map { $0.name ?? "?" })）")
-            exit(3)
+            bail(3)
         }
         targets = [p]
         p.delegate = self
@@ -117,13 +129,14 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
+        liveConn = (p, c)
         p.discoverServices([SVC])
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverServices e: Error?) {
         guard let s = (p.services ?? []).first(where: { $0.uuid == SVC }) else {
             note("这台设备没有 KeyMap 服务")
-            exit(4)
+            bail(4)
         }
         p.discoverCharacteristics([CTRL, BLAST], for: s)
     }
@@ -135,9 +148,20 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         }
         guard let ctrl, let blast else {
             note("KeyMap 服务里缺 CONTROL 或 BLAST 特征")
-            exit(4)
+            bail(4)
         }
         p.setNotifyValue(true, for: blast)
+        // --reset：只发一个裸 [2]（RESET_STAGING_TABLE）把暂存表状态机复位。
+        // 会话没走完就退出会让设备后续拒收（写 CONTROL 报 Unknown ATT error）。
+        if args.contains("--reset") {
+            note("复位暂存表")
+            p.writeValue(Data([CTRL_START_TABLE]), for: ctrl, type: .withResponse)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                print("RESET")
+                bail(0)
+            }
+            return
+        }
         // --ctx：先发一次上下文切换（控制码 1）。电视配对后也走这一步（日志里的
         // state_switch），可能是 blast 的前置条件。
         if args.contains("--ctx") {
@@ -161,7 +185,7 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     func peripheral(_ p: CBPeripheral, didWriteValueFor ch: CBCharacteristic, error e: Error?) {
         if let e {
             note("写 \(ch.uuid.uuidString) 失败：\(e.localizedDescription)")
-            exit(5)
+            bail(5)
         }
         guard let ctrl, let blast else { return }
 
@@ -207,11 +231,11 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         // 0x00 是「还没结果」，继续等 —— 别一读到就判失败。
         if first == 2 {
             print("OK")
-            exit(0)
+            bail(0)
         }
         if first != 0 {
             note("设备回了 0x\(String(format: "%02X", first))（成功应该是 0x02）")
-            exit(6)
+            bail(6)
         }
         lastSeen = first
     }
