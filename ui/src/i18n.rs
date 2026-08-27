@@ -394,6 +394,25 @@ impl L {
     pub fn pair_likely(&self) -> &'static str { t!(self.0, "像遥控器", "likely remote") }
     pub fn pair_current(&self) -> &'static str { t!(self.0, "当前", "current") }
     pub fn pair_rescan(&self) -> &'static str { t!(self.0, "重新扫描", "Rescan") }
+    // ── 红外遥控 ──
+    pub fn dsc_ir(&self) -> &'static str { t!(self.0, "红外遥控", "IR remote") }
+    pub fn ir_code_label(&self) -> &'static str { t!(self.0, "红外码（JSON）", "IR code (JSON)") }
+    pub fn ir_help(&self) -> &'static str {
+        t!(self.0,
+           "遥控器自带红外发射管，可以拿来控制电视、音响、投影这类设备。把抓到的码按下面的格式粘进来：",
+           "The remote has its own IR emitter — use it for TVs, soundbars, projectors and the like. Paste a captured code in this shape:")
+    }
+    pub fn ir_limits(&self) -> &'static str {
+        t!(self.0,
+           "限制来自遥控器固件：最多 2 段，每个时长 ≤ 32767 µs。空调那种多帧长码放不下。",
+           "Limits come from the remote's firmware: at most 2 sequences, each duration ≤ 32767 µs. Multi-frame A/C codes won't fit.")
+    }
+    pub fn ir_not_wired(&self) -> &'static str {
+        t!(self.0,
+           "发射通道还没接通 —— 现在只校验码对不对",
+           "Transmit path isn't wired up yet — this only validates the code for now")
+    }
+
     // ── PTT 遥控器提醒 ──
     pub fn ptt_hint(&self) -> &'static str {
         t!(self.0,

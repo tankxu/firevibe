@@ -401,3 +401,42 @@ codesign -dv --verbose=2 target/release/firectl           # 要看到 Authority=
 
 **tag 规则**：app = `vX.Y.Z`，CLI = `cli-vX.Y.Z`（CLI 发 `--prerelease`，
 因为应用的更新检查走 `/releases/latest`，那个接口会忽略预发布）。
+
+## 红外遥控（`ActionType::IrBlast`）
+
+遥控器**自带红外发射管**（0x0425 实物拆开确认过）。发射不走 HID，走 **BLE GATT
+的 KeyMap 服务** —— macOS 只对 app 隐藏 HID 服务 `0x1812`，`FE151500` 是自定义服务，
+CoreBluetooth 直接可达（和读电量同一条路）。
+
+**协议全部摸清了**，写在 `~/LocalDev/firetv-remote-mac/NOTES.md` 的「红外发射」一节：
+服务/特征、控制码、五步发射流程、字节格式。来源是 Fire TV 固件的
+`BluetoothKeyMapLib`（`KeyMapActionIr` / `BleKeyMapDeviceProxyV2` / `BleConfig`）。
+
+### 现在做到哪儿
+
+- ✅ `core/src/ir.rs` —— 码的解析 / 校验 / 编译成设备载荷，7 个单测覆盖格式细节
+- ✅ `ActionType::IrBlast` + 编辑器里的粘贴框（边填边校验）+ 卡片摘要
+- ❌ **发射通道没接** —— 触发时只校验+编译，然后如实说「通道还没接通」
+
+### 还差什么
+
+一个独立的 CoreBluetooth 小进程（照 `helper/battprobe.swift` 的架子，
+**不能在 app 进程里建 CBCentralManager**，见 battprobe 顶部注释），执行：
+`requestStartNewTable` → 订阅 BLAST → 分块写（200 字节/片）→ `commitBlast`(opcode 5) → 等 notify。
+外层 `compileAction` / `compileAsBlast` 的确切帧格式还没读完（都在反编译产物里）。
+
+### 两条硬限制（来自固件，不是我们定的）
+
+- **最多 2 段**原始码（`for i in 0..<2`）
+- 时长是**有符号 int16**（`(short) data`）→ 上限 **32767 µs**
+
+→ 只适合电视/音响那类短码。**空调塞不进去**：Daikin 经典 ARC 每次发 3 帧、
+帧间隔 25~35 ms。空调交给 StackChan + `IRremoteESP8266` 的编码器，
+抓码规格见 `~/LocalDev/firetv-remote-mac/daikin-capture-spec.md`。
+
+### ⚠️ 安全边界
+
+- 只走 blast（一次性、有暂存表，`RESET_STAGING_TABLE`=2 可回滚）
+- **绝不提交 `FE151501` MAPPING** —— 写坏持久化按键映射要重新配对才能恢复
+- **绝不碰 `CFBFA000` OTA 服务** —— `CFBFA004` 里有 WIPE(12) / WIPE_UNPAIR(14)
+- CONTROL 只发 1 / 2 / 5，永不发 16(DELETE_TABLE) / 32

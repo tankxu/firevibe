@@ -1042,6 +1042,7 @@ impl Runtime {
             ActionType::Record => {
                 return run_record(&self.status, &self.recording, &self.tx, down);
             }
+            ActionType::IrBlast => return ir_blast(&self.tx, act),
             ActionType::VoiceDictate => {
                 let long = act.arg == "hold";
                 if !long && !down {
@@ -1343,6 +1344,7 @@ fn dispatch(
         ActionType::None => "未设置".into(),
         // 上面已经提前返回了，这条只是让 match 穷尽
         ActionType::Record => String::new(),
+        ActionType::IrBlast => ir_blast(tx, &act),
         ActionType::Key => match inj.key_stroke(&act.key, &act.mods) {
             Ok(_) => act.describe(),
             Err(e) => format!("失败: {e}"),
@@ -1891,6 +1893,39 @@ fn record_battery(status: &Arc<Status>, cfg: &Arc<RwLock<Config>>, b: i32, how: 
 /// 所以录音只能跟着按住的那段时间走，配在麦克风键上才有意义。
 ///
 /// 录的是遥控器麦克风解码后的 PCM（和听写共用同一路），不碰系统输入设备。
+/// 让遥控器打一发红外。
+///
+/// 现在只做到**校验 + 编译**：把用户配的码解析出来、按固件的格式编译成载荷，
+/// 错在哪儿立刻告诉他。真正的发射要走 BLE GATT 的 KeyMap 服务
+/// （`FE151500` / `FE151503` BLAST），得像 battprobe 那样起个独立的
+/// CoreBluetooth 小进程 —— 那部分还没写（见 CLAUDE.md「红外发射」）。
+///
+/// 这样排的好处：码配得对不对现在就能验，不用等发射通道。
+fn ir_blast(tx: &Sender<Event>, act: &Action) -> String {
+    match crate::ir::IrCode::parse(&act.arg) {
+        Err(e) => {
+            let m = format!("红外码有问题：{e}");
+            let _ = tx.send(Event::Log(m.clone()));
+            m
+        }
+        Ok(code) => match code.compile_payload() {
+            Err(e) => {
+                let m = format!("红外码编译失败：{e}");
+                let _ = tx.send(Event::Log(m.clone()));
+                m
+            }
+            Ok(payload) => {
+                let _ = tx.send(Event::Log(format!(
+                    "红外码没问题（{}，载荷 {} 字节），但发射通道还没接通",
+                    code.summary(),
+                    payload.len()
+                )));
+                "红外发射通道还没接通".into()
+            }
+        },
+    }
+}
+
 fn run_record(
     status: &Arc<Status>,
     recording: &Arc<Mutex<Option<crate::recorder::Rec>>>,

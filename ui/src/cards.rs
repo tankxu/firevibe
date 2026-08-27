@@ -610,6 +610,7 @@ pub fn kind_icon(k: ActionType) -> Option<&'static str> {
         ActionType::VoiceHotkey => "zap",
         ActionType::VoiceDictate => "mic",
         ActionType::Record => "mic",
+        ActionType::IrBlast => "tv",
     })
 }
 
@@ -681,6 +682,22 @@ pub fn describe(a: &Action, l: crate::i18n::L) -> (String, String) {
         ActionType::Record => (
             l.dsc_record().into(),
             l.dsc_record_hint().into(),
+        ),
+        // 卡片第二行直接给码的摘要 / 或者说清哪儿不对，不用点进去才知道
+        ActionType::IrBlast => (
+            l.dsc_ir().into(),
+            match firevibe_core::ir::IrCode::parse(&a.arg) {
+                Ok(c) => c.summary(),
+                Err(e) => e,
+            },
+        ),
+        // 卡片上第二行直接给码的摘要 / 或者说清哪儿不对，不用点进去才知道
+        ActionType::IrBlast => (
+            l.dsc_ir().into(),
+            match firevibe_core::ir::IrCode::parse(&a.arg) {
+                Ok(c) => c.summary(),
+                Err(e) => e,
+            },
         ),
         ActionType::VoiceDictate => (
             l.dsc_dictate().into(),

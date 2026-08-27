@@ -8,6 +8,7 @@ pub mod file_dialog;
 pub mod frontapp;
 pub mod hidremap;
 pub mod hotkey;
+pub mod ir;
 pub mod inject;
 pub mod keys;
 pub mod layout;

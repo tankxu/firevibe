@@ -17,6 +17,11 @@ let dumpMode = args.contains("--dump")
 // 特征、不发任何厂商命令。用来验证「国产遥控器的语音是不是走它自己的 FFF0 私有服务」——
 // 那一系（Amlogic/Telink 方案）按下麦克风键就自己推流，不需要主机下命令。
 let listenMode = args.contains("--listen")
+// --readall=<服务UUID前缀>：把该服务下所有**可读**特征的当前值读出来打印。
+// 纯读，不写任何东西 —— 用来判断固件是真实现了这个服务还是只挂了个空壳。
+let readAllSvc: String? = args.first(where: { $0.hasPrefix("--readall=") }).map {
+    String($0.dropFirst(10)).uppercased()
+}
 // 监听时长，默认 30 秒
 let listenSecs: Double = {
     guard let a = args.first(where: { $0.hasPrefix("--secs=") }),
@@ -69,7 +74,7 @@ final class Probe: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         let all = c.retrieveConnectedPeripherals(withServices: [BATTERY])
         note("带电池服务的已连接外设: \(all.map { $0.name ?? "?" })")
         // dump / listen 模式：不限定电池服务，列出所有已连接外设再按名字挑
-        if dumpMode || listenMode {
+        if dumpMode || listenMode || readAllSvc != nil {
             let every = c.retrieveConnectedPeripherals(withServices: [
                 CBUUID(string: "1800"), CBUUID(string: "1801"), CBUUID(string: "180A"),
                 BATTERY, CBUUID(string: "1812"), CBUUID(string: "FE03"),
@@ -88,9 +93,16 @@ final class Probe: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         for p in targets { p.delegate = self; c.connect(p, options: nil) }
     }
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
-        p.discoverServices((dumpMode || listenMode) ? nil : [BATTERY])
+        p.discoverServices((dumpMode || listenMode || readAllSvc != nil) ? nil : [BATTERY])
     }
     func peripheral(_ p: CBPeripheral, didDiscoverServices e: Error?) {
+        if let want = readAllSvc {
+            for s in p.services ?? [] where s.uuid.uuidString.uppercased().hasPrefix(want) {
+                note("=== 服务 \(s.uuid.uuidString) ===")
+                p.discoverCharacteristics(nil, for: s)
+            }
+            return
+        }
         if listenMode {
             note("=== \(p.name ?? "?") 服务 \((p.services ?? []).map { $0.uuid.uuidString }) ===")
             for s in p.services ?? [] { p.discoverCharacteristics(nil, for: s) }
@@ -107,6 +119,12 @@ final class Probe: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         for s in p.services ?? [] { p.discoverCharacteristics([LEVEL], for: s) }
     }
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error e: Error?) {
+        if readAllSvc != nil {
+            for ch in s.characteristics ?? [] where ch.properties.contains(.read) {
+                p.readValue(for: ch)   // 只读
+            }
+            return
+        }
         if listenMode {
             for ch in s.characteristics ?? [] {
                 if ch.properties.contains(.notify) || ch.properties.contains(.indicate) {
@@ -132,6 +150,19 @@ final class Probe: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         for ch in s.characteristics ?? [] { p.readValue(for: ch) }
     }
     func peripheral(_ p: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error e: Error?) {
+        if readAllSvc != nil {
+            if let err = e {
+                note("  \(ch.uuid.uuidString)  读失败: \(err.localizedDescription)")
+            } else if let d = ch.value {
+                let txt = String(data: d, encoding: .utf8).map {
+                    $0.allSatisfy { $0.isASCII && !$0.isNewline } ? "  \"\($0)\"" : ""
+                } ?? ""
+                note("  \(ch.uuid.uuidString)  \(d.count)B  \(hex(d))\(txt)")
+            } else {
+                note("  \(ch.uuid.uuidString)  空值")
+            }
+            return
+        }
         if listenMode {
             guard let d = ch.value else { return }
             let k = ch.uuid.uuidString
@@ -156,7 +187,9 @@ final class Probe: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 note("probe 启动 want=\(want)")
 let probe = Probe()
 probe.central = CBCentralManager(delegate: probe, queue: nil)
-if listenMode {
+if readAllSvc != nil {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 8) { note("读完退出"); exit(0) }
+} else if listenMode {
     note("监听 \(Int(listenSecs)) 秒 —— 现在按住遥控器麦克风键说话")
     DispatchQueue.main.asyncAfter(deadline: .now() + listenSecs) {
         note("──────── 汇总 ────────")

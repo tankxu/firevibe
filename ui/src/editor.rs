@@ -295,6 +295,41 @@ l.hotkey_tap_hint()
             ActionType::Shell => {
                 body = body.child(div().child(field_lab(l.shell_cmd())).child(code_field(d)));
             }
+            ActionType::IrBlast => {
+                // 边填边校验：码对不对、多长、几段，立刻显示。不用点保存才知道。
+                let txt = d.input.read(cx).value().to_string();
+                let (ok, msg) = match firevibe_core::ir::IrCode::parse(&txt) {
+                    Ok(c) => (true, c.summary()),
+                    Err(e) => (false, e),
+                };
+                body = body
+                    .child(div().child(field_lab(l.ir_help())))
+                    .child(div().child(field_lab(l.ir_code_label())).child(code_field(d)))
+                    .child(
+                        div()
+                            .px(px(10.))
+                            .py(px(8.))
+                            .rounded(px(R))
+                            .border_1()
+                            .border_color(c(if ok { OK } else { WARN_LINE }))
+                            .bg(c(if ok { OK_SOFT } else { WARN_BG }))
+                            .text_size(px(11.5))
+                            .text_color(c(if ok { OK } else { INK2 }))
+                            .line_height(gpui::relative(1.5))
+                            .child(SharedString::from(if ok {
+                                format!("{msg}\n{}", l.ir_not_wired())
+                            } else {
+                                msg
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(c(INK3))
+                            .line_height(gpui::relative(1.5))
+                            .child(SharedString::from(l.ir_limits())),
+                    );
+            }
             ActionType::Http => {
                 let post = d.post;
                 body = body

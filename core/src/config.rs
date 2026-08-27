@@ -68,9 +68,12 @@ pub enum ActionType {
     VoiceHotkey,
     /// 录音到「下载」：**按住**录、松手保存。录的是遥控器麦克风
     Record,
+    /// 让遥控器打一发红外。`arg` 存红外码 JSON（见 `crate::ir::IrCode`）。
+    /// 走 BLE GATT 的 KeyMap 服务，不是 HID —— 遥控器自带发射管，我们只是告诉它发什么。
+    IrBlast,
 }
 impl ActionType {
-    pub const ALL: [ActionType; 12] = [
+    pub const ALL: [ActionType; 13] = [
         ActionType::None,
         ActionType::Key,
         ActionType::Text,
@@ -83,6 +86,7 @@ impl ActionType {
         ActionType::VoiceHotkey,
         ActionType::VoiceDictate,
         ActionType::Record,
+        ActionType::IrBlast,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -98,6 +102,7 @@ impl ActionType {
             ActionType::VoiceHotkey => "第三方语音输入",
             ActionType::VoiceDictate => "语音转文字",
             ActionType::Record => "录音",
+            ActionType::IrBlast => "红外遥控",
         }
     }
     pub fn hint(self) -> &'static str {
@@ -113,6 +118,7 @@ ActionType::VoicePtt => "按住时把麦克风送进虚拟声卡，松手停止"
 ActionType::VoiceToggle => "点一下开始送流，再点一下停止",
 ActionType::VoiceDictate => "用系统自带的离线语音识别把你说的话转成文字，打进当前焦点。不依赖第三方工具，也不动系统输入设备",
 ActionType::Record => "按住录音、松手保存到「下载」。录的是遥控器麦克风 —— 遥控器只在麦克风键按住时才出声，所以这个动作配在麦克风键的长按上才有用。录音状态只在本应用窗口里显示",
+ActionType::IrBlast => "按下时让遥控器打一发红外 —— 它自带发射管，可以拿来控制电视、音响、投影这类设备。红外码粘在下面",
 ActionType::VoiceHotkey => {"发一个快捷键去唤起第三方语音输入工具，由它识别并把文字打进当前焦点。短按 = 敲一下，长按 = 按住不放"
 }
 }
@@ -121,7 +127,11 @@ ActionType::VoiceHotkey => {"发一个快捷键去唤起第三方语音输入工
     pub fn needs_arg(self) -> bool {
         matches!(
             self,
-            ActionType::Text | ActionType::OpenApp | ActionType::AppleScript | ActionType::Shell
+            ActionType::Text
+                | ActionType::OpenApp
+                | ActionType::AppleScript
+                | ActionType::Shell
+                | ActionType::IrBlast
         )
     }
 }
@@ -224,6 +234,11 @@ impl Action {
             ActionType::VoiceToggle => "开始 / 停止说话".into(),
             ActionType::VoiceDictate => "语音转文字".into(),
             ActionType::Record => "按住录音".into(),
+            // 配好了就显示码的摘要（名字 · 频率 · 段数 · 时长），没配好就说清哪儿不对
+            ActionType::IrBlast => match crate::ir::IrCode::parse(&self.arg) {
+                Ok(c) => format!("红外遥控 · {}", c.summary()),
+                Err(e) => format!("红外遥控（{}）", ellipsis(&e, 20)),
+            },
             ActionType::VoiceHotkey => {
                 let m: String = self.mods.iter().map(|m| format!("{m}+")).collect();
                 let k = if self.key.is_empty() {
