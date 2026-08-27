@@ -79,15 +79,33 @@ impl IrCode {
         if s.is_empty() {
             return Err("还没填红外码".into());
         }
-        // 两种都收：我们自己的 JSON，和业界发布量最大的 Pronto hex。
-        // 不给用户加一个「格式」下拉框 —— 看第一个字符就知道是哪种。
-        if !s.starts_with('{') {
+        // 三种都收，自动认，不给用户加「格式」下拉框：
+        //   · 我们的 JSON        —— `{` 开头且带引号（键名）
+        //   · Pronto hex         —— 首词是 0000 / 0100
+        //   · 原始 µs 列表        —— 其余（ESP32 抓码直出的 rawData[]、Flipper 的 data:）
+        // 注意 `{9000, 4500}` 这种 C 数组也是 `{` 开头，所以 JSON 要靠引号区分。
+        // `{` 开头有两种可能：我们的 JSON，或者 C 数组 `{9000, 4500, …}`。
+        // 先按 JSON 试，不成再按原始列表试；两边都不成就报 JSON 的错
+        // —— 用户既然写了 `{`，多半是想写 JSON，那个错更有指导性。
+        if s.starts_with('{') {
+            match serde_json::from_str::<IrCode>(s) {
+                Ok(code) => {
+                    code.validate()?;
+                    return Ok(code);
+                }
+                Err(je) => {
+                    if let Ok(c) = Self::from_raw_us(s) {
+                        return Ok(c);
+                    }
+                    return Err(format!("JSON 解析失败：{je}"));
+                }
+            }
+        }
+        let first = s.split_whitespace().next().unwrap_or("");
+        if matches!(first.to_ascii_uppercase().as_str(), "0000" | "0100") {
             return Self::from_pronto(s);
         }
-        let code: IrCode =
-            serde_json::from_str(s).map_err(|e| format!("JSON 解析失败：{e}"))?;
-        code.validate()?;
-        Ok(code)
+        Self::from_raw_us(s)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -250,6 +268,66 @@ impl IrCode {
     }
 }
 
+// ─────────────────────── 原始 µs 列表（ESP32 抓码直出）───────────────────────
+
+impl IrCode {
+    /// 吃 `IRremoteESP8266` 的 `resultToSourceCode()` 直出的数组，比如
+    /// `uint16_t rawData[67] = {9000, 4500, 560, 1690};`，或者光是
+    /// `9000, 4500, 560, 1690`（Flipper 的 `data:` 那行空格分隔也行）。
+    ///
+    /// 裸列表不带载波频率，默认按 38 kHz —— 绝大多数消费级设备都是。
+    /// 要别的频率就用 Pronto（自带频率）或我们的 JSON。
+    pub fn from_raw_us(src: &str) -> Result<Self, String> {
+        let body = src
+            .rsplit('=')
+            .next()
+            .unwrap_or(src)
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .trim_start_matches(['{', '['])
+            .trim_end_matches(['}', ']']);
+        let seq: Vec<i32> = body
+            .split(|ch: char| ch == ',' || ch.is_whitespace())
+            .filter(|t| !t.is_empty())
+            .map(|t| {
+                t.parse::<i32>()
+                    .map_err(|_| format!("「{t}」不是个整数微秒值"))
+            })
+            .collect::<Result<_, _>>()?;
+        if seq.is_empty() {
+            return Err("没解析出任何时长".into());
+        }
+        let code = IrCode {
+            label: String::new(),
+            frequency: 38_000,
+            duty_cycle: default_duty(),
+            sequences: vec![seq],
+            repeat: 0,
+            post_delay_ms: 0,
+            toggle_bitmask: 0,
+            repeat_type: default_repeat_type(),
+        };
+        code.validate()?;
+        Ok(code)
+    }
+
+    /// 反过来导成 Pronto hex —— 便携格式，可以存档或者贴到别的工具里。
+    /// 和 `from_pronto` 是同一套换算，只是反着来。
+    pub fn to_pronto(&self) -> String {
+        let k = (1_000_000.0 / (self.frequency as f64 * PRONTO_TICK_US)).round() as u32;
+        let period = k as f64 * PRONTO_TICK_US;
+        let n = |i: usize| self.sequences.get(i).map(|s| s.len() / 2).unwrap_or(0);
+        let mut out = format!("{:04X} {:04X} {:04X} {:04X}", 0, k, n(0), n(1));
+        for seq in self.sequences.iter().take(MAX_SEQUENCES) {
+            for &v in seq {
+                out.push_str(&format!(" {:04X}", (v as f64 / period).round() as u32));
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +343,38 @@ mod tests {
             toggle_bitmask: 0,
             repeat_type: "basic".into(),
         }
+    }
+
+    #[test]
+    fn 吃_esp32_抓码直出的数组() {
+        let c = IrCode::parse("uint16_t rawData[6] = {9000, 4500, 560, 1690, 560, 560};")
+            .unwrap();
+        assert_eq!(c.frequency, 38_000, "裸列表默认 38 kHz");
+        assert_eq!(c.sequences, vec![vec![9000, 4500, 560, 1690, 560, 560]]);
+    }
+
+    #[test]
+    fn 也吃裸的空格分隔_flipper那种() {
+        let c = IrCode::parse("9000 4500 560 1690").unwrap();
+        assert_eq!(c.sequences[0].len(), 4);
+    }
+
+    #[test]
+    fn pronto_往返换算对得上() {
+        let src = "0000 006D 0002 0001 0056 0015 0016 0015 0016 0400";
+        let a = IrCode::from_pronto(src).unwrap();
+        let b = IrCode::from_pronto(&a.to_pronto()).unwrap();
+        assert_eq!(a.frequency, b.frequency);
+        for (x, y) in a.sequences.iter().flatten().zip(b.sequences.iter().flatten()) {
+            assert!((x - y).abs() <= 1, "往返误差过大 {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn 原始列表能导成_pronto() {
+        let c = IrCode::parse("{9000, 4500, 560, 1690}").unwrap();
+        let p = c.to_pronto();
+        assert!(p.starts_with("0000 006D 0002 0000"), "{p}");
     }
 
     #[test]
@@ -302,8 +412,10 @@ mod tests {
     fn parse_自动识别_pronto_和_json() {
         assert!(IrCode::parse("0000 006D 0001 0000 0056 0015").is_ok());
         assert!(IrCode::parse(r#"{"frequency":38000,"sequences":[[560,560]]}"#).is_ok());
-        // 既不像 JSON 也不像 hex → 按 Pronto 报错，信息要具体
-        assert!(IrCode::parse("hello world").unwrap_err().contains("不是十六进制"));
+        assert!(IrCode::parse("{9000, 4500}").is_ok(), "C 数组也认");
+        // 什么都不像 → 按原始列表报错，指出是哪个词有问题
+        let e = IrCode::parse("hello world").unwrap_err();
+        assert!(e.contains("hello"), "{e}");
     }
 
     #[test]
