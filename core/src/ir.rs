@@ -28,8 +28,17 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 设备侧对单个时长的上限（有符号 int16）
-pub const MAX_DURATION_US: i32 = 32767;
+/// 设备侧一格是多少微秒。
+///
+/// **实测出来的**：按微秒填进去，遥控器打出来的每一段都正好长 10 倍
+/// （发 560 打出 5554、发 1690 打出 16970、发 442 打出 4376）。除以 10 再发，
+/// 抓回来就是标准时序、协议解得干干净净。Amazon 那份 JSON 里的 `IRCode`
+/// 字符串（`"342s171s21s65…"`）也对得上：342 格 × 10 µs = 3420 µs。
+pub const DEVICE_TICK_US: i32 = 10;
+
+/// 单个时长上限（微秒）。设备侧是有符号 int16 **格**，所以是 32767 × 10 µs
+/// ≈ 327 ms —— 比按微秒算宽裕十倍，空调那种 25~35 ms 的帧间隔完全放得下。
+pub const MAX_DURATION_US: i32 = 32767 * DEVICE_TICK_US;
 /// 设备侧最多接受几段原始码
 pub const MAX_SEQUENCES: usize = 2;
 
@@ -135,7 +144,7 @@ impl IrCode {
             if let Some(bad) = seq.iter().find(|&&v| v <= 0 || v > MAX_DURATION_US) {
                 return Err(format!(
                     "第 {} 段有个时长 {bad} µs 越界 —— 必须在 1..{MAX_DURATION_US} 之间\
-                     （设备侧是有符号 int16）",
+                     （设备侧是有符号 int16，一格 {DEVICE_TICK_US} µs）",
                     i + 1
                 ));
             }
@@ -182,9 +191,12 @@ impl IrCode {
         out.extend_from_slice(format!("d[{}]", self.post_delay_ms).as_bytes());
         out.extend_from_slice(format!("t[{}]", self.toggle_bitmask).as_bytes());
         out.push(0);
+        // 微秒 → 设备的 10 µs 格。四舍五入，428 µs → 43 格 = 430 µs，误差 0.5%，
+        // 远小于红外接收头的容差。
         for seq in self.sequences.iter().take(MAX_SEQUENCES) {
             for &v in seq {
-                out.extend_from_slice(&(v as i16).to_le_bytes());
+                let ticks = ((v + DEVICE_TICK_US / 2) / DEVICE_TICK_US).max(1);
+                out.extend_from_slice(&(ticks as i16).to_le_bytes());
             }
         }
         Ok(out)
@@ -506,12 +518,22 @@ mod tests {
     }
 
     #[test]
-    fn 脉冲是小端_int16() {
+    fn 脉冲换算成设备的_10微秒格_小端int16() {
         let b = nec_power().compile_payload().unwrap();
         let body = &b[b.iter().position(|&x| x == 0).unwrap() + 1..];
         assert_eq!(body.len(), 4 * 2);
-        assert_eq!(&body[0..2], &9000i16.to_le_bytes());
-        assert_eq!(&body[6..8], &1690i16.to_le_bytes());
+        // 9000 µs → 900 格，1690 µs → 169 格
+        assert_eq!(&body[0..2], &900i16.to_le_bytes(), "9000µs 应该是 900 格");
+        assert_eq!(&body[6..8], &169i16.to_le_bytes(), "1690µs 应该是 169 格");
+    }
+
+    #[test]
+    fn 上限是_327ms_不是_32ms() {
+        let mut c = nec_power();
+        c.sequences = vec![vec![560, 30000]]; // 30 ms 的帧间隔，空调常见
+        assert!(c.validate().is_ok(), "30ms 应该放得下：{:?}", c.validate());
+        c.sequences = vec![vec![560, 400_000]];
+        assert!(c.validate().is_err(), "400ms 该越界");
     }
 
     #[test]
@@ -524,9 +546,9 @@ mod tests {
     #[test]
     fn 时长越界要报错_有符号int16() {
         let mut c = nec_power();
-        c.sequences = vec![vec![560, 40000]];
+        c.sequences = vec![vec![560, 400_000]];
         let e = c.validate().unwrap_err();
-        assert!(e.contains("40000"), "{e}");
+        assert!(e.contains("400000"), "{e}");
     }
 
     #[test]

@@ -840,6 +840,97 @@ fn mic_check() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 从内置码库挑一条红外码发出去。用来在没绑按键的情况下直接验发射通路。
+///
+/// 用法：`firectl --ir-blast "daikin arc480a41" COOL`
+/// 只给设备名 / 不给按键名 → 列出候选，不发射。
+fn ir_blast_cmd(args: &[String]) -> anyhow::Result<()> {
+    use firevibe_core::irdb;
+    let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let Some(q) = pos.first() else {
+        println!("用法：firectl --ir-blast <设备搜索词> [按键名]");
+        return Ok(());
+    };
+    // IRBLAST_RAW：直接发一串自定义时长（逗号/空格分隔），用来做协议实验，
+    // 不经过码库。比如扫「多少个脉冲开始出问题」。
+    if let Ok(raw) = std::env::var("IRBLAST_RAW") {
+        let code = firevibe_core::ir::IrCode::parse(&raw).map_err(|e| anyhow::anyhow!(e))?;
+        return ir_send(&code);
+    }
+    let hits = irdb::search(q, 20);
+    if hits.is_empty() {
+        println!("码库里搜不到「{q}」");
+        return Ok(());
+    }
+    if hits.len() > 1 && pos.len() < 2 {
+        println!("匹配到 {} 个，再写细一点：", hits.len());
+        for h in &hits {
+            println!("  {} {}  （{} · {} 键）", h.brand, h.model, h.category, h.buttons);
+        }
+        return Ok(());
+    }
+    let h = &hits[0];
+    let btns = irdb::buttons_of(h.idx);
+    println!("设备：{} {}  （{}）", h.brand, h.model, h.category);
+    let Some(want) = pos.get(1) else {
+        println!("按键：{}", btns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join("  "));
+        println!("\n再跑一次并带上按键名就会发射。");
+        return Ok(());
+    };
+    let Some(bi) = btns.iter().position(|(n, _)| n.eq_ignore_ascii_case(want)) else {
+        println!("没有叫「{want}」的按键。有这些：");
+        println!("  {}", btns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join("  "));
+        return Ok(());
+    };
+    let code = irdb::code_of(h.idx, bi).ok_or_else(|| anyhow::anyhow!("这条码取不出来"))?;
+    println!("按键：{}", btns[bi].0);
+    return ir_send(&code);
+}
+
+/// 把一条码编译成表并交给 helper 发出去
+fn ir_send(code: &firevibe_core::ir::IrCode) -> anyhow::Result<()> {
+    // scanId 是「这一行挂在哪个物理键上」。一次性发射理论上无所谓，但这是目前
+    // 唯一还在猜的参数，留个口子好扫。
+    let scan_id: u8 = std::env::var("IRBLAST_SCANID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let table = code.compile_blast(scan_id).map_err(|e| anyhow::anyhow!(e))?;
+    println!("{}", code.summary());
+    println!("表 {} 字节，分 {} 片写，scanId={scan_id}", table.len(), (table.len() + 199) / 200);
+
+    // 蓝牙那半交给独立小进程 —— 和 app 里走的是同一个 helper
+    // FIREVIBE_IRBLAST 可以指到新编的 helper，改 helper 不用整包重签
+    let exe = std::env::var("FIREVIBE_IRBLAST")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| "/Applications/FireVibe.app/Contents/MacOS/irblast".into());
+    let exe = exe.as_path();
+    if !exe.is_file() {
+        anyhow::bail!("找不到 {} —— 先跑一次 ./package.sh 并装到 /Applications", exe.display());
+    }
+    // 蓝牙外设名。命令行里没有 runtime 在跑，battery::target_name() 是空的，
+    // 所以直接从系统里找一台带 KeyMap 服务的遥控器 —— 让 helper 自己按名字挑。
+    let dev = std::env::var("FIREVIBE_BT_NAME").unwrap_or_else(|_| "BLE".into());
+    let hex: String = table.iter().map(|b| format!("{b:02x}")).collect();
+    println!("发给「{dev}」…\n");
+    // 调试期：IRBLAST_ARGS 里的开关原样透传给 helper（--verify N / --sha / --uuid-rand）
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg(&dev).arg(&hex);
+    if let Ok(extra) = std::env::var("IRBLAST_ARGS") {
+        for a in extra.split_whitespace() {
+            cmd.arg(a);
+        }
+    }
+    let st = cmd.status()?;
+    println!();
+    if st.success() {
+        println!("✓ 设备回执正常 —— 空调有反应吗？");
+    } else {
+        println!("✗ 退出码 {:?}（上面几行是它卡在哪一步）", st.code());
+    }
+    Ok(())
+}
+
 fn mic_probe() -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
     let cfg = firevibe_core::config::Config::load();
@@ -990,7 +1081,7 @@ fn run_cli() -> anyhow::Result<()> {
         "--no-voice", "--descriptor", "--probe-all", "--probe-mic", "--keys", "--mic-off-test", "--mic-probe",
         "--adapt", "--map", "--sniff", "--tap", "--watch-mods", "--modcmp", "--mic", "--hold",
         "--run", "--type", "--inputs", "--set-input", "--config", "--battery", "--hid-list",
-        "--loopback-test", "--feed-tone", "--pin-input", "--all", "--collection-test", "--mic-listen", "--no-cmd", "--secs", "--mic-check",
+        "--loopback-test", "--feed-tone", "--pin-input", "--all", "--collection-test", "--mic-listen", "--no-cmd", "--secs", "--mic-check", "--ir-blast",
     ];
     if let Some(bad) = args.iter().find(|a| {
         a.starts_with("--")
@@ -1098,6 +1189,19 @@ fn run_cli() -> anyhow::Result<()> {
 
     if has("--mic-check") {
         return mic_check();
+
+
+
+    }
+
+
+
+
+
+    if has("--ir-blast") {
+        let rest: Vec<String> = args.iter().skip_while(|a| *a != "--ir-blast").skip(1).cloned().collect();
+        return ir_blast_cmd(&rest);
+
 
 
 

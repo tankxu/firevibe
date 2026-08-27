@@ -35,7 +35,7 @@ import sys
 
 REPO_URL = "https://github.com/Lucaslhm/Flipper-IRDB.git"
 OUT = "core/assets/irdb.jsonl.gz"
-MAX_US = 32767  # 和 core/src/ir.rs 的 MAX_DURATION_US 对齐
+MAX_US = 327670  # 设备侧是 int16 「格」，一格 10 µs → 327 ms（和 core/src/ir.rs 对齐）
 
 # NEC 家族标准时序（µs）。这几个数字是拿库里 1175 条真实 raw 反解验证过的。
 NEC_HDR_MARK, NEC_HDR_SPACE = 9000, 4500

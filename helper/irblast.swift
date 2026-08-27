@@ -30,6 +30,18 @@ guard args.count >= 2 else {
 let wantName = args[0]
 let tableHex = args[1]
 
+// 几个只能靠试的点，做成开关：
+//   --verify N   开表命令第 2 个字节（固件写 1；BleConfig 里 0=NONE 1=SHA2）
+//   --sha        表数据后面附 32 字节 SHA-256，并把长度算进去
+//   --uuid-rand  开表用随机 UUID（固件是表 id 的 UUID，我们默认全零）
+func flagInt(_ k: String, _ dflt: Int) -> Int {
+    guard let i = args.firstIndex(of: k), i + 1 < args.count else { return dflt }
+    return Int(args[i + 1]) ?? dflt
+}
+let verifyByte = UInt8(flagInt("--verify", 1))
+let wantSha = args.contains("--sha")
+let randUuid = args.contains("--uuid-rand")
+
 func note(_ m: String) {
     FileHandle.standardError.write((m + "\n").data(using: .utf8)!)
 }
@@ -57,6 +69,15 @@ let table: Data = {
     return d
 }()
 
+import CryptoKit
+/// 真正要写下去的字节。`--sha` 时在表后附 32 字节 SHA-256。
+let payload: Data = {
+    guard wantSha else { return table }
+    var d = table
+    d.append(Data(SHA256.hash(data: table)))
+    return d
+}()
+
 let SVC = CBUUID(string: "FE151500-5E8D-11E6-8B77-86F30CA893D3")
 let CTRL = CBUUID(string: "FE151502-5E8D-11E6-8B77-86F30CA893D3")
 let BLAST = CBUUID(string: "FE151503-5E8D-11E6-8B77-86F30CA893D3")
@@ -75,6 +96,8 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var ctrl: CBCharacteristic?
     var blast: CBCharacteristic?
     var step = 0
+    var lastSeen: UInt8 = 0xFF
+    var stepName = "init"
 
     func centralManagerDidUpdateState(_ c: CBCentralManager) {
         gotState = true
@@ -115,14 +138,24 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             exit(4)
         }
         p.setNotifyValue(true, for: blast)
+        // --ctx：先发一次上下文切换（控制码 1）。电视配对后也走这一步（日志里的
+        // state_switch），可能是 blast 的前置条件。
+        if args.contains("--ctx") {
+            note("⓪ 上下文切换")
+            p.writeValue(Data([1]), for: ctrl, type: .withResponse)
+            Thread.sleep(forTimeInterval: 0.3)
+        }
 
-        // ① 申请开一张暂存表。UUID 用全零 —— 一次性发射不需要索引到具体表。
-        var cmd = Data([CTRL_START_TABLE, 1])
-        cmd.append(Data(repeating: 0, count: 16))
+        // ① 申请开一张暂存表
+        var cmd = Data([CTRL_START_TABLE, verifyByte])
+        cmd.append(randUuid ? Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+                            : Data(repeating: 0, count: 16))
         cmd.append(contentsOf: [0, 0])                                   // u16-le 0
-        cmd.append(contentsOf: withUnsafeBytes(of: UInt16(table.count).littleEndian) { Array($0) })
-        note("① 申请开表，长度 \(table.count)")
+        cmd.append(contentsOf: withUnsafeBytes(of: UInt16(payload.count).littleEndian) { Array($0) })
+        stepName = "开表后"
+        note("① 申请开表 verify=\(verifyByte) sha=\(wantSha) 长度 \(payload.count)")
         p.writeValue(cmd, for: ctrl, type: .withResponse)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { p.readValue(for: ctrl) }
     }
 
     func peripheral(_ p: CBPeripheral, didWriteValueFor ch: CBCharacteristic, error e: Error?) {
@@ -134,44 +167,60 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
         // ③ 分片写数据。每片定长 200，最后一片补零 —— 固件就是这么干的，
         //    设备靠 ① 里声明的长度定真实边界。
-        let chunks = (table.count + CHUNK - 1) / CHUNK
+        let chunks = (payload.count + CHUNK - 1) / CHUNK
         if step < chunks {
             var piece = Data(repeating: 0, count: CHUNK)
             let lo = step * CHUNK
-            let hi = min(lo + CHUNK, table.count)
-            piece.replaceSubrange(0..<(hi - lo), with: table[lo..<hi])
+            let hi = min(lo + CHUNK, payload.count)
+            piece.replaceSubrange(0..<(hi - lo), with: payload[lo..<hi])
             note("③ 写第 \(step + 1)/\(chunks) 片")
             step += 1
+            stepName = "第\(step)片后"
             p.writeValue(piece, for: blast, type: .withResponse)
+            p.readValue(for: ctrl)
             return
         }
         if step == chunks {
             step += 1
             note("④ 提交发射")
+            stepName = "提交后"
             p.writeValue(Data([CTRL_COMMIT_BLAST]), for: ctrl, type: .withResponse)
-            // ⑤ 收不到 notify 就主动读一次兜底
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                p.readValue(for: blast)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { p.readValue(for: ctrl) }
+            // ⑤ 等回执。固件是先等 notify，收不到就轮询最多 9 次、间隔递增 ——
+            //    照抄这个节奏，一次读到 0x00 不代表失败，可能只是还没执行完。
+            for i in 1...9 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25 * Double(i)) {
+                    p.readValue(for: blast)
+                }
             }
         }
     }
 
     func peripheral(_ p: CBPeripheral, didUpdateValueFor ch: CBCharacteristic, error e: Error?) {
+        // 调试：CONTROL 上有真状态（首字节 + 16 字节表 UUID），把每步之后的都打出来
+        if ch.uuid == CTRL, let v = ch.value {
+            note("   CTRL[\(stepName)] = \(v.map { String(format: "%02x", $0) }.joined())")
+            return
+        }
         guard ch.uuid == BLAST, let v = ch.value, let first = v.first else { return }
-        // 首字节 == 2 就是成功（固件的 tableWriteCompleted）
+        // 首字节 == 2 就是成功（固件的 tableWriteCompleted）。
+        // 0x00 是「还没结果」，继续等 —— 别一读到就判失败。
         if first == 2 {
             print("OK")
             exit(0)
         }
-        note("设备回了 0x\(String(format: "%02X", first))（成功应该是 0x02）")
-        exit(6)
+        if first != 0 {
+            note("设备回了 0x\(String(format: "%02X", first))（成功应该是 0x02）")
+            exit(6)
+        }
+        lastSeen = first
     }
 }
 
 let b = Blaster()
 b.central = CBCentralManager(delegate: b, queue: nil)
 DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
-    note("超时")
+    note("等回执超时，最后读到 0x\(String(format: "%02X", b.lastSeen))")
     exit(gotState ? 7 : 2)
 }
 RunLoop.main.run()
