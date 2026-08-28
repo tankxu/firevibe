@@ -1257,7 +1257,15 @@ impl FireVibe {
         let Ok(res) = rx.try_recv() else { return };
         self.start_rx = None;
         match res {
-            Ok(_) => match why {
+            Ok(_) => {
+                // 连上才补硬件层映射 —— hidutil 是按 VID/PID 匹配当下在线的设备，
+                // 设备不在线时下发是空操作。以前只在启动和改配置时下发，遥控器
+                // 后来才醒的话就永远没映射：麦克风键没被接管、Spotlight 照弹、
+                // 第三方语音工具拿不到硬件修饰键。这台仿品休眠很快，几乎必中。
+                if let Some(m) = self.rt.sync_hid_remap() {
+                    eprintln!("[firevibe] {m}");
+                }
+                match why {
                 StartWhy::Auto | StartWhy::Manual => {
                     self.err = None;
                     self.err_sticky = false;
@@ -1274,7 +1282,8 @@ impl FireVibe {
                     let m = self.l().toast_connected();
                     self.toast(m);
                 }
-            },
+                }
+            }
             Err(m) => match why {
                 // 后台自动重连：不覆盖用户主动点出来的错，没连上就安静等
                 StartWhy::Auto => {
