@@ -56,6 +56,19 @@ pub enum Screen {
 }
 
 /// 编辑弹窗的临时状态。保存时才写回配置。
+/// 为什么要（重）起 HID 连接 —— 决定成功/失败各自怎么提示
+#[derive(Clone, Copy, PartialEq)]
+pub enum StartWhy {
+    /// 后台每 2 秒自动重试
+    Auto,
+    /// 用户点了「连接」
+    Manual,
+    /// 刚选了新遥控器
+    Pair,
+    /// 错误栏里点了「重试」
+    Retry,
+}
+
 pub struct EditState {
     pub slot: Slot,
     pub long: bool,
@@ -97,6 +110,9 @@ pub struct FireVibe {
     pub screen: Screen,
     /// 编辑弹窗
     pub dialog: Option<EditState>,
+    /// 排错钩子用：下一帧要模拟选中的设备
+    /// 后台起 HID 连接的结果通道（附带「为什么起」，决定成功/失败怎么提示）
+    pub start_rx: Option<(StartWhy, std::sync::mpsc::Receiver<Result<(), String>>)>,
     /// 展开了「…」菜单的卡片
     pub menu_open: Option<Slot>,
     /// 鼠标停在哪张卡上（决定测试/编辑按钮是否露出）
@@ -327,6 +343,7 @@ impl FireVibe {
             rx,
             screen: Screen::Main,
             dialog: None,
+            start_rx: None,
             menu_open: None,
             hover_card: None,
             hover_from: None,
@@ -525,6 +542,7 @@ impl FireVibe {
     }
 
     fn pump(&mut self) {
+        self.poll_runtime_start();
         self.poll_hotkey_grab();
         self.poll_battery();
         self.poll_config_file_io();
@@ -555,20 +573,7 @@ impl FireVibe {
             let first = !self.started;
             self.started = true;
             self.hid_try_at = Instant::now();
-            match self.rt.start() {
-                Ok(_) => {
-                    self.err = None;
-                    self.err_sticky = false; // 连上了，清掉主动错误
-                }
-                Err(e) => {
-                    // 用户主动点过 Connect 报的错要留着；后台自动重连不覆盖、不清
-                    if !self.err_sticky {
-                        let m = format!("{e:#}");
-                        // 只有真错误才报；没连上就安静等
-                        self.err = if m.starts_with("HID_NOT_FOUND") { None } else { Some(m) };
-                    }
-                }
-            }
+            self.start_runtime(StartWhy::Auto);
             if first {
                 // 启动时把关键权限状态打到 stderr，排障时一眼能看到
                 eprintln!(
@@ -929,9 +934,8 @@ impl FireVibe {
                             cx.listener(|this, _, _, cx| {
                                 if this.connected() {
                                     this.rt.stop();
-                                } else if let Err(e) = this.rt.start() {
-                                    this.err = Some(format!("{e:#}"));
-                                    this.err_sticky = true; // 用户主动连的，留住别自动消失
+                                } else {
+                                    this.start_runtime(StartWhy::Manual);
                                 }
                                 cx.notify();
                             }),
@@ -1225,6 +1229,74 @@ impl FireVibe {
     }
 
     /// 选定一个设备作为遥控器：写进配置的 device_vid/pid，重连。
+    /// 在**后台线程**重启 HID 连接，结果回到 `pump` 里处理。
+    ///
+    /// ⚠️ **绝不能在 UI 线程上调 `rt.start()`**。它内部的 `HidApi::new()` 在 macOS 上
+    /// 枚举设备时会转一遍 run loop；而这时 gpui 的 App 正被当前 listener/render 借着，
+    /// run loop 里排队的异步任务（pump 的定时器、HUD 的电平刷新）醒来调 `cx.update()`
+    /// 就是 RefCell 二次借用 —— 直接 abort，不是 panic 提示，是进程没了。
+    /// 配对时一选设备就闪退就是这个。`list_hid` 早因同样原因被要求走后台线程，
+    /// `start()` 当初漏了。
+    fn start_runtime(&mut self, why: StartWhy) {
+        if self.start_rx.is_some() {
+            return; // 已经有一次在路上，别叠
+        }
+        let rt = self.rt.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.start_rx = Some((why, rx));
+        std::thread::spawn(move || {
+            rt.stop();
+            let _ = tx.send(rt.start().map_err(|e| format!("{e:#}")));
+        });
+    }
+
+    /// 收后台起连接的结果。每种入口的提示方式不一样，所以带着 `why` 回来。
+    fn poll_runtime_start(&mut self) {
+        let Some((why, rx)) = &self.start_rx else { return };
+        let why = *why;
+        let Ok(res) = rx.try_recv() else { return };
+        self.start_rx = None;
+        match res {
+            Ok(_) => match why {
+                StartWhy::Auto | StartWhy::Manual => {
+                    self.err = None;
+                    self.err_sticky = false;
+                }
+                StartWhy::Pair => {
+                    self.err = None;
+                    self.err_sticky = false;
+                    let m = self.l().pair_ok();
+                    self.toast(m);
+                }
+                StartWhy::Retry => {
+                    self.err = None;
+                    self.err_sticky = false;
+                    let m = self.l().toast_connected();
+                    self.toast(m);
+                }
+            },
+            Err(m) => match why {
+                // 后台自动重连：不覆盖用户主动点出来的错，没连上就安静等
+                StartWhy::Auto => {
+                    if !self.err_sticky {
+                        self.err = if m.starts_with("HID_NOT_FOUND") { None } else { Some(m) };
+                    }
+                }
+                StartWhy::Manual | StartWhy::Retry => {
+                    self.err = Some(m);
+                    self.err_sticky = true;
+                }
+                StartWhy::Pair => {
+                    if !m.starts_with("HID_NOT_FOUND") {
+                        self.err = Some(m);
+                    }
+                    let t = self.l().pair_saved();
+                    self.toast(t);
+                }
+            },
+        }
+    }
+
     fn pick_device(&mut self, vid: u16, pid: u16, cx: &mut Context<Self>) {
         {
             let mut c = self.rt.cfg.write();
@@ -1248,18 +1320,8 @@ impl FireVibe {
         self.pair_rx = None;
         self.err = None;
         self.err_sticky = false;
-        // 停掉旧连接再按新 ID 连
-        self.rt.stop();
-        match self.rt.start() {
-            Ok(_) => self.toast(self.l().pair_ok()),
-            Err(e) => {
-                let m = format!("{e:#}");
-                if !m.starts_with("HID_NOT_FOUND") {
-                    self.err = Some(m);
-                }
-                self.toast(self.l().pair_saved());
-            }
-        }
+        // 停掉旧连接再按新 ID 连 —— 必须走后台线程，见 start_runtime 上的说明
+        self.start_runtime(StartWhy::Pair);
         cx.notify();
     }
 
@@ -1555,16 +1617,7 @@ impl FireVibe {
                         d.child(mini2("hid-retry", l.retry()).h(px(32.)).on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.err = None;
-                                match this.rt.start() {
-                                    Ok(_) => {
-                                        this.err_sticky = false;
-                                        this.toast(this.l().toast_connected());
-                                    }
-                                    Err(e) => {
-                                        this.err = Some(format!("{e:#}"));
-                                        this.err_sticky = true;
-                                    }
-                                }
+                                this.start_runtime(StartWhy::Retry);
                                 cx.notify();
                             },
                         )))
