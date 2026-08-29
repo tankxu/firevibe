@@ -4,7 +4,7 @@
 //! （公有领域），所以能直接打进包里。打包脚本见 `tools/build-irdb.py`，
 //! 里面写了收哪些、丢哪些、以及为什么。
 //!
-//! 1431 个设备、22708 条码，gzip 后 0.68 MB。**懒加载**：用户不点搜索就不解压，
+//! 1605 个设备、25767 条码，gzip 后 0.99 MB。**懒加载**：用户不点搜索就不解压，
 //! 解一次存住（约 8 MB 常驻，桌面应用可以接受）。
 
 use crate::ir::IrCode;
@@ -102,6 +102,17 @@ pub fn buttons_of(idx: usize) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// 某个设备每个按键的脉冲数，顺序和 [`buttons_of`] 一致。
+///
+/// 单独给一个是因为界面要在**列按键时**就标出「这条太长、某些遥控器放不下」——
+/// 为此给每个按键都 `code_of` + `compile_payload` 一遍太浪费，这里只数长度。
+pub fn pulses_of(idx: usize) -> Vec<usize> {
+    db()
+        .get(idx)
+        .map(|d| d.k.iter().map(|b| b.s.len()).collect())
+        .unwrap_or_default()
+}
+
 /// 取某个按键的码，直接就是能存进动作的 `IrCode`
 pub fn code_of(idx: usize, button: usize) -> Option<IrCode> {
     let d = db().get(idx)?;
@@ -167,6 +178,17 @@ mod tests {
             }
         }
         assert!(n > 150, "只抽到 {n} 条");
+    }
+
+    #[test]
+    fn 脉冲数和按键列表一一对应() {
+        let h = &search("daikin arc480a41", 1)[0];
+        let (btns, pulses) = (buttons_of(h.idx), pulses_of(h.idx));
+        assert_eq!(btns.len(), pulses.len());
+        // 不用真编译一遍也得数对
+        for (i, n) in pulses.iter().enumerate() {
+            assert_eq!(*n, code_of(h.idx, i).unwrap().sequences[0].len());
+        }
     }
 
     #[test]

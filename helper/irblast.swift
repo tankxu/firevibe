@@ -71,8 +71,16 @@ let table: Data = {
 
 import CryptoKit
 /// 真正要写下去的字节。`--sha` 时在表后附 32 字节 SHA-256。
+/// --mapping：把表写进**持久化键位表**而不是一次性发射通道。
+/// 仿品（0x0425）不实现 blast，但 MAPPING 是实现的（电视就是这么给它写红外码的），
+/// 所以只能靠这条：把码绑到某个键上，按那个键才发。
+/// ⚠️ 会覆盖电视写进去的键位表（三星音量码会丢），恢复靠重跑设备控制向导。
+let toMapping = args.contains("--mapping")
+
 let payload: Data = {
-    guard wantSha else { return table }
+    // 写键位表**必须**附 SHA-256：固件 writeTable() 用的是 compileWithChecksum()，
+    // 而且开表命令里声明的长度含这 32 字节。少了它设备会收下但不采用。
+    guard wantSha || toMapping else { return table }
     var d = table
     d.append(Data(SHA256.hash(data: table)))
     return d
@@ -81,7 +89,14 @@ let payload: Data = {
 let SVC = CBUUID(string: "FE151500-5E8D-11E6-8B77-86F30CA893D3")
 let CTRL = CBUUID(string: "FE151502-5E8D-11E6-8B77-86F30CA893D3")
 let BLAST = CBUUID(string: "FE151503-5E8D-11E6-8B77-86F30CA893D3")
+let MAPPING = CBUUID(string: "FE151501-5E8D-11E6-8B77-86F30CA893D3")
 let CHUNK = 200
+/// 等遥控器上线的上限（秒）。可用 --wait N 调。
+let waitSecs: Double = {
+    guard let i = args.firstIndex(of: "--wait"), i + 1 < args.count,
+          let v = Double(args[i + 1]) else { return 20 }
+    return v
+}()
 
 // 控制码。只用这两个 —— 16(删表) / 32 一律不碰。
 let CTRL_START_TABLE: UInt8 = 2
@@ -107,9 +122,12 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     var targets: [CBPeripheral] = []
     var ctrl: CBCharacteristic?
     var blast: CBCharacteristic?
+    var mapping: CBCharacteristic?
     var step = 0
     var lastSeen: UInt8 = 0xFF
     var stepName = "init"
+    var tableUuid = Data(repeating: 0, count: 16)
+    let startedAt = Date()
 
     func centralManagerDidUpdateState(_ c: CBCentralManager) {
         gotState = true
@@ -117,15 +135,30 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             note("蓝牙没开或没授权 state=\(c.state.rawValue)")
             bail(2)
         }
+        tryPick(c, first: true)
+    }
+
+    /// 找设备。找不到就**等**：遥控器睡着时不广播（实测两台都是），主机没有任何
+    /// 办法叫醒它，只能等用户按一下键。所以别直接失败，提示一句然后守着 ——
+    /// 它一上线立刻继续，用户按完就完事，不用回来重点一次。
+    func tryPick(_ c: CBCentralManager, first: Bool) {
         let all = c.retrieveConnectedPeripherals(withServices: [SVC])
-        let hit = all.filter { ($0.name ?? "").contains(wantName) }
-        guard let p = hit.first else {
-            note("没找到名字含「\(wantName)」且带 KeyMap 服务的设备（在线的：\(all.map { $0.name ?? "?" })）")
+        if let p = all.first(where: { ($0.name ?? "").contains(wantName) }) {
+            targets = [p]
+            p.delegate = self
+            c.connect(p, options: nil)
+            return
+        }
+        if first {
+            note("遥控器不在线 —— 请按一下它上面任意一个键唤醒，会自动继续（最多等 \(Int(waitSecs)) 秒）")
+        }
+        if Date().timeIntervalSince(startedAt) > waitSecs {
+            note("等不到遥控器上线")
             bail(3)
         }
-        targets = [p]
-        p.delegate = self
-        c.connect(p, options: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.tryPick(c, first: false)
+        }
     }
 
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
@@ -138,13 +171,14 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             note("这台设备没有 KeyMap 服务")
             bail(4)
         }
-        p.discoverCharacteristics([CTRL, BLAST], for: s)
+        p.discoverCharacteristics([CTRL, BLAST, MAPPING], for: s)
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverCharacteristicsFor s: CBService, error e: Error?) {
         for ch in s.characteristics ?? [] {
             if ch.uuid == CTRL { ctrl = ch }
             if ch.uuid == BLAST { blast = ch }
+            if ch.uuid == MAPPING { mapping = ch }
         }
         guard let ctrl, let blast else {
             note("KeyMap 服务里缺 CONTROL 或 BLAST 特征")
@@ -172,12 +206,13 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
         // ① 申请开一张暂存表
         var cmd = Data([CTRL_START_TABLE, verifyByte])
-        cmd.append(randUuid ? Data((0..<16).map { _ in UInt8.random(in: 0...255) })
-                            : Data(repeating: 0, count: 16))
+        tableUuid = randUuid ? Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+                             : Data(repeating: 0, count: 16)
+        cmd.append(tableUuid)
         cmd.append(contentsOf: [0, 0])                                   // u16-le 0
         cmd.append(contentsOf: withUnsafeBytes(of: UInt16(payload.count).littleEndian) { Array($0) })
         stepName = "开表后"
-        note("① 申请开表 verify=\(verifyByte) sha=\(wantSha) 长度 \(payload.count)")
+        note("① 申请开表 verify=\(verifyByte) uuid=\(tableUuid.prefix(4).map{String(format:"%02x",$0)}.joined())… 长度 \(payload.count)")
         p.writeValue(cmd, for: ctrl, type: .withResponse)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { p.readValue(for: ctrl) }
     }
@@ -200,8 +235,26 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             note("③ 写第 \(step + 1)/\(chunks) 片")
             step += 1
             stepName = "第\(step)片后"
-            p.writeValue(piece, for: blast, type: .withResponse)
+            p.writeValue(piece, for: toMapping ? (mapping ?? blast) : blast, type: .withResponse)
             p.readValue(for: ctrl)
+            return
+        }
+        if step == chunks && toMapping {
+            step += 1
+            note("④ 写完，切换到这张表（CONTEXT_SWITCH）")
+            // 表是按 UUID 索引的，写进去还得激活才生效 —— 不然按键跑的还是
+            // 电视那张表。KEYMAP_CONTROL_CONTEXT_SWITCH = 1。
+            // 18 字节：[1][UUID 16][toggleBitState 1] —— 少最后那个字节设备不认
+            var sw = Data([1])
+            sw.append(tableUuid)
+            sw.append(0)
+            p.writeValue(sw, for: ctrl, type: .withResponse)
+            note("   读 MAPPING 状态")
+            for i in 1...8 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3 * Double(i)) {
+                    if let m = self.mapping { p.readValue(for: m) }
+                }
+            }
             return
         }
         if step == chunks {
@@ -226,7 +279,7 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             note("   CTRL[\(stepName)] = \(v.map { String(format: "%02x", $0) }.joined())")
             return
         }
-        guard ch.uuid == BLAST, let v = ch.value, let first = v.first else { return }
+        guard ch.uuid == BLAST || ch.uuid == MAPPING, let v = ch.value, let first = v.first else { return }
         // 首字节 == 2 就是成功（固件的 tableWriteCompleted）。
         // 0x00 是「还没结果」，继续等 —— 别一读到就判失败。
         if first == 2 {
@@ -243,7 +296,7 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
 let b = Blaster()
 b.central = CBCentralManager(delegate: b, queue: nil)
-DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+DispatchQueue.main.asyncAfter(deadline: .now() + waitSecs + 15) {
     note("等回执超时，最后读到 0x\(String(format: "%02X", b.lastSeen))")
     exit(gotState ? 7 : 2)
 }

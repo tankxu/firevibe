@@ -101,6 +101,10 @@ pub struct Runtime {
     tap: Arc<Mutex<Option<crate::tap::Tap>>>,
     pub descriptor: Arc<Mutex<Vec<u8>>>,
     stop: Arc<AtomicBool>,
+    /// HID 读线程还活着吗。`start()` 必须等它真的退出再开新的 ——
+    /// 两个读线程开着同一个设备会把 CoreFoundation 的对象搞坏，
+    /// 崩在 `IOHIDDeviceScheduleWithRunLoop` / `__CFCheckCFInfoPACSignature`。
+    hid_running: Arc<AtomicBool>,
     tx: Sender<Event>,
 }
 
@@ -135,6 +139,7 @@ impl Runtime {
                 tap: Arc::new(Mutex::new(None)),
                 descriptor: Arc::new(Mutex::new(Vec::new())),
                 stop: Arc::new(AtomicBool::new(false)),
+                hid_running: Arc::new(AtomicBool::new(false)),
                 tx,
             },
             rx,
@@ -183,6 +188,18 @@ impl Runtime {
         *self.voice.lock() = Some(sink);
         self.set_mic(true);
         Ok(())
+    }
+
+    /// 语音链路建起来了吗。
+    ///
+    /// 界面**必须拿它当判据**去决定要不要重建，不能用一次性的标志位：
+    /// `stop()` 里有 `stop_voice()`，而每次**重连尝试**都会先 `stop()` ——
+    /// 遥控器一休眠掉线，sink 就被销毁了。界面那边如果只记着「建过了」，
+    /// 就再也不会重建：之后按住说话，快捷键照发（那段在 sink 判断之外，
+    /// 所以第三方工具照常弹出来），但**音频不进虚拟声卡、电平条不出、
+    /// 系统输入也不切** —— 看起来像"能用但没声音"，极难往这儿想。
+    pub fn has_voice(&self) -> bool {
+        self.voice.lock().is_some()
     }
 
     pub fn stop_voice(&self) {
@@ -384,7 +401,149 @@ impl Runtime {
         }
     }
 
+    /// 把当前方案里配的红外码**烧进仿品遥控器**（PID 0x0425 那条路）。
+    ///
+    /// 仿品没实现 blast，只能改它的持久化键位表 —— 所以红外不是「app 让它发」，
+    /// 而是「按实体键它自己发」，电脑关着也照发。代价是只有 4 个键能挂
+    /// （见 `irtable::scan_id`）、而且要先写进去，十几秒。
+    ///
+    /// **四行永远都写**，没配码的行只有 `BLE_KEYPRESS` —— 这样用户把动作删掉，
+    /// 下一次同步就真的把那个键的红外清了，不会在遥控器里留着旧码。
+    ///
+    /// 原厂遥控器（热麦克风那派）不走这条：它的 blast 是即时的，见 `ir_blast`。
+    /// 连上遥控器时自动补写：**只在用户确实配过红外、而且表变了的时候**。
+    ///
+    /// 不无条件写是有原因的 —— 见 `Settings::ir_table_hash` 的注释：
+    /// 没配过红外的人被写一张空表，等于把电视烧进去的音量控制抹掉。
+    pub fn maybe_sync_ir_table(&self) -> Option<String> {
+        if self.cfg.read().settings.ir_table_hash.is_empty() {
+            // 从没写过 —— 只有配了码才主动写
+            let has_ir = {
+                let cfg = self.cfg.read();
+                let prof = cfg.profile();
+                crate::irtable::IR_SLOTS.iter().any(|s| {
+                    prof.action(*s, false)
+                        .is_some_and(|a| a.kind == crate::config::ActionType::IrBlast)
+                })
+            };
+            if !has_ir {
+                return None;
+            }
+        }
+        self.sync_ir_table_inner(false)
+    }
+
+    pub fn sync_ir_table(&self) -> Option<String> {
+        self.sync_ir_table_inner(true)
+    }
+
+    fn sync_ir_table_inner(&self, force: bool) -> Option<String> {
+        if !self.cfg.read().settings.mic_model.is_ptt() {
+            return None; // 原厂走 blast，不用烧表
+        }
+        let (table, n) = {
+            let cfg = self.cfg.read();
+            let prof = cfg.profile();
+            let mut codes: Vec<(crate::layout::Slot, Option<crate::ir::IrCode>)> = Vec::new();
+            for slot in crate::irtable::IR_SLOTS {
+                // 只看短按：表里没有「长按」这个概念，一个 scanId 一条码
+                let code = prof
+                    .action(slot, false)
+                    .filter(|a| a.kind == crate::config::ActionType::IrBlast)
+                    .and_then(|a| crate::ir::IrCode::parse(&a.arg).ok());
+                codes.push((slot, code));
+            }
+            let n = codes.iter().filter(|(_, c)| c.is_some()).count();
+            let refs: Vec<_> = codes.iter().map(|(s, c)| (*s, c.as_ref())).collect();
+            match crate::irtable::build(&refs) {
+                Ok(t) => (t, n),
+                Err(e) => return Some(format!("红外表编译失败：{e}")),
+            }
+        };
+        let hex = crate::irtable::to_hex(&table);
+        if !force && self.cfg.read().settings.ir_table_hash == hex {
+            return None; // 遥控器里已经是这张表了
+        }
+        let name = ir_device_name();
+        let tx = self.tx.clone();
+        let cfg2 = self.cfg.clone();
+        let hex2 = hex.clone();
+        std::thread::spawn(move || {
+            let Some(exe) = ir_blaster_path() else {
+                let _ = tx.send(Event::Log("找不到 irblast，重新打包一次".into()));
+                return;
+            };
+            let _ = tx.send(Event::Log(format!(
+                "正在把 {n} 个红外码写进遥控器（十几秒，别关 app）…"
+            )));
+            // --mapping 写持久化键位表；--uuid-rand 因为表 id 随机就行（电视也是）；
+            // --wait 让它等遥控器醒过来 —— 仿品空闲几十秒就睡，睡着时不广播，
+            // 主机叫不醒它，只能等用户按键。
+            let out = std::process::Command::new(exe)
+                .arg(&name)
+                .arg(&hex)
+                .args(["--mapping", "--uuid-rand", "--wait", "90"])
+                .output();
+            let msg = match out {
+                Ok(o) if o.status.success() => {
+                    {
+                        let mut c = cfg2.write();
+                        // 清空之后把指纹也清掉：遥控器回到「我们没动过」的状态，
+                        // 下次连上就不该再自动写了
+                        c.settings.ir_table_hash = if n == 0 { String::new() } else { hex2 };
+                        let _ = c.save();
+                    }
+                    if n == 0 {
+                        "遥控器上的红外码已清空".to_string()
+                    } else {
+                        format!("{n} 个红外码已写进遥控器，按实体键就发（电脑关着也发）")
+                    }
+                }
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    let last = err.lines().last().unwrap_or("").to_string();
+                    if last.contains("等不到遥控器") {
+                        "遥控器睡着了，写不进去 —— 按一下它任意键再试".to_string()
+                    } else {
+                        format!("红外表写入失败：{last}")
+                    }
+                }
+                Err(e) => format!("红外表写入起不来：{e}"),
+            };
+            // 也进 stderr：只发 Event::Log 的话成功消息会被界面的过滤器丢掉，
+            // 用户和排障都看不到「到底写没写进去」——今晚在这上面白等过一轮
+            eprintln!("[firevibe] {msg}");
+            let _ = tx.send(Event::Log(msg));
+        });
+        Some(if n == 0 {
+            "正在清空遥控器上的红外码…".into()
+        } else {
+            format!("正在把 {n} 个红外码写进遥控器…")
+        })
+    }
+
     pub fn start(&self) -> Result<()> {
+        // ⚠️ 停止标志必须在这儿复位。它是**跨连接存活**的（`Arc<AtomicBool>` 挂在
+        // Runtime 上，不是每次 start 新建），而 `start_runtime` 永远是
+        // 「先 stop 再 start」—— 不复位的话新起的读线程第一圈就 `break`。
+        //
+        // 症状极其像"设备坏了"：打开成功、Connected 事件照发、hidremap 照下、
+        // 电量也读得到，就是**一个 HID 报文都收不到** —— 软遥控器不亮、
+        // 按键没反应、语音没音频。而 firectl 单独跑却一切正常（它不走这条路）。
+        //
+        // ⚠️ 但复位**必须等旧读线程真的退出之后**。直接置 false 的话，旧线程
+        // 可能压根没看到停止信号 —— 于是两个读线程同时开着同一个设备，
+        // 而 hidapi 在 macOS 上会给每个设备起自己的 run loop，撞在一起就把
+        // CoreFoundation 的对象写坏，崩在 `IOHIDDeviceScheduleWithRunLoop`
+        // → `__CFCheckCFInfoPACSignature`（Trace/BPT trap）。
+        self.stop.store(true, Ordering::Relaxed);
+        for _ in 0..50 {
+            if !self.hid_running.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        self.stop.store(false, Ordering::Relaxed);
         let exclusive = self.cfg.read().exclusive;
         let api = hidapi::HidApi::new().context("hidapi 初始化失败")?;
         #[cfg(target_os = "macos")]
@@ -392,9 +551,42 @@ impl Runtime {
         // 错误分类用 ASCII 前缀，别让界面去匹配中文 ——
         // 原来消息里永远带「输入监控」四个字，结果「设备没连上」也被显示成权限问题。
         let (vid, pid) = self.cfg.read().device_ids();
-        let dev = api.open(vid, pid).map_err(|e| {
+        // ⚠️ **必须认准 vendor collection**，不能用 `api.open(vid, pid)`。
+        //
+        // macOS 把这支遥控器拆成三个 top-level collection：
+        //   0x0001/0x06 键盘 · 0x000c/0x01 消费类 · **0x00ff/0x00 厂商**
+        // `open(vid, pid)` 拿的是**枚举出来的第一个**（实测是键盘那个），
+        // 而按键报文 0x02、音频报文 0xF0 都只从**厂商**那个 collection 出来。
+        // 开错了就是「设备连上了、映射也下发了、语音链路也建好了，
+        // 但一个报文都收不到」—— 界面上一切正常，按键却毫无反应。
+        //
+        // 枚举顺序不保证稳定，所以这不是"偶尔"，是"看运气"：重新配对之后
+        // 顺序变了就从能用变成不能用。firectl 的诊断命令当初就是特意挑
+        // 0x00ff 的（见 cli/src/main.rs 里那句「认准 vendor collection」），
+        // 但这个知识一直没搬进来。
+        let pick = api
+            .device_list()
+            .find(|d| d.vendor_id() == vid && d.product_id() == pid && d.usage_page() == 0x00ff)
+            .or_else(|| {
+                api.device_list()
+                    .find(|d| d.vendor_id() == vid && d.product_id() == pid)
+            })
+            .map(|d| d.path().to_owned());
+        let dev = pick
+            .ok_or_else(|| anyhow!("HID_NOT_FOUND: 没找到 {vid:#06x}/{pid:#06x}"))
+            .and_then(|path| Ok(api.open_path(&path)?))
+            .map_err(|e| {
             let raw = e.to_string();
-            let kind = if raw.contains("not permitted") || raw.contains("0xE00002E2") {
+            // 0xE00002C1 (kIOReturnNotPrivileged / "privilege violation") 是
+            // `IOHIDDeviceOpen` 在**没有「输入监控」权限**时的返回码 —— 枚举不需要
+            // 权限，所以设备列得出来、就是打不开。以前它落进 HID_ERROR，界面只显示
+            // 一句看不懂的英文，不提示去开授权，白查了很久。
+            // （另一个码 0xE00002E2 not permitted 出现在 SetReport 上，见文档。）
+            let kind = if raw.contains("not permitted")
+                || raw.contains("0xE00002E2")
+                || raw.contains("privilege violation")
+                || raw.contains("0xE00002C1")
+            {
                 "HID_NOT_PERMITTED"
             } else if raw.contains("No HID devices") || raw.contains("not found") {
                 "HID_NOT_FOUND"
@@ -444,11 +636,22 @@ impl Runtime {
         let dictating = self.dictating.clone();
         let recording = self.recording.clone();
         let stop = self.stop.clone();
+        let hid_running = self.hid_running.clone();
         let tx = self.tx.clone();
 
         std::thread::Builder::new()
             .name("firevibe-hid".into())
             .spawn(move || {
+                // 用 guard 置位/清位，保证任何退出路径（含 `?`、panic）都会清掉，
+                // 否则 `start()` 会一直等一个已经死了的线程
+                struct Alive(Arc<AtomicBool>);
+                impl Drop for Alive {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Relaxed);
+                    }
+                }
+                hid_running.store(true, Ordering::Relaxed);
+                let _alive = Alive(hid_running);
                 let mut dec = match opus::Decoder::new(OPUS_RATE, opus::Channels::Mono) {
                     Ok(d) => d,
                     Err(e) => {
@@ -973,7 +1176,7 @@ impl Runtime {
                 return if r.is_empty() { "试录 2 秒".into() } else { format!("{r} · 2 秒") };
             }
             if act.kind == ActionType::VoicePtt {
-                let r = self.run_action(&act, true);
+                let r = self.run_action_at(&act, true, Some(slot));
                 if let Some(sink) = self.voice.lock().clone() {
                     let (cfg, st, prev) =
                         (self.cfg.clone(), self.status.clone(), self.prev_input.clone());
@@ -984,7 +1187,7 @@ impl Runtime {
                 }
                 return format!("{r} · 2 秒");
             }
-            return self.run_action(&act, true);
+            return self.run_action_at(&act, true, Some(slot));
         }
         // 没配就走默认直通：方向键 / OK / 返回 / 音量 / 静音 / 播放 / 快进快退
         // 按了就该有反应，不该要求先配一遍
@@ -1002,6 +1205,17 @@ impl Runtime {
 
     /// 执行一个动作。`down` 只对按住说话有意义（true=开始送流）。
     pub fn run_action(&self, act: &Action, down: bool) -> String {
+        self.run_action_at(act, down, None)
+    }
+
+    /// 和 [`Self::run_action`] 一样，但告诉它这个动作挂在哪个键上。
+    /// 仿品遥控器的红外要按 scanId 找行，不知道是哪个键就没法把话说准。
+    pub fn run_action_at(
+        &self,
+        act: &Action,
+        down: bool,
+        slot: Option<crate::layout::Slot>,
+    ) -> String {
         match act.kind {
             ActionType::None => "未设置".into(),
             ActionType::VoicePtt => {
@@ -1042,7 +1256,11 @@ impl Runtime {
             ActionType::Record => {
                 return run_record(&self.status, &self.recording, &self.tx, down);
             }
-            ActionType::IrBlast => return ir_blast(&self.tx, act),
+            ActionType::IrBlast => {
+                let ptt = self.cfg.read().settings.mic_model.is_ptt();
+                return ir_blast(&self.tx, act, ptt, slot);
+                // slot 为 None 时（CLI 直接跑动作）只能说通用的那句
+            }
             ActionType::VoiceDictate => {
                 let long = act.arg == "hold";
                 if !long && !down {
@@ -1176,9 +1394,24 @@ impl Runtime {
         // 映射是系统状态，退出必须清 —— 留着遥控器那颗键会一直是修饰键
         crate::hidremap::clear();
         self.restore_input();
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop_light();
         self.status.mic_on.store(false, Ordering::Relaxed);
         self.stop_voice();
+    }
+
+    /// 只让 HID 读线程退出，**不动映射、不拆语音链路**。重连尝试用这个。
+    ///
+    /// 为什么不能在重连时用完整的 `stop()`：这台遥控器空闲几秒就掉线，
+    /// 重连每 300ms 试一次，于是
+    /// · `hidremap::clear()` 每秒被调三次 —— 白跑三个 hidutil 进程，
+    ///   而且清掉和补上之间有窗口，正好按到麦克风键就弹 Spotlight；
+    /// · `stop_voice()` 把 cpal 的输出流反复拆了又建 —— 纯浪费，
+    ///   而且一旦界面那边没重建就彻底哑掉（见 `has_voice`）。
+    ///
+    /// 两样都是**跨连接存活**的东西：映射靠 `sync_hid_remap()` 幂等重下，
+    /// sink 和 HID 连接本来就没关系。
+    pub fn stop_light(&self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1344,7 +1577,7 @@ fn dispatch(
         ActionType::None => "未设置".into(),
         // 上面已经提前返回了，这条只是让 match 穷尽
         ActionType::Record => String::new(),
-        ActionType::IrBlast => ir_blast(tx, &act),
+        ActionType::IrBlast => ir_blast(tx, &act, cfg.read().settings.mic_model.is_ptt(), Some(slot)),
         ActionType::Key => match inj.key_stroke(&act.key, &act.mods) {
             Ok(_) => act.describe(),
             Err(e) => format!("失败: {e}"),
@@ -1912,15 +2145,41 @@ fn ir_device_name() -> String {
     crate::battery::target_name()
 }
 
-/// 让遥控器打一发红外。
+/// 让遥控器打一发红外。**两种遥控器走的路完全相反**：
 ///
-/// 现在只做到**校验 + 编译**：把用户配的码解析出来、按固件的格式编译成载荷，
-/// 错在哪儿立刻告诉他。真正的发射要走 BLE GATT 的 KeyMap 服务
-/// （`FE151500` / `FE151503` BLAST），得像 battprobe 那样起个独立的
-/// CoreBluetooth 小进程 —— 那部分还没写（见 CLAUDE.md「红外发射」）。
+/// - **原厂 0x0421（热麦克风）**：实现了 blast —— 这里现编码、现写进
+///   `FE151503`，遥控器立刻打一发。即时、不留痕、任意键都能绑。
+/// - **仿品 0x0425（PTT）**：**没有** blast。红外是事先烧进它的键位表的
+///   （见 [`Runtime::sync_ir_table`]），按实体键时**遥控器自己就发了** ——
+///   等这个函数被调到，红外早已经出去了。所以这里什么都不做，只回一句话。
 ///
-/// 这样排的好处：码配得对不对现在就能验，不用等发射通道。
-fn ir_blast(tx: &Sender<Event>, act: &Action) -> String {
+/// 这个区别不是实现偷懒，是固件决定的。仿品上试过 blast 的全套流程，
+/// 设备回 `0x02` 说成功但什么都不发（见 NOTES.md）。
+fn ir_blast(
+    tx: &Sender<Event>,
+    act: &Action,
+    ptt: bool,
+    slot: Option<crate::layout::Slot>,
+) -> String {
+    if ptt {
+        // 仿品：红外已经由遥控器自己发出去了。这里只负责把话说清楚。
+        if let Some(s) = slot {
+            if !crate::irtable::supports_ir(s) {
+                let m = "这个键在仿品遥控器上挂不了红外 —— 只有开关机 / 音量± / 静音四个键可以"
+                    .to_string();
+                let _ = tx.send(Event::Log(m.clone()));
+                return m;
+            }
+        }
+        return match crate::ir::IrCode::parse(&act.arg) {
+            Ok(c) => format!("红外由遥控器自己发出 · {}", c.summary()),
+            Err(e) => {
+                let m = format!("红外码有问题：{e}");
+                let _ = tx.send(Event::Log(m.clone()));
+                m
+            }
+        };
+    }
     match crate::ir::IrCode::parse(&act.arg) {
         Err(e) => {
             let m = format!("红外码有问题：{e}");

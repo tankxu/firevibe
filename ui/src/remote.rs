@@ -104,12 +104,14 @@ impl FireVibe {
         if self.soft.map(|(x, _)| x == s).unwrap_or(false) {
             return Press::Flash;
         }
+        // 用 key_lit 而不是直接查 `pressed`：快按一下的话，等真正绘制时
+        // `pressed` 可能已经被清空了，要靠余辉兜住（见 FireVibe::flash）
         let hit = self
             .rt
             .cfg
             .read()
             .slot_key(s)
-            .map(|k| self.pressed.contains(&k))
+            .map(|k| self.key_lit(&k))
             .unwrap_or(false);
         if hit {
             Press::Flash

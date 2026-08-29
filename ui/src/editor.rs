@@ -56,6 +56,14 @@ impl FireVibe {
             // 说没见过双击触发，所以只作为可选项留着，不当默认。
             dbl: a.arg == "double",
             input,
+            // 已有的码里带 label 就填进去，方便改
+            ir_name: new_line_input(
+                &firevibe_core::ir::IrCode::parse(&a.arg)
+                    .map(|c| c.label)
+                    .unwrap_or_default(),
+                window,
+                cx,
+            ),
             ir_q: new_line_input("", window, cx),
             ir_pick: None,
             post: a.method.eq_ignore_ascii_case("POST"),
@@ -112,6 +120,11 @@ impl FireVibe {
         // 麦克风键短按：四个语音动作**照常列出**，选中时用一行说明代替配置项 ——
         // 那才是用户真会去点、且需要被告知的地方。
         let hide_voice = ptt_other_key;
+        // 仿品的红外是烧进它的键位表的：一个 scanId 一条码，只有四个键有 scanId，
+        // 而且表里没有「长按」这回事。挂不上的地方干脆不给选 —— 让用户配一个
+        // 永远不会响的动作，比不给配更糟。
+        let ir_burnable = firevibe_core::irtable::supports_ir(d.slot) && !d.long;
+        let hide_ir = is_ptt && !ir_burnable;
 
         // 动作类型
         let mut types = div().flex().flex_wrap().gap(px(6.));
@@ -122,6 +135,9 @@ impl FireVibe {
                 continue;
             }
             if d.long && k == ActionType::VoiceToggle {
+                continue;
+            }
+            if hide_ir && k == ActionType::IrBlast {
                 continue;
             }
             if hide_voice
@@ -170,9 +186,17 @@ impl FireVibe {
                 }),
             ));
         }
+        // 内容区自己滚：动作类型不同高度差很多（红外那种带说明+码库+长码预览+校验，
+        // 能顶到屏幕外）。头部和底部按钮固定，只有中间滚 —— 否则「保存」会被挤出可视区。
+        // `min_h(0)` 不能省：flex 子项默认 min-height:auto，不给 0 它不肯被压缩，
+        // max_h 就形同虚设。
         let mut body = div()
+            .id("dlg-body")
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
             .gap(px(16.))
             .px(px(18.))
             .pt(px(2.))
@@ -306,17 +330,37 @@ l.hotkey_tap_hint()
                 let txt = d.input.read(cx).value().to_string();
                 // 空着不报错 —— 刚点进来还没开始填就先甩个警告，纯属添堵。
                 // 「没填」这件事留到保存时再拦（见 save_dialog）。
+                // 两种遥控器的红外语义是反的，说法也得两套：
+                //   原厂 —— app 现场发射，「按下那个键就打出去」
+                //   仿品 —— 码烧进遥控器，按实体键它自己发（电脑关着也发）
+                let tail = if is_ptt { l.ir_clone_note() } else { l.ir_not_wired() };
                 let verdict = if txt.trim().is_empty() {
                     None
                 } else {
                     Some(match firevibe_core::ir::IrCode::parse(&txt) {
-                        Ok(c) => (true, format!("{}\n{}", c.summary(), l.ir_not_wired())),
+                        // 解析通过不等于能用：仿品对单条码有脉冲数上限，
+                        // 超了必须**在这儿**就变成警告 —— 否则用户看到绿色的
+                        // 「码没问题」，到保存才被拦，白填一趟。
+                        Ok(c) => match is_ptt.then(|| firevibe_core::irtable::check_code(&c)) {
+                            Some(Err(e)) => (false, format!("{}\n{e}", c.summary())),
+                            _ => (true, format!("{}\n{}", c.summary(), tail)),
+                        },
                         Err(e) => (false, e),
                     })
                 };
+                let limits = if is_ptt {
+                    format!("{}\n{}", l.ir_clone_slots(), l.ir_clone_budget())
+                } else {
+                    l.ir_limits().to_string()
+                };
                 body = body
-                    .child(hint_box(format!("{}\n{}", l.ir_help(), l.ir_limits())))
-                    .child(ir_library(d, l, cx))
+                    .child(hint_box(format!("{}\n{}", l.ir_help(), limits)))
+                    .child(ir_library(d, l, is_ptt, cx))
+                    .child(
+                        div()
+                            .child(field_lab(l.ir_name_label()))
+                            .child(input_box(&d.ir_name)),
+                    )
                     .child(div().child(field_lab(l.ir_code_label())).child(code_field(d)))
                     .when_some(verdict, |b, (ok, msg)| {
                         b.child(note_box(msg, if ok { Note::Ok } else { Note::Warn }))
@@ -408,12 +452,16 @@ l.hotkey_tap_hint()
         let foot = div()
             .flex()
             .items_center()
+            .flex_shrink_0()
             .gap(px(8.))
             .px(px(18.))
             .py(px(13.))
             .border_t_1()
             .border_color(c(LINE))
             .bg(c(FOOT_BG))
+            // 自己收圆角：gpui 的 ContentMask 是矩形的，父容器的 overflow_hidden
+            // 不按圆角裁，直角的按钮栏会从弹窗圆角里探出来。14 减去 1px 边框。
+            .rounded_b(px(13.))
             .child(
                 mini2_ico("dlg-test", "zap", l.test_once()).on_click(cx.listener(
                     |this, _, _, cx| {
@@ -437,16 +485,23 @@ l.hotkey_tap_hint()
             .child(
                 div()
                     .id("dlg")
+                    .flex()
+                    .flex_col()
                     .w(px(520.))
+                    // 别顶满：留一圈才看得出是浮层，也不会贴着窗口边
+                    .max_h(gpui::relative(0.88))
                     .bg(c(SURFACE))
                     .border_1()
                     .border_color(c(LINE))
                     .rounded(px(14.))
+                    // 底部那条按钮栏是直角的，不裁就会从圆角里探出来
+                    .overflow_hidden()
                     .shadow(sh3())
                     .child(
                         div()
                             .flex()
                             .items_start()
+                            .flex_shrink_0()
                             .gap(px(12.))
                             .px(px(18.))
                             .pt(px(16.))
@@ -509,6 +564,18 @@ l.hotkey_tap_hint()
             a.retries = d.retries_in.read(cx).value().trim().parse().unwrap_or(0);
             a.timeout_ms = d.timeout_in.read(cx).value().trim().parse().unwrap_or(0);
         }
+        // 红外：把名称写进码里再存成 JSON。
+        // 必须转成 JSON —— Pronto 和裸时长数组都表达不了 label，
+        // 用户填了名字却存回原格式的话，下次打开就没了。
+        if d.kind == ActionType::IrBlast {
+            let name = d.ir_name.read(cx).value().trim().to_string();
+            if let Ok(mut code) = firevibe_core::ir::IrCode::parse(&a.arg) {
+                if code.label != name {
+                    code.label = name;
+                    a.arg = code.to_json();
+                }
+            }
+        }
         Some(a)
     }
     /// 保存弹窗
@@ -517,13 +584,33 @@ l.hotkey_tap_hint()
         // 红外码在这儿才拦：编辑时空着不报错，但空着/写错了不给存 —— 存进去
         // 也是个按下去只会报错的死动作。
         if a.kind == ActionType::IrBlast {
-            if let Err(e) = firevibe_core::ir::IrCode::parse(&a.arg) {
-                self.toast(e);
-                return;
+            match firevibe_core::ir::IrCode::parse(&a.arg) {
+                Err(e) => {
+                    self.toast(e);
+                    return;
+                }
+                // 仿品放不下的码不给存 —— 存进去只会在同步时失败，
+                // 而更早的版本会直接写进遥控器，那个键从此发一条乱码
+                Ok(c) if self.rt.cfg.read().settings.mic_model.is_ptt() => {
+                    if let Err(e) = firevibe_core::irtable::check_code(&c) {
+                        self.toast(e);
+                        return;
+                    }
+                }
+                Ok(_) => {}
             }
         }
+        let is_ir = a.kind == ActionType::IrBlast;
         let Some(d) = &self.dialog else { return };
         let (slot, long) = (d.slot, d.long);
+        // 原来是红外、现在改成别的 —— 也得重写表，不然遥控器里还烧着旧码
+        let was_ir = self
+            .rt
+            .cfg
+            .read()
+            .profile()
+            .action(slot, long)
+            .is_some_and(|old| old.kind == ActionType::IrBlast);
         {
             let mut g = self.rt.cfg.write();
             if long {
@@ -533,13 +620,27 @@ l.hotkey_tap_hint()
             }
         }
         self.save();
+        // 仿品遥控器：红外码得真写进它的键位表才会生效。改完就同步 ——
+        // 四行一起写，所以「把动作删了」也要走这一趟，才能把旧码清掉。
+        if is_ir || was_ir {
+            if let Some(m) = self.rt.sync_ir_table() {
+                self.toast(m);
+            }
+        }
         self.dialog = None;
         cx.notify();
     }
     /// 弹窗里「测试一次」：用当前编辑值直接跑，不落盘
     fn run_dialog_action(&mut self, cx: &mut Context<Self>) {
         let Some(a) = self.build_action(cx) else { return };
-        let r = self.rt.run_action(&a, true);
+        // 仿品的红外电脑指挥不动（它自己按键才发），别让「测试一次」假装成功
+        if a.kind == ActionType::IrBlast && self.rt.cfg.read().settings.mic_model.is_ptt() {
+            self.toast(self.l().ir_clone_untestable().to_string());
+            cx.notify();
+            return;
+        }
+        let slot = self.dialog.as_ref().map(|d| d.slot);
+        let r = self.rt.run_action_at(&a, true, slot);
         self.toast(if r.is_empty() { self.l().toast_executed().into() } else { r });
         cx.notify();
     }
@@ -790,7 +891,17 @@ fn hint_box(text: impl Into<SharedString>) -> AnyElement {
 /// 为什么值得做：用户手上大概率只有「我家是大金空调」这点信息，让他去网上找
 /// Pronto 码、或者搬个 ESP32 来抓，门槛太高。库里 1400 多个设备两万多条码，
 /// 搜一下点一下就完事。
-fn ir_library(d: &EditState, l: crate::i18n::L, cx: &mut Context<FireVibe>) -> AnyElement {
+/// 码库：搜设备 → 挑按键 → 填进输入框。
+///
+/// `ptt` 为真时把放不进仿品遥控器的按键标出来 —— 让人挑完才知道选不了，
+/// 比一开始就说清楚糟糕得多。标记而不是隐藏：那条码确实存在，
+/// 只是得换原厂遥控器发。
+fn ir_library(
+    d: &EditState,
+    l: crate::i18n::L,
+    ptt: bool,
+    cx: &mut Context<FireVibe>,
+) -> AnyElement {
     let q = d.ir_q.read(cx).value().to_string();
 
     let mut col = div()
@@ -825,15 +936,22 @@ fn ir_library(d: &EditState, l: crate::i18n::L, cx: &mut Context<FireVibe>) -> A
                 cx.notify();
             })),
         );
+        let pulses = firevibe_core::irdb::pulses_of(idx);
         for (i, (name, src)) in btns.into_iter().enumerate() {
             // 合成出来的标一下来源，万一发不出去用户知道该去抓真码
-            let label = if src == "raw" { name } else { format!("{name} ·{src}") };
+            let mut label = if src == "raw" { name } else { format!("{name} ·{src}") };
+            if ptt && pulses.get(i).is_some_and(|n| *n > firevibe_core::irtable::MAX_PULSES) {
+                label = format!("{label} ·{}", l.ir_lib_toolong());
+            }
             row = row.child(chip_sm(("ir-btn", i), label, false).on_click(cx.listener(
                 move |this, _, window, cx| {
                     let Some(code) = firevibe_core::irdb::code_of(idx, i) else { return };
                     let text = code.to_json();
                     if let Some(d) = &this.dialog {
                         d.input.update(cx, |s, cx| s.set_value(&text, window, cx));
+                        // 名称框跟着填上「品牌 型号 · 按键」，不然用户还得自己抄一遍
+                        let name = code.label.clone();
+                        d.ir_name.update(cx, |s, cx| s.set_value(&name, window, cx));
                     }
                     cx.notify();
                 },

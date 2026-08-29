@@ -40,6 +40,8 @@ const TOPBAR_H: f32 = 40.;
 const CONTENT_MAX_W: f32 = 1280.;
 /// 卡片 hover 过渡时长
 const HOVER_MS: Duration = Duration::from_millis(140);
+/// 实体键按下后的余辉时长 —— 比 pump 的 70ms 长几倍，快按也一定看得见
+const FLASH: Duration = Duration::from_millis(160);
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
@@ -94,6 +96,9 @@ pub struct EditState {
     pub focus: gpui::FocusHandle,
     /// 正在等你按组合键
     pub recording: bool,
+    /// 红外：这条码是干嘛的（存进 `IrCode.label`）。
+    /// 光看一串时长数字过两天就忘了是哪台设备的哪个键 —— 卡片摘要和校验框都显示它。
+    pub ir_name: Entity<InputState>,
     /// 红外：内置码库的搜索框
     pub ir_q: Entity<InputState>,
     /// 红外：搜索结果里选中的设备（库里的下标），选了才列按键
@@ -105,6 +110,17 @@ pub struct EditState {
 }
 
 pub struct FireVibe {
+    /// 实体键按下后的「余辉」：键 -> 按下时刻。
+    ///
+    /// 为什么需要：快按一下只有**一个 70ms 的 pump tick** 看得到 `pressed`，
+    /// 而 `cx.notify()` 只是标记「该重画」，**真正绘制在之后** —— 那时下一轮
+    /// pump 早把 `pressed` 清空了，于是画出来的那一帧没有高亮，闪都不闪。
+    /// （表现就是「按快了不亮、按久一点才亮」。）
+    /// 所以按下时点一盏灯，`FLASH` 这段时间内一直算亮。
+    pub flash: Vec<(firevibe_core::keys::Key, Instant)>,
+    /// 上一次重绘时界面的指纹 / 时刻（见 `paint_key`）
+    last_paint_key: u64,
+    last_paint: Instant,
     pub rt: Arc<Runtime>,
     rx: Receiver<Event>,
     pub screen: Screen,
@@ -321,15 +337,45 @@ impl FireVibe {
         cx.spawn(async move |this, cx| {
             let mut fast = false;
             loop {
-                let ms = if fast { 16 } else { 70 };
+                // 缩在状态栏时把节奏放慢、而且**不重绘** —— 没人看的一帧不用画。
+                //
+                // 实测：`cx.notify()` 每 70ms 一次 = 常年 14fps 全量重绘整棵元素树，
+                // app 空闲也吃 12~20% CPU，**窗口隐藏了照样画**（采样里全是 gpui 的
+                // 布局/绘制递归）。而这个 app 的常态就是缩在状态栏跑一整天。
+                //
+                // `pump()` 照常跑（HID 重连、电量、配置这些不能停），只是不画。
+                // 悬浮电平条是独立窗口、有自己的 16ms 定时器，不受影响。
+                let hidden = firevibe_core::tray::is_hidden();
+                let ms = if fast {
+                    16
+                } else if hidden {
+                    300
+                } else {
+                    70
+                };
                 cx.background_executor().timer(Duration::from_millis(ms)).await;
                 match this.update(cx, |v, cx| {
                     v.pump();
                     // 开/关悬浮窗必须在绘制过程之外做，
                     // 在 render() 里调 open_window 会重入 GPUI 的绘制、直接把进程带走
                     v.sync_hud(cx);
-                    cx.notify();
-                    v.animating()
+                    // 只在「界面真的变了 / 有动画在跑 / 距上次重绘超过 500ms」时重绘。
+                    // 500ms 是兜底：paint_key 万一漏了某个状态，那部分退化成 2fps，
+                    // 不至于卡住不动。
+                    let key = v.paint_key();
+                    let anim = v.animating();
+                    let due = v.last_paint.elapsed() > Duration::from_millis(500);
+                    let paint = anim || key != v.last_paint_key || due;
+                    if !v.pressed.is_empty() && std::env::var_os("FIREVIBE_TRACE_UI").is_some() {
+                        eprintln!("[ui] 有键按着 anim={anim} 指纹变={} 到期={due} 重绘={paint}",
+                            key != v.last_paint_key);
+                    }
+                    if paint {
+                        v.last_paint_key = key;
+                        v.last_paint = Instant::now();
+                        cx.notify();
+                    }
+                    anim
                 }) {
                     Ok(f) => fast = f,
                     Err(_) => break,
@@ -339,6 +385,9 @@ impl FireVibe {
         .detach();
         let show_onb = !rt.cfg.read().settings.onboarded;
         Self {
+            flash: Vec::new(),
+            last_paint_key: 0,
+            last_paint: Instant::now(),
             rt,
             rx,
             screen: Screen::Main,
@@ -511,8 +560,55 @@ impl FireVibe {
     }
 
     /// 还有动画在跑吗 —— 决定下一帧的间隔
+    /// 界面「看起来」的样子的指纹。只有它变了才值得重画。
+    ///
+    /// 为什么需要：`pump` 每 70ms 无条件 `cx.notify()`，等于常年 14fps 全量重绘
+    /// 整棵元素树 —— app 完全空闲也吃 12% CPU（`sample` 里主线程全是 gpui 的
+    /// 布局/绘制递归）。而它的常态是缩在状态栏跑一整天。
+    ///
+    /// ⚠️ 这里**不必列全**：漏掉的状态由调用处 500ms 的兜底重绘接住，
+    /// 最差是那部分以 2fps 更新，不会卡死不动。按下高亮这种对延迟敏感的
+    /// 一定要列进来。
+    fn paint_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.connected().hash(&mut h);
+        (self.screen as u8).hash(&mut h);
+        self.dialog.is_some().hash(&mut h);
+        self.err.is_some().hash(&mut h);
+        self.toast.is_some().hash(&mut h);
+        self.adding.hash(&mut h);
+        self.pairing.hash(&mut h);
+        self.menu_open.hash(&mut h);
+        self.input_open.hash(&mut h);
+        self.hover_card.hash(&mut h);
+        self.voice_ready.hash(&mut h);
+        self.loopback.is_ready().hash(&mut h);
+        self.rt.status.mic_on.load(Ordering::Relaxed).hash(&mut h);
+        // 按下高亮：延迟最敏感，一定要进指纹
+        let mut ks: Vec<_> = self.pressed.iter().map(|k| (k.page, k.usage)).collect();
+        ks.sort_unstable();
+        ks.hash(&mut h);
+        let mut fs: Vec<_> = self.flash.iter().map(|(k, _)| (k.page, k.usage)).collect();
+        fs.sort_unstable();
+        fs.hash(&mut h);
+        h.finish()
+    }
+
+    /// 某个键现在该不该亮：正按着，或者刚按过还在余辉里
+    pub fn key_lit(&self, k: &firevibe_core::keys::Key) -> bool {
+        self.pressed.contains(k) || self.flash.iter().any(|(x, _)| x == k)
+    }
+
     pub fn animating(&self) -> bool {
-        self.rt.dictating.lock().is_some()
+        // 有键按着就一直算「在动」。指纹能抓到按下/松开那两个**瞬间**，但
+        // 「按住期间」的高亮要靠持续重绘 —— 只靠指纹的话，按下那一帧画完就不再画，
+        // 而 render() 是在 notify **之后**才读 `self.pressed` 的，
+        // 中间可能已经被下一轮 pump 清空 → 高亮闪都不闪一下。
+        // （表现就是「窗口打开后第一次按键不亮、第二次才亮」。）
+        !self.pressed.is_empty()
+            || !self.flash.is_empty()
+            || self.rt.dictating.lock().is_some()
             || self.voice_test
             || self.soft.is_some()
             || ((self.hover_card.is_some() || self.hover_from.is_some())
@@ -567,9 +663,18 @@ impl FireVibe {
         }
         // HID 打开也会跑 run loop，同样不能放构造期。
         // 「设备没连上」是正常状态不是错误 —— 不弹错误条，靠状态卡高亮表示，
-        // 后台每 2 秒自己重试，遥控器一醒就自动连上。
-        if !self.started || (!self.connected() && self.hid_try_at.elapsed() > Duration::from_secs(2))
-        {
+        // 后台自己重试，遥控器一醒就自动连上。
+        //
+        // ⚠️ 间隔必须**远小于遥控器的在线窗口**。这台仿品按一下只醒 3 秒左右，
+        // 原来 2 秒一次经常整个窗口都错过 —— 表现是按麦克风键弹 Spotlight
+        // （hidremap 还没下发）、或者干脆没反应。
+        //
+        // 之前不敢调快是以为重连很贵，实测根本不是：
+        // `HidApi::new()` ≈ 5ms、`open()` ≈ 1.7ms（设备不在时也是这个量级）。
+        // 300ms 一次 = 每秒约 20ms，可以忽略；而抓住 3 秒窗口就变得很稳。
+        // 已有 `start_rx` 的并发保护，不会叠着起。
+        const HID_RETRY: Duration = Duration::from_millis(300);
+        if !self.started || (!self.connected() && self.hid_try_at.elapsed() > HID_RETRY) {
             let first = !self.started;
             self.started = true;
             self.hid_try_at = Instant::now();
@@ -604,14 +709,36 @@ impl FireVibe {
         // cpal 打开设备会跑 run loop，在 update 里同步做会触发那个 RefCell panic。
         // 注意只建链路不开麦，开麦是按需的（热麦克风会让蓝灯一直闪还费电）。
         if let Some(rx) = &self.voice_rx {
-            if let Ok(r) = rx.try_recv() {
+            // ⚠️ `Disconnected` 必须一起处理，不能只认 `Ok`：建 sink 的线程一旦
+            // panic，sender 直接被丢掉，之后 try_recv 永远是 Disconnected ——
+            // 只认 Ok 的话 `voice_rx` 就永久卡在 Some，下面的重建分支再也进不去，
+            // 语音从此彻底哑掉。症状极难认：快捷键照发（那段在 sink 判断之外，
+            // 第三方工具照常弹出来），但音频不进虚拟声卡、电平条不出、输入也不切。
+            // try_recv 只能调一次 —— 调两次的话第一次拿到的 Ok 会被丢掉
+            let got = rx.try_recv();
+            if matches!(got, Err(std::sync::mpsc::TryRecvError::Disconnected)) {
+                eprintln!("[firevibe] 建语音链路的线程没回话（多半 panic 了），下一轮重来");
+                self.voice_rx = None;
+            } else if let Ok(r) = got {
                 self.voice_rx = None;
                 match r {
-                    Ok(()) => self.voice_ready = true,
-                    Err(e) => { let m = self.l().toast_voice_start_failed(&e.to_string()); self.toast(m); }
+                    Ok(()) => {
+                        self.voice_ready = true;
+                        eprintln!("[firevibe] 语音链路已建立（sink={}）", self.rt.has_voice());
+                    }
+                    Err(e) => {
+                        // 只弹 toast 的话，用户走开一眼就错过了，而症状
+                        // （第三方工具有条但没声音）完全看不出是这儿断的
+                        eprintln!("[firevibe] 语音链路建立失败: {e}");
+                        let m = self.l().toast_voice_start_failed(&e.to_string());
+                        self.toast(m);
+                    }
                 }
             }
-        } else if !self.voice_ready && self.loopback.is_ready() {
+        } else if !self.rt.has_voice() && self.loopback.is_ready() {
+            // 判据是**运行时真的有没有 sink**，不是「建过没有」。
+            // 每次重连尝试都会 `rt.stop()` → `stop_voice()` 把 sink 销毁，
+            // 用一次性标志位就再也不会重建（见 Runtime::has_voice 的注释）。
             let rt = self.rt.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             self.voice_rx = Some(rx);
@@ -630,6 +757,9 @@ impl FireVibe {
         // 丢后台线程，结果走 channel 回来
         if let Some(rx) = &self.loopback_rx {
             if let Ok(st) = rx.try_recv() {
+                if st.is_ready() != self.loopback.is_ready() {
+                    eprintln!("[firevibe] 虚拟声卡状态 -> {st:?}");
+                }
                 self.loopback = st;
                 self.loopback_rx = None;
                 self.loopback_at = Instant::now();
@@ -643,7 +773,24 @@ impl FireVibe {
             });
         }
         // 实体按下状态
-        self.pressed = self.rt.pressed.lock().clone();
+        let was = std::mem::replace(&mut self.pressed, self.rt.pressed.lock().clone());
+        // 新按下的键点灯；过期的摘掉
+        for k in self.pressed.iter() {
+            if !was.contains(k) {
+                self.flash.retain(|(x, _)| x != k);
+                self.flash.push((*k, Instant::now()));
+            }
+        }
+        self.flash.retain(|(_, t)| t.elapsed() < FLASH);
+        // `FIREVIBE_TRACE_UI=1` 时把「按下集合」的每次变化打出来。
+        // 加它是因为查「按键不高亮」时完全没有可观测性 —— 只能靠猜。
+        if (was != self.pressed) && std::env::var_os("FIREVIBE_TRACE_UI").is_some() {
+            eprintln!(
+                "[ui] pressed {:?} -> {:?}",
+                was.iter().map(|k| (k.page, k.usage)).collect::<Vec<_>>(),
+                self.pressed.iter().map(|k| (k.page, k.usage)).collect::<Vec<_>>()
+            );
+        }
         // 更新检查结果
         if let Some(rx) = &self.update_rx {
             if let Ok(st) = rx.try_recv() {
@@ -1085,6 +1232,21 @@ impl FireVibe {
         let name = cur.as_ref().map(|d| d.name.clone()).unwrap_or_else(|| "—".into());
         // 当前默认输入就是虚拟声卡 → 系统正在听遥控器
         let on_loopback = name.to_lowercase().contains(&want);
+        // ⚠️ 但停在虚拟声卡上、我们又**没有在送流**，那就不是「正在听遥控器」，
+        // 是**所有应用都在收静音** —— 会议、听写、第三方语音输入全哑。
+        //
+        // 这个状态之前是完全静默的：芯片照样高亮、副标题还写着「系统输入」，
+        // 看起来一切正常。而且它**自己好不了**：`recover_input` 在
+        // `prev_input_id` 为空时直接返回，`gate_voice` 又因为「已经是虚拟声卡」
+        // 提前返回、记不下还原目标 —— 一旦进去就永远出不来。
+        // （我在反复打包时强杀进程，就把用户的机器搞成了这样。）
+        //
+        // 不自动切回去：把 FireVibe Mic 选成系统输入是个**正当用法**
+        // （「当一支普通麦克风用」），分不清是我们扔在这儿的还是用户自己选的。
+        // 所以只把话说清楚，切不切让用户点。
+        let streaming = self.rt.status.mic_on.load(Ordering::Relaxed)
+            || self.rt.dictating.lock().is_some();
+        let stuck = on_loopback && !streaming;
 
         let head = div()
             .id("input-switch")
@@ -1097,7 +1259,13 @@ impl FireVibe {
             .py(px(9.))
             .border_1()
             .bg(c(SURFACE))
-            .border_color(if on_loopback { c(ACCENT) } else { c(LINE) })
+            .border_color(if stuck {
+                c(WARN)
+            } else if on_loopback {
+                c(ACCENT)
+            } else {
+                c(LINE)
+            })
             .shadow(sh1())
             .cursor_pointer()
             .hover(|s| s.border_color(if on_loopback { c(ACCENT) } else { c(LINE_STRONG) }))
@@ -1132,8 +1300,12 @@ impl FireVibe {
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(c(INK3))
-                            .child(SharedString::from(l.system_input())),
+                            .text_color(if stuck { c(WARN) } else { c(INK3) })
+                            .child(SharedString::from(if stuck {
+                                l.input_stuck()
+                            } else {
+                                l.system_input()
+                            })),
                     ),
             )
             .child(
@@ -1245,7 +1417,9 @@ impl FireVibe {
         let (tx, rx) = std::sync::mpsc::channel();
         self.start_rx = Some((why, rx));
         std::thread::spawn(move || {
-            rt.stop();
+            // 只停 HID 读线程 —— 别用完整的 stop()，那会顺手清掉硬件层映射
+            // 并拆掉语音链路，而重连每 300ms 就来一次（见 Runtime::stop_light）
+            rt.stop_light();
             let _ = tx.send(rt.start().map_err(|e| format!("{e:#}")));
         });
     }
@@ -1263,6 +1437,12 @@ impl FireVibe {
                 // 后来才醒的话就永远没映射：麦克风键没被接管、Spotlight 照弹、
                 // 第三方语音工具拿不到硬件修饰键。这台仿品休眠很快，几乎必中。
                 if let Some(m) = self.rt.sync_hid_remap() {
+                    eprintln!("[firevibe] {m}");
+                }
+                // 仿品遥控器的红外码要烧进它自己的键位表 —— 写表走蓝牙、需要它
+                // 醒着，而它空闲几十秒就睡。所以「刚连上」是唯一可靠的时机。
+                // 里面有两道闸：没配过红外不写、表没变不写（见 maybe_sync_ir_table）。
+                if let Some(m) = self.rt.maybe_sync_ir_table() {
                     eprintln!("[firevibe] {m}");
                 }
                 match why {
@@ -1959,7 +2139,13 @@ impl FireVibe {
 
 /// 电量小电池：外框 + 按百分比填充 + 右侧正极
 fn battery_gauge(pct: i32) -> impl IntoElement {
-    let fill = (pct.clamp(0, 100) as f32 / 100.) * 15.6;
+    // 外壳 20 宽，边框和内边距各 1.6 —— gpui 是 border-box，
+    // 所以能填的只有 20 - 1.6*2 - 1.6*2 = 13.6。
+    // 以前按 15.6 算，96% 就撑出 15px 溢出被裁掉，看着和 100% 一模一样。
+    const SHELL: f32 = 20.0;
+    const EDGE: f32 = 1.6; // 边框宽 = 内边距
+    const INNER: f32 = SHELL - EDGE * 4.0;
+    let fill = (pct.clamp(0, 100) as f32 / 100.) * INNER;
     let col = if pct <= 15 { ERR } else if pct <= 30 { WARN } else { INK2 };
     div()
         .flex()
@@ -1967,12 +2153,12 @@ fn battery_gauge(pct: i32) -> impl IntoElement {
         .gap(px(1.5))
         .child(
             div()
-                .w(px(20.))
+                .w(px(SHELL))
                 .h(px(11.))
                 .rounded(px(3.))
-                .border(px(1.6))
+                .border(px(EDGE))
                 .border_color(c(col))
-                .p(px(1.6))
+                .p(px(EDGE))
                 .child(
                     div()
                         .w(px(fill.max(1.)))

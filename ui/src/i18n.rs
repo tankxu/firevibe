@@ -140,6 +140,19 @@ impl L {
     pub fn dsc_mode_tap(&self) -> &'static str { t!(self.0, "敲一下", "Single tap") }
     pub fn cli_tool(&self) -> &'static str { t!(self.0, "命令行工具 firectl", "Command-line tool (firectl)") }
     pub fn cli_tool_sub(&self) -> &'static str { t!(self.0, "配新遥控器 / 排障用", "For setting up a new remote / diagnostics") }
+    /// 系统输入停在虚拟声卡上、但我们并没有在送流 —— 此时所有应用都收不到声音
+    pub fn input_stuck(&self) -> &'static str {
+        t!(self.0,
+           "其它应用收不到声音 · 点这里换回麦克风",
+           "Other apps hear silence \u{2014} click to switch back")
+    }
+    pub fn repo(&self) -> &'static str { t!(self.0, "源码与文档", "Source & docs") }
+    pub fn repo_sub(&self) -> &'static str {
+        t!(self.0,
+           "GitHub 仓库 —— 使用说明、红外码怎么抓、提问题",
+           "GitHub repository \u{2014} how-tos, capturing IR codes, issues")
+    }
+    pub fn open_link(&self) -> &'static str { t!(self.0, "打开", "Open") }
     pub fn download(&self) -> &'static str { t!(self.0, "下载", "Download") }
 
     // 状态条
@@ -397,8 +410,12 @@ impl L {
     // ── 红外遥控 ──
     pub fn dsc_ir(&self) -> &'static str { t!(self.0, "红外遥控", "IR remote") }
     pub fn ir_lib_label(&self) -> &'static str { t!(self.0, "从内置码库找（搜品牌或型号）", "Find in the built-in library (search brand or model)") }
+    pub fn ir_lib_toolong(&self) -> &'static str { t!(self.0, "超长", "too long") }
     pub fn ir_lib_back(&self) -> &'static str { t!(self.0, "← 换设备", "← Back") }
     pub fn ir_lib_none(&self) -> &'static str { t!(self.0, "没搜到。换个写法试试，比如只写品牌。", "No match — try just the brand.") }
+    pub fn ir_name_label(&self) -> &'static str {
+        t!(self.0, "这是什么（给自己看的名字）", "What is it (a name for yourself)")
+    }
     pub fn ir_code_label(&self) -> &'static str { t!(self.0, "红外码", "IR code") }
     pub fn ir_help(&self) -> &'static str {
         t!(self.0,
@@ -407,13 +424,35 @@ impl L {
     }
     pub fn ir_limits(&self) -> &'static str {
         t!(self.0,
-           "限制来自遥控器固件：最多 2 段（Pronto 的 intro/repeat），单个时长 ≤ 32767 µs。多帧长码（比如空调）编成一段连续序列就行，帧间隔当长 space。",
-           "Limits come from the remote's firmware: at most 2 sequences (Pronto's intro/repeat) and each single duration ≤ 32767 µs. Multi-frame codes (A/C) fit as one continuous sequence — inter-frame gaps are just long spaces.")
+           "限制来自遥控器固件：最多 2 段（Pronto 的 intro/repeat），单个时长 ≤ 327670 µs。多帧长码（比如空调）编成一段连续序列就行，帧间隔当长 space。",
+           "Limits come from the remote's firmware: at most 2 sequences (Pronto's intro/repeat) and each single duration ≤ 327670 µs. Multi-frame codes (A/C) fit as one continuous sequence — inter-frame gaps are just long spaces.")
     }
     pub fn ir_not_wired(&self) -> &'static str {
         t!(self.0,
            "码没问题。按下那个键就会让遥控器打出去 —— 对准设备试试。",
            "Code looks good. Pressing that key makes the remote fire it — aim at the device and try.")
+    }
+
+    // ── 仿品遥控器（PTT 那派）的红外：烧进遥控器，不是即时发射 ──
+    pub fn ir_clone_note(&self) -> &'static str {
+        t!(self.0,
+           "这台遥控器的红外是**烧进去**的：保存后 app 会把码写进遥控器（十几秒，要它醒着）。之后按这个实体键就直接发射 —— 电脑关着也照发。把动作删掉再保存，就能把它清掉。",
+           "On this remote the code is **burned in**: after saving, the app writes it into the remote (takes a dozen seconds, remote must be awake). From then on the physical key fires it directly — even with the Mac off. Delete the action and save again to clear it.")
+    }
+    pub fn ir_clone_untestable(&self) -> &'static str {
+        t!(self.0,
+           "「测试一次」对这台遥控器没用 —— 红外由它自己发，电脑指挥不动。保存后按实体键试。",
+           "\u{201c}Test once\u{201d} does nothing on this remote — it fires IR on its own, the Mac cannot trigger it. Save, then press the physical key.")
+    }
+    pub fn ir_clone_slots(&self) -> &'static str {
+        t!(self.0,
+           "这台遥控器只有开关机 / 音量+ / 音量− / 静音四个键能挂红外，而且只能配在短按上 —— 它的键位表里没有长按这回事。",
+           "On this remote only Power / Vol+ / Vol\u{2212} / Mute can carry IR, and only on short press — its key table has no notion of a long press.")
+    }
+    pub fn ir_clone_budget(&self) -> &'static str {
+        t!(self.0,
+           "这台遥控器的红外还在完善中：目前只支持到约 70 个脉冲的短码 —— 电视、机顶盒那种一帧的码（NEC / Samsung 多是 67~68 个）没问题。再长的会被遥控器丢掉、改发一条乱码，所以先拦住。长码请用原厂遥控器，它走的是另一条通路，空调整帧都发得出去。",
+           "IR on this remote is still a work in progress: for now only short codes (about 70 pulses) are supported — a one-frame TV or set-top box code (NEC / Samsung are usually 67-68) is fine. Anything longer gets dropped by the remote, which then emits an unrelated code, so it is rejected up front. For long codes use the original remote — it takes a different path and handles a full A/C frame.")
     }
 
     // ── PTT 遥控器提醒 ──

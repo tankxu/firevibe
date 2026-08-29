@@ -414,28 +414,40 @@ CoreBluetooth 直接可达（和读电量同一条路）。
 
 ### 现在做到哪儿
 
-- ✅ `core/src/ir.rs` —— 码的解析 / 校验 / 编译成设备载荷，7 个单测覆盖格式细节
-- ✅ `ActionType::IrBlast` + 编辑器里的粘贴框（边填边校验）+ 卡片摘要
-- ❌ **发射通道没接** —— 触发时只校验+编译，然后如实说「通道还没接通」
+- ✅ `core/src/ir.rs` —— 码的解析 / 校验 / 编译成设备载荷，20 个单测覆盖格式细节
+- ✅ 内置码库 `core/src/irdb.rs`（Flipper-IRDB，CC0，1605 设备 / 25767 条码 / 0.99 MB）
+- ✅ `ActionType::IrBlast` + 编辑器里的粘贴框 + 码库搜索 + 卡片摘要
+- ✅ **官方遥控器（0x0421）走 blast** —— 端到端验证过（Daikin152，CRC 正确）
+- ✅ **仿品（0x0425）走 MAPPING 键位表** —— 端到端验证过（NEC `112121DE` 逐位一致）
+- ❌ 两条路都还只在 `helper/irblast.swift` 里，**app 里没接**
 
 ### 还差什么
 
-一个独立的 CoreBluetooth 小进程（照 `helper/battprobe.swift` 的架子，
-**不能在 app 进程里建 CBCentralManager**，见 battprobe 顶部注释），执行：
-`requestStartNewTable` → 订阅 BLAST → 分块写（200 字节/片）→ `commitBlast`(opcode 5) → 等 notify。
-外层帧格式**已经读完并记进 NOTES.md**（动作头 `[type][flags][u16-le len]`、
-表布局、`compileAsBlast` 去掉首字节、三个 GATT 操作的确切字节）——
-反编译产物已删，别再去电视上重拉。
+`helper/irblast.swift` 已经把两条路都跑通了（**独立进程**，
+不能在 app 进程里建 CBCentralManager，见 battprobe 顶部注释）。
+剩下的是把它接进 `runtime.rs::ir_blast()`：按 `settings.mic_model` 分流 ——
+`Hot`(0x0421) 走 blast，`Ptt`(0x0425) 走 `--mapping`。
+⚠️ MAPPING 那条是**改键位表**不是一次性发射：得先存一份当前表、
+按键和红外码的对应关系要落进配置，不能每次触发都重写一遍表。
 
 ### 两条硬限制（来自固件，不是我们定的）
 
 - **最多 2 段**原始码（`for i in 0..<2`）
-- 时长是**有符号 int16**（`(short) data`）→ 上限 **32767 µs**
+- 时长是**有符号 int16**，单位是 **10 µs 一格** → 上限 **327670 µs**
+  ❗ 早先写成「上限 32767 µs」，**错的**，害得码全长了 10 倍还发不对。
+  单位是拿 StackChan 抓码回来 diff 出来的 —— 设备对错误单位照样 ACK 0x02，
+  **只靠回执判断不了对错，必须实测抓码**。
 
 ❗ **更正**：早先写过「空调塞不进去」，错的。「2 段」限制的是 Pronto 的
 intro/repeat，**和帧数无关** —— 多帧编成一段连续序列即可，帧间隔就是长 space；
-32767 µs 卡的是单个条目，Daikin 帧间隔 25~29 ms 在限内。
-唯一没验证的是表缓冲上限（空调码约 1~2 KB），等发射通路通了实测。
+上限卡的是单个条目，Daikin 帧间隔 25~29 ms 远在限内。
+❗ **尺寸上限至今没搞清，别信任何一个"实测值"。** 三个数据点自相矛盾：
+同一条 263 脉冲的码，放进**电视那张四行都带码的表**（1127 B）→ ✅ 抓码正确；
+放进**我们生成的三行 NO_ACTION 占位表**（614 B）→ ❌ 发兜底乱码。
+**更小的表反而失败**，所以不是「载荷 ≤ N」，还和表的形状有关。
+现在 `MAX_PAYLOAD_BYTES` 保守压到 **180 B / 72 脉冲**（只覆盖验证过的区间）。
+⚠️ 超限时设备**照样回 0x02**，那个键却发 NEC 地址 `027D` 的兜底码 ——
+**回执永远不能当验证，必须抓码**。要放宽先二分 + 抓码确认。
 空调是**有状态协议**，一个按键只能对一个固定状态，所以要的是几条预设码
 （制冷 26 度 / 关机 / 制热 22 度…），抓一次就行，不需要编码器。
 更复杂的空调控制仍建议 StackChan + `IRremoteESP8266` 的编码器，
@@ -443,7 +455,102 @@ intro/repeat，**和帧数无关** —— 多帧编成一段连续序列即可�
 
 ### ⚠️ 安全边界
 
-- 只走 blast（一次性、有暂存表，`RESET_STAGING_TABLE`=2 可回滚）
-- **绝不提交 `FE151501` MAPPING** —— 写坏持久化按键映射要重新配对才能恢复
 - **绝不碰 `CFBFA000` OTA 服务** —— `CFBFA004` 里有 WIPE(12) / WIPE_UNPAIR(14)
-- CONTROL 只发 1 / 2 / 5，永不发 16(DELETE_TABLE) / 32
+- CONTROL 只发 1 / 2 / 5，永不发 16(DELETE_TABLE) / 32(ENABLE_SDS)
+- 不对不明设备做 opcode 盲扫
+
+❗ **「绝不提交 MAPPING」这条已作废。** 仿品不实现 blast，MAPPING 是唯一通路，
+用户明确同意（「能恢复感觉就不是问题」）。代价是覆盖持久化键位表 ——
+**在电视上跑一次「设备控制」就恢复原样**，实测过。真正不可逆的只有 OTA 那条。
+写之前先把当前表存一份（`firetv-remote-mac/tv_table.hex` 就是这么来的），随时能写回。
+
+### 仿品（0x0425）的配方 —— 三个坑，都踩过
+
+```bash
+irblast "BLE_TEST" "$(cat 表.hex)" --mapping --uuid-rand --wait 80   # OK = 回 0x02
+```
+1. **每行必须正好两个动作，而且四行都得在。** 红外行 = 红外 + `BLE_KEYPRESS`
+   (type 5, flags 0, len 1, 载荷 `0x00`)；**没红外的行用 `NO_ACTION`(type 0, 零长度)
+   占位**，不能只写一个动作。只写一行（哪怕动作齐）也不生效。
+   三种违规**设备一律回 0x02**，抓码才看得出没生效。
+2. 写完要 **CONTEXT_SWITCH**（CONTROL opcode 1，18 字节，少最后那个字节设备不认）。
+3. 表 UUID **随机就行**，不用固定值（电视那边也是服务端每个 activity 随机生成一个）。
+
+**实现**：`core/src/irtable.rs`（表的构建，7 个单测）。其中
+`和真机验证过的编码器逐字节一致` 把**真机抓码验证过的那串字节**钉死成黄金样本 ——
+格式跑偏在设备上是静默失败（照样回 0x02 就是不发），只靠真机很难发现。
+表的解析器和电视原表在 `firetv-remote-mac/{surg.py, tv_table.hex}`。
+
+⚠️ **排查「写了没生效」时一定要有对照组**：中间重写一次已知能生效的表，
+确认还能发，再继续查内容 —— 不然分不清是表错了还是设备进了坏状态。
+
+⚠️ **一手资料的拿法**：`BleKeyMapDeviceProxyV2.writeTable()` 里那行
+`Log.v(TAG,…)` 是**无条件写日志**的（TAG `SBleKeyMapDeviceProxy`），
+`adb logcat` 期间在电视上跑「设备控制」就能抓到完整表的十六进制。
+不用 `setprop log.tag.*`（会被 SELinux 挡）。**比在黑盒里试参数快一个数量级** ——
+我先黑盒试了几小时，回去看日志 20 分钟拿到全部答案。
+
+## ★★★ 「连上了、但一个 HID 报文都收不到」—— stop 标志没复位
+
+**症状特别像硬件坏了**：设备打开成功、`Connected` 事件照发、hidremap 照下发、
+蓝牙电量也读得到、语音链路也建好了 —— 就是**软遥控器不亮、按键毫无反应、
+语音没有音频**。而 `firectl --sniff` 单独跑一切正常（它不走 Runtime 那条路）。
+
+根因：`Runtime.stop` 是挂在 Runtime 上的 `Arc<AtomicBool>`，**跨连接存活**，
+而 `start()` 里**没有把它复位成 false**。`start_runtime` 又永远是
+「先 stop 再 start」，于是新起的读线程第一圈就 `break`。
+
+```rust
+pub fn start(&self) -> Result<()> {
+    self.stop.store(false, Ordering::Relaxed);   // ← 少了这行就全哑
+```
+
+⚠️ 这类「跨连接存活的状态没复位」在这个项目里出现过**四次**，形态都一样
+（一次性闩锁，坏了就永久坏，且完全静默）：
+
+| 状态 | 后果 |
+|---|---|
+| `Runtime.stop` 不复位 | 读线程立刻退出，收不到任何报文 |
+| UI 的 `voice_ready` | 重连会 `stop_voice()` 拆掉 sink，标志还是 true → **永不重建** |
+| UI 的 `voice_rx` | 建 sink 的线程 panic → `try_recv` 永远 `Disconnected`，只认 `Ok` 就永久卡住 |
+| `Settings.prev_input_id` | 卡在虚拟声卡上而没有还原目标 → 所有 app 的麦克风永久哑掉 |
+
+**判据**：凡是「重连/重试」路径上被置位的状态，都要问一句「谁把它清回去」。
+
+## 打开 HID 必须认准 vendor collection
+
+macOS 把这支遥控器拆成三个 top-level collection：
+`0x0001/0x06 键盘` · `0x000c/0x01 消费类` · **`0x00ff/0x00 厂商`**。
+
+`api.open(vid, pid)` 拿的是**枚举出来的第一个**（实测是键盘那个），
+而按键报文 `0x02`、音频 `0xF0` 都从**厂商**那个出来。枚举顺序不保证稳定，
+所以这是「看运气」，重新配对之后顺序变了就从能用变成不能用。
+
+```rust
+api.device_list()
+   .find(|d| d.vendor_id()==vid && d.product_id()==pid && d.usage_page()==0x00ff)
+   .or_else(|| /* 兜底：任意一个 */)
+```
+（firectl 的诊断命令当初就是这么挑的，但这个知识一直没搬进 `Runtime::start()`。）
+
+## 配置文件必须原子写
+
+`save_to` 以前用 `std::fs::write`（**先截断再写**），而统计是**每按一次键就存一次**——
+写到一半进程被杀就留下半个文件；`load()` 那边解析失败又**静默退回出厂默认**，
+接着 `normalize` 触发保存，**把用户配置永久覆盖**。真出过：整套方案 + 累计统计全没了。
+
+现在：临时文件 → `sync_all()` → `rename`；解析失败**保留原文件**为
+`config.json.corrupt-<pid>` 并在 stderr 吼一声，绝不覆盖。
+
+## 排障纪律（这一晚栽的）
+
+- **先确认 app 在不在跑**。我对着一个已经退出的进程测了很久，据此推出
+  「遥控器被写坏了」「Fire TV 在抢」「输入监控掉了」「该换电池了」
+  —— 全是错的，还让用户抠电池、拔电源、重配三次。
+- **探针要先自证**。`hidutil list` 那次一个设备都没列出来，我拿它的
+  「0/200 在线」下了结论。换成 `ioreg -c IOHIDDevice` 并先验证它能列出
+  已知设备之后，数据才可信。
+- **判据别用 `awk '{print $NF}'`**。"FireVibe Mic" 的最后一个词是 "Mic"，
+  `grep FireVibe` 直接判负 —— 差点把一次成功的切换判成失败。
+- **失败路径要有日志**。连不上、语音链路建不起来，以前全都只写进界面，
+  stderr 一片空白 —— 这是这一晚花掉最多时间的原因。

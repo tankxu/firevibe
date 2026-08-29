@@ -389,10 +389,16 @@ fn vibe_profile() -> Profile {
             // 麦克风：喂第三方语音输入工具。选纯修饰键是有意的 ——
             // 会走 HID 设备层映射（见 hidremap），那类工具只认硬件来源的按键。
             // 右⌥ 只是个起点，用户得改成自己工具里设的那个热键。
-            SlotAction::new(
-                Slot::Mic,
-                Action::voice_hotkey("rightoption", Vec::new(), false),
-            ),
+            //
+            // 配在**长按**、而且是 `hold` 语义：这支遥控器有一派是「按住才出声」
+            // （见 MicModel），短按点一下就松手，遥控器那边一帧音频都不会出。
+            // 长按 = 按住，语义也更直白。短按留空，配合 `long_fires_on_press()`
+            // 做到「按下即触发」，不然开头那截话会丢在虚拟声卡外面。
+            SlotAction::new(Slot::Mic, Action::none()).with_long(Action::voice_hotkey(
+                "rightoption",
+                Vec::new(),
+                true,
+            )),
             // 主页 / TV 在 Mac 上没有天然对应动作，摆进列表等配
             SlotAction::new(Slot::Home, Action::none()),
             // 菜单 → 删除键（⌫）
@@ -524,6 +530,17 @@ pub struct Settings {
     /// 当前遥控器的开麦模型。连上后自动探一次就存下来，换设备时清掉重探。
     #[serde(default)]
     pub mic_model: MicModel,
+
+    /// 上一次成功写进仿品遥控器的那张红外键位表的指纹。
+    ///
+    /// 有这个才敢在「连上遥控器」时自动补写：一样就不写。不然每次唤醒都要
+    /// 花十几秒重写同一张表。
+    ///
+    /// ⚠️ 更重要的是**它为空时绝不自动写**。用户没配过红外就去写一张空表，
+    /// 等于把电视「设备控制」烧进去的音量/静音红外平白抹掉 —— 装个 app
+    /// 把人家遥控器搞残，没有比这更糟的。清空只在用户自己删掉动作时发生。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ir_table_hash: String,
 }
 fn default_true() -> bool {
     true
@@ -555,6 +572,7 @@ impl Default for Settings {
             device_vid: None,
             device_pid: None,
             mic_model: MicModel::Unknown,
+            ir_table_hash: String::new(),
         }
     }
 }
@@ -717,11 +735,25 @@ impl Config {
     }
 
     pub fn load() -> Self {
-        let c: Config = std::fs::read_to_string(config_path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        let (c, migrated) = Self::normalize(c);
+        let path = config_path();
+        let raw = std::fs::read_to_string(&path).ok();
+        let parsed: Option<Config> = raw.as_deref().and_then(|s| serde_json::from_str(s).ok());
+        // ⚠️ 文件在、但解析不了 —— **绝不能默默用默认配置**。
+        // 后面 normalize 一旦判定要迁移就会 save()，等于把用户那份直接覆盖掉，
+        // 一整套方案和累计统计当场消失、且不可恢复。
+        // 先把原文件留一份带时间戳的，再吼一声。
+        if parsed.is_none() {
+            if let Some(bad) = raw.filter(|s| !s.trim().is_empty()) {
+                let side = path.with_extension(format!("corrupt-{}", std::process::id()));
+                let _ = std::fs::write(&side, bad);
+                eprintln!(
+                    "[config] 配置解析失败，已保留原文件到 {} —— 这次先用默认配置起来，\
+                     别在界面上乱改，先把那份文件找回来",
+                    side.display()
+                );
+            }
+        }
+        let (c, migrated) = Self::normalize(parsed.unwrap_or_default());
         if migrated {
             let _ = c.save();
         }
@@ -807,12 +839,29 @@ impl Config {
     }
 
     /// 导出到指定路径；也由 `save` 用来写实际配置文件。
+    ///
+    /// **必须原子写**：先写同目录的临时文件、落盘、再 `rename` 覆盖。
+    /// `std::fs::write` 是「先截断再写」，写到一半进程被杀就留下半个文件 ——
+    /// 而统计是**每按一次键就存一次**，这个窗口一天要撞上几百次。
+    /// 配合 `load()` 那边解析失败就退回默认，用户的配置会被**永久**覆盖掉。
+    /// （真出过：一整套方案 + 累计统计全没了，靠手动备份才救回来。）
     pub fn save_to(&self, p: &Path) -> Result<()> {
-
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d)?;
         }
-        std::fs::write(p, serde_json::to_string_pretty(self)?)?;
+        let body = serde_json::to_string_pretty(self)?;
+        // 临时文件必须和目标**同一个目录** —— 跨文件系统 rename 不是原子的
+        let tmp = p.with_extension(format!(
+            "tmp{}",
+            std::process::id()
+        ));
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()?; // 元数据也要落盘，否则断电后可能是个空文件
+        }
+        std::fs::rename(&tmp, p)?;
         Ok(())
     }
 

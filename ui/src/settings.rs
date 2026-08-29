@@ -334,7 +334,12 @@ impl FireVibe {
                     ),
             )
             .child(section_lab(l.about()).mt(px(26.)).mb(px(8.)))
-            .child(group().child(self.about_row(cx)).child(self.cli_row(cx)))
+            .child(
+                group()
+                    .child(self.about_row(cx))
+                    .child(self.cli_row(cx))
+                    .child(self.repo_row(cx)),
+            )
     }
 
     /// 消费原生文件面板的异步结果。放在主循环 pump 里，避免文件面板的嵌套
@@ -581,6 +586,47 @@ impl FireVibe {
             wrap = wrap.child(deferred(menu));
         }
         wrap.into_any_element()
+    }
+
+    /// 仓库入口 —— 放「关于」最后一行。使用说明、红外码怎么抓这些都在 README 里，
+    /// 界面上没必要重讲一遍，给个门就行。
+    fn repo_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let l = self.l();
+        group_row()
+            .child(
+                div()
+                    .size(px(38.))
+                    .flex_none()
+                    .rounded(px(10.))
+                    .bg(c(CODE_BG))
+                    .border_1()
+                    .border_color(c(LINE))
+                    .text_color(c(INK2))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon("github", 18.)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(div().text_size(px(13.)).font_weight(w(560.)).child(SharedString::from(l.repo())))
+                    .child(div().text_size(px(11.5)).text_color(c(INK3)).child(SharedString::from(l.repo_sub()))),
+            )
+            .child(
+                mini2_ico("open-repo", "external-link", l.open_link()).on_click(cx.listener(
+                    |_, _, _, _| {
+                        let _ = std::process::Command::new("open")
+                            .arg("https://github.com/tankxu/firevibe")
+                            .spawn();
+                    },
+                )),
+            )
+            .into_any_element()
     }
 
     /// 命令行工具下载行 —— firectl（配新遥控器 / 排障用），跳 GitHub Releases。

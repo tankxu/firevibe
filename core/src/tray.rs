@@ -112,10 +112,23 @@ pub fn install(_icon_png: &[u8], _show_label: &str, _quit_label: &str) {}
 /// 上的 `start_window_drag()`（performWindowDragWithEvent）精准拖。留空壳兼容旧调用。
 pub fn make_windows_draggable() {}
 
+/// 窗口是不是缩到状态栏了。界面那边靠它决定「还要不要重绘」——
+/// 这个 app 的常态就是缩在状态栏跑一整天，那期间画一帧都是浪费。
+static HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn is_hidden() -> bool {
+    HIDDEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_hidden(v: bool) {
+    HIDDEN.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// 主窗口关闭后进入纯菜单栏模式：进程和状态栏图标继续存在，但不占 Dock。
 /// 从托盘选择“显示窗口”时，`fv_show` 会把 activation policy 恢复为 Regular。
 #[cfg(target_os = "macos")]
 pub fn hide_to_tray() {
+    set_hidden(true);
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
@@ -126,11 +139,14 @@ pub fn hide_to_tray() {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn hide_to_tray() {}
+pub fn hide_to_tray() {
+    set_hidden(true);
+}
 
 /// 通过 Finder/Dock 的 reopen 事件恢复时，也确保重新显示 Dock 图标。
 #[cfg(target_os = "macos")]
 pub fn show_from_tray() {
+    set_hidden(false);
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 
@@ -142,7 +158,9 @@ pub fn show_from_tray() {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn show_from_tray() {}
+pub fn show_from_tray() {
+    set_hidden(false);
+}
 
 /// 从当前鼠标事件开始拖窗 —— 挂在 header 的 on_mouse_down 上。用 AppKit 原生的
 /// performWindowDragWithEvent，只有 header 触发，输入框等交互元素不受影响。
