@@ -8,7 +8,7 @@ use crate::voice::{VoiceSink, OPUS_FRAME, OPUS_RATE};
 use anyhow::{anyhow, Context, Result};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,6 +39,10 @@ pub enum Event {
         serial: String,
     },
     Disconnected(String),
+    /// 开麦模型探测出结果了。UI 收到后要补一次红外表同步 ——
+    /// 刚配对的遥控器在「连上」那一刻模型还是 Unknown，红外同步会被跳过，
+    /// 不补的话要等下一次重连才写得进去。
+    MicModelProbed,
 }
 
 pub struct Status {
@@ -101,10 +105,19 @@ pub struct Runtime {
     tap: Arc<Mutex<Option<crate::tap::Tap>>>,
     pub descriptor: Arc<Mutex<Vec<u8>>>,
     stop: Arc<AtomicBool>,
-    /// HID 读线程还活着吗。`start()` 必须等它真的退出再开新的 ——
-    /// 两个读线程开着同一个设备会把 CoreFoundation 的对象搞坏，
-    /// 崩在 `IOHIDDeviceScheduleWithRunLoop` / `__CFCheckCFInfoPACSignature`。
-    hid_running: Arc<AtomicBool>,
+    /// 还有几条 HID 线程活着（主读线程 + 各副 collection 的读线程）。
+    /// `start()` 必须等它们**全部**退出再开新的 —— 同一个设备被两个线程
+    /// 打开会把 CoreFoundation 的对象搞坏，崩在
+    /// `IOHIDDeviceScheduleWithRunLoop` / `__CFCheckCFInfoPACSignature`。
+    /// ⚠️ 计数在 `start()` 里**spawn 之前**就加上 —— 在线程体里才加的话，
+    /// spawn 和真正跑起来之间有个窗口，下一次 start() 会以为没人活着。
+    hid_threads: Arc<AtomicUsize>,
+    /// 红外表写入在途锁。写一次要十几秒（还要等遥控器醒），而触发点有两个
+    /// （编辑器保存 + 每次重连自动补写）—— 不锁的话两个 irblast 进程会同时
+    /// 往同一组 GATT 特征里交错写分片，表被写坏**设备照样回 0x02 说成功**，
+    /// 然后 CONTEXT_SWITCH 到一张坏表，按键行为从此不对。遥控器被写坏
+    /// 大概率就是这么来的。
+    ir_sync_busy: Arc<AtomicBool>,
     tx: Sender<Event>,
 }
 
@@ -139,7 +152,8 @@ impl Runtime {
                 tap: Arc::new(Mutex::new(None)),
                 descriptor: Arc::new(Mutex::new(Vec::new())),
                 stop: Arc::new(AtomicBool::new(false)),
-                hid_running: Arc::new(AtomicBool::new(false)),
+                hid_threads: Arc::new(AtomicUsize::new(0)),
+                ir_sync_busy: Arc::new(AtomicBool::new(false)),
                 tx,
             },
             rx,
@@ -465,10 +479,31 @@ impl Runtime {
             return None; // 遥控器里已经是这张表了
         }
         let name = ir_device_name();
+        if name.is_empty() {
+            // 还没连上过，不知道该找哪台蓝牙外设。irblast 拿空串去 contains 匹配
+            // 谁都配不上，白等 90 秒 —— 连上后 maybe_sync 会自动补。
+            return Some("还没连上遥控器，红外码会在连上时自动写入".into());
+        }
+        // 在途锁：写一次要十几秒（还要等遥控器醒），期间编辑器再保存 / 遥控器
+        // 重连都会再触发一次。两个 irblast 同时往同一组 GATT 特征交错写分片，
+        // 表被写坏设备**照样回 0x02**，然后 CONTEXT_SWITCH 到一张坏表 ——
+        // 绝不能并发。在途时直接跳过：写完 hash 没更新的话，下一次重连会补。
+        if self.ir_sync_busy.swap(true, Ordering::SeqCst) {
+            return Some("上一次红外写入还在进行，这次先不写（完成后会自动补）".into());
+        }
+        let busy = self.ir_sync_busy.clone();
         let tx = self.tx.clone();
         let cfg2 = self.cfg.clone();
         let hex2 = hex.clone();
         std::thread::spawn(move || {
+            // 任何退出路径都要放锁（含 panic），否则红外同步从此永远被跳过
+            struct Unlock(Arc<AtomicBool>);
+            impl Drop for Unlock {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            let _unlock = Unlock(busy);
             let Some(exe) = ir_blaster_path() else {
                 let _ = tx.send(Event::Log("找不到 irblast，重新打包一次".into()));
                 return;
@@ -537,11 +572,19 @@ impl Runtime {
         // CoreFoundation 的对象写坏，崩在 `IOHIDDeviceScheduleWithRunLoop`
         // → `__CFCheckCFInfoPACSignature`（Trace/BPT trap）。
         self.stop.store(true, Ordering::Relaxed);
-        for _ in 0..50 {
-            if !self.hid_running.load(Ordering::Relaxed) {
+        for _ in 0..100 {
+            if self.hid_threads.load(Ordering::Relaxed) == 0 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if self.hid_threads.load(Ordering::Relaxed) != 0 {
+            // ⚠️ 等不到就**失败返回**，绝不硬闯。以前这里直接往下走，旧线程还
+            // 开着设备、新线程又开一遍 —— hidapi 在 macOS 上给每个设备起自己的
+            // run loop，撞在一起把 CF 对象写坏，直接 abort（不是 panic，是进程没了）。
+            // 返回 HID_ERROR 的话 UI 300ms 后会自动重试，下一轮多半就干净了。
+            self.stop.store(true, Ordering::Relaxed);
+            return Err(anyhow!("HID_ERROR: 上一条连接还没退干净，稍后自动重试"));
         }
         self.stop.store(false, Ordering::Relaxed);
         let exclusive = self.cfg.read().exclusive;
@@ -564,17 +607,45 @@ impl Runtime {
         // 顺序变了就从能用变成不能用。firectl 的诊断命令当初就是特意挑
         // 0x00ff 的（见 cli/src/main.rs 里那句「认准 vendor collection」），
         // 但这个知识一直没搬进来。
-        let pick = api
+        // ⚠️ 以前这里只挑**一个** collection 打开（写死 0x00ff 厂商），但实测
+        // 「按键报文从哪个 collection 出来」会随枚举顺序 / 配对状态 / 是否写过
+        // 键位表而变 —— 押错一个就是「设备连上了、一个报文都收不到」，还查不出
+        // 原因。所以现在**全部打开**：主 collection（优先厂商 0x00ff，命令和音频
+        // 从它走）留在主读线程，其余的各起一条只转发报文的副线程，全部报文汇到
+        // 主循环按 report id 处理 —— report id 本来就够区分，不用赌路由。
+        // 按键状态集 `active` 是幂等的，就算同一报文从两条路各来一份也不会重复触发。
+        // `FIREVIBE_HID_USAGE_PAGE` 仍可覆盖主 collection（十六进制；`any`=第一个）。
+        let want_page: Option<u16> = match std::env::var("FIREVIBE_HID_USAGE_PAGE") {
+            Ok(v) if v.eq_ignore_ascii_case("any") => None,
+            Ok(v) => u16::from_str_radix(v.trim_start_matches("0x"), 16).ok(),
+            Err(_) => Some(0x00ff),
+        };
+        let all: Vec<(std::ffi::CString, u16, u16)> = api
             .device_list()
-            .find(|d| d.vendor_id() == vid && d.product_id() == pid && d.usage_page() == 0x00ff)
-            .or_else(|| {
-                api.device_list()
-                    .find(|d| d.vendor_id() == vid && d.product_id() == pid)
-            })
-            .map(|d| d.path().to_owned());
-        let dev = pick
-            .ok_or_else(|| anyhow!("HID_NOT_FOUND: 没找到 {vid:#06x}/{pid:#06x}"))
-            .and_then(|path| Ok(api.open_path(&path)?))
+            .filter(|d| d.vendor_id() == vid && d.product_id() == pid)
+            .map(|d| (d.path().to_owned(), d.usage_page(), d.usage()))
+            .collect();
+        // ⚠️ 「没枚举到」要**直接返回**，不能穿过下面那个分类器。
+        // 穿过去的话消息会变成 `HID_ERROR: HID_NOT_FOUND: …`（前缀套两层），
+        // 而界面是靠 `starts_with("HID_NOT_FOUND")` 决定要不要显示
+        // 「重试 / 重新配对」两个按钮的 —— 判断一失效，用户就**没有配对入口**了。
+        // 分类器只认英文关键字，中文消息永远命不中，所以这里必须自己给前缀。
+        if all.is_empty() {
+            return Err(anyhow!("HID_NOT_FOUND: 没找到 {vid:#06x}/{pid:#06x}"));
+        }
+        let primary_idx = want_page
+            .and_then(|pg| all.iter().position(|(_, p, _)| *p == pg))
+            .unwrap_or(0);
+        {
+            let (_, pg, us) = &all[primary_idx];
+            eprintln!(
+                "[firevibe] 枚举到 {} 个 collection，主 collection usage_page 0x{pg:04x} usage 0x{us:02x}",
+                all.len()
+            );
+        }
+        let path = all[primary_idx].0.clone();
+        let dev = api
+            .open_path(&path)
             .map_err(|e| {
             let raw = e.to_string();
             // 0xE00002C1 (kIOReturnNotPrivileged / "privilege violation") 是
@@ -617,6 +688,60 @@ impl Runtime {
             "共享模式打开 —— 系统同时会收到原始按键"
         });
 
+        // 其余 collection：各起一条副读线程，只把 (report id, 载荷) 转发给主循环。
+        // 线程计数在 spawn **之前**加，Drop guard 减 —— 见 hid_threads 的注释。
+        struct ThreadCount(Arc<AtomicUsize>);
+        impl Drop for ThreadCount {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let (fwd_tx, fwd_rx) = channel::<(u8, Vec<u8>)>();
+        for (i, (p, pg, us)) in all.iter().enumerate() {
+            if i == primary_idx {
+                continue;
+            }
+            let sec = match api.open_path(p) {
+                Ok(d) => d,
+                Err(e) => {
+                    // 开不成不算致命 —— 主 collection 还在。只记一笔。
+                    eprintln!("[firevibe] 副 collection 0x{pg:04x}/0x{us:02x} 打不开：{e}");
+                    continue;
+                }
+            };
+            eprintln!("[firevibe] 副 collection usage_page 0x{pg:04x} usage 0x{us:02x} 已打开");
+            let stop2 = self.stop.clone();
+            let tx2 = fwd_tx.clone();
+            self.hid_threads.fetch_add(1, Ordering::SeqCst);
+            let count = ThreadCount(self.hid_threads.clone());
+            let spawned = std::thread::Builder::new()
+                .name(format!("firevibe-hid-{pg:04x}"))
+                .spawn(move || {
+                    let _count = count;
+                    let mut buf = [0u8; 128];
+                    loop {
+                        if stop2.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        match sec.read_timeout(&mut buf, 200) {
+                            Ok(0) => {}
+                            Ok(n) => {
+                                if tx2.send((buf[0], buf[1..n].to_vec())).is_err() {
+                                    break; // 主循环没了
+                                }
+                            }
+                            Err(_) => break, // 设备掉了，主线程那边会走断开流程
+                        }
+                    }
+                });
+            if spawned.is_err() {
+                // spawn 失败时闭包（连同里面的计数 guard）被原地丢弃，
+                // Drop 会把计数减回来，不会卡住下一次 start()
+                eprintln!("[firevibe] 副读线程起不来");
+            }
+        }
+        drop(fwd_tx); // 主循环握着 fwd_rx；发送端只留副线程那几份
+
         let cfg = self.cfg.clone();
         let status = self.status.clone();
         let inj = self.inj.clone();
@@ -636,22 +761,34 @@ impl Runtime {
         let dictating = self.dictating.clone();
         let recording = self.recording.clone();
         let stop = self.stop.clone();
-        let hid_running = self.hid_running.clone();
         let tx = self.tx.clone();
+        // 计数在 spawn 之前加 —— 线程体里才加的话，spawn 到跑起来之间
+        // 下一次 start() 会以为没人活着，又开一遍同一个设备。
+        self.hid_threads.fetch_add(1, Ordering::SeqCst);
+        let main_count = ThreadCount(self.hid_threads.clone());
 
-        std::thread::Builder::new()
+        let spawn_res = std::thread::Builder::new()
             .name("firevibe-hid".into())
             .spawn(move || {
-                // 用 guard 置位/清位，保证任何退出路径（含 `?`、panic）都会清掉，
+                // 用 guard 清计数，保证任何退出路径（含 `?`、panic）都会清掉，
                 // 否则 `start()` 会一直等一个已经死了的线程
-                struct Alive(Arc<AtomicBool>);
+                // ⚠️ 退出时必须**同时**清掉 `connected`。它以前只在「读报错」那条路上
+                // 被清，读线程从别的路径退出（停止标志、探测失败、panic）就留着 true。
+                // 而界面的重连是 `!connected()` 才触发的 —— 标志不清，
+                // **300ms 重试永远不跑**，app 从此不再抓着设备。
+                //
+                // 后果比听起来严重：这台遥控器**只要 app 握着 HID 句柄就不休眠**，
+                // 一旦不抓了，它几秒就掉线、而且再也回不来（没人去连它）。
+                // 表现就是「刚配好能用几秒，然后彻底掉，重启 app 才好」。
+                struct Alive(ThreadCount, Arc<Status>);
                 impl Drop for Alive {
                     fn drop(&mut self) {
-                        self.0.store(false, Ordering::Relaxed);
+                        self.1.connected.store(false, Ordering::Relaxed);
+                        // 退出以前是完全静默的：日志里只看到「连上了」，看不到「又断了」
+                        eprintln!("[firevibe] HID 读线程退出");
                     }
                 }
-                hid_running.store(true, Ordering::Relaxed);
-                let _alive = Alive(hid_running);
+                let _alive = Alive(main_count, status.clone());
                 let mut dec = match opus::Decoder::new(OPUS_RATE, opus::Channels::Mono) {
                     Ok(d) => d,
                     Err(e) => {
@@ -667,49 +804,26 @@ impl Runtime {
                 // （关麦命令有效，前提是本进程有「输入监控」授权 —— 见 device.rs。）
                 let _ = dev.write(&MIC_OFF);
 
-                // ── 探一次开麦模型 ──
+                // ── 开麦模型探测（在主循环里开窗口，不再单独阻塞 1.5 秒）──
                 // 判据：**没人碰遥控器的时候发 MIC_ON，出不出流**。
                 // 出流 = 热麦克风（它压根不看按键）；不出流 = PTT（只有按住才出）。
                 // 结果存进配置，换设备时会被清掉重探（见 UI 的 pick_device）。
                 //
+                // ⚠️ 以前这是个独立的 1.5 秒小循环：既不查停止标志（start() 等半秒
+                // 就硬闯 → 两个读线程开同一个设备 → CF 崩溃），期间的按键还全被
+                // 吃掉（只数音频帧，别的报文读了就扔）。放进主循环两个毛病都没了。
+                //
                 // ⚠️ 判成 PTT 之后**照样继续发 MIC_ON/keepalive** —— 对 PTT 无害，
                 // 而万一判错（比如探测时遥控器正好睡着了）也不会把热麦克风弄瘫。
                 // 判型只用来关掉那个没意义的自愈关麦、和在界面上提醒绑定方式。
-                if cfg.read().settings.mic_model == crate::config::MicModel::Unknown {
-                    let base = status.audio_frames.load(Ordering::Relaxed);
-                    let _ = dev.write(&MIC_ON);
-                    let t0 = Instant::now();
-                    let mut n = 0u32;
-                    let mut b = [0u8; 128];
-                    while t0.elapsed() < Duration::from_millis(1500) {
-                        if let Ok(len) = dev.read_timeout(&mut b, 50) {
-                            if len > 0 && b[0] == RID_AUDIO {
-                                n += 1;
-                            }
-                        }
-                    }
-                    let _ = dev.write(&MIC_OFF);
-                    let model = if n > 3 {
-                        crate::config::MicModel::Hot
+                let mut probe_until: Option<Instant> =
+                    if cfg.read().settings.mic_model == crate::config::MicModel::Unknown {
+                        let _ = dev.write(&MIC_ON);
+                        Some(Instant::now() + Duration::from_millis(1500))
                     } else {
-                        crate::config::MicModel::Ptt
+                        None
                     };
-                    {
-                        let mut c = cfg.write();
-                        c.settings.mic_model = model;
-                        let _ = c.save();
-                    }
-                    let _ = tx.send(Event::Log(format!(
-                        "开麦模型：{}（静默发 MIC_ON 收到 {n} 帧）",
-                        match model {
-                            crate::config::MicModel::Hot => "热麦克风 —— 发命令就一直出流",
-                            crate::config::MicModel::Ptt =>
-                                "按住才出流 —— 麦克风键要绑「按住」模式",
-                            _ => "未知",
-                        }
-                    )));
-                    status.audio_frames.store(base, Ordering::Relaxed);
-                }
+                let mut probe_frames = 0u32;
 
                 let mut mic_was = false;
                 let mut last_ka = Instant::now();
@@ -721,6 +835,33 @@ impl Runtime {
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         break;
+                    }
+                    // 探测窗口到点：收针、判型、落盘
+                    if probe_until.is_some_and(|t| Instant::now() >= t) {
+                        probe_until = None;
+                        let _ = dev.write(&MIC_OFF);
+                        let model = if probe_frames > 3 {
+                            crate::config::MicModel::Hot
+                        } else {
+                            crate::config::MicModel::Ptt
+                        };
+                        {
+                            let mut c = cfg.write();
+                            c.settings.mic_model = model;
+                            let _ = c.save();
+                        }
+                        let _ = tx.send(Event::Log(format!(
+                            "开麦模型：{}（静默发 MIC_ON 收到 {probe_frames} 帧）",
+                            match model {
+                                crate::config::MicModel::Hot => "热麦克风 —— 发命令就一直出流",
+                                crate::config::MicModel::Ptt =>
+                                    "按住才出流 —— 麦克风键要绑「按住」模式",
+                                _ => "未知",
+                            }
+                        )));
+                        // 让 UI 补一次红外表同步：连上那一刻模型还是 Unknown，
+                        // maybe_sync_ir_table 被跳过了
+                        let _ = tx.send(Event::MicModelProbed);
                     }
                     // 外面递进来的 OUTPUT 报文（--probe-all 的三轮对照用来试开麦）
                     {
@@ -809,19 +950,27 @@ impl Runtime {
                         }
                     }
 
-                    let n = match dev.read_timeout(&mut buf, 200) {
-                        Ok(n) => n,
+                    // 本圈的报文：主 collection 直读一条 + 副线程转发来的全部。
+                    // 超时从 200ms 收到 50ms —— 副 collection 的按键要等主读超时
+                    // 才被捞出来，200ms 的按键延迟按着能感觉到。
+                    let mut reports: Vec<(u8, Vec<u8>)> = Vec::new();
+                    match dev.read_timeout(&mut buf, 50) {
+                        Ok(0) => {}
+                        Ok(n) => reports.push((buf[0], buf[1..n].to_vec())),
                         Err(e) => {
                             status.connected.store(false, Ordering::Relaxed);
                             let _ = tx.send(Event::Disconnected(e.to_string()));
                             break;
                         }
-                    };
-                    if n == 0 {
+                    }
+                    while let Ok(r) = fwd_rx.try_recv() {
+                        reports.push(r);
+                    }
+                    if reports.is_empty() {
                         continue;
                     }
-                    let rid = buf[0];
-                    let payload = &buf[1..n];
+                    for (rid, payload) in reports {
+                    let payload = &payload[..];
                     *seen_rids.lock().entry(rid).or_insert(0) += 1;
                     let raw_on = raw_all.load(Ordering::Relaxed);
                     if raw_on {
@@ -832,6 +981,11 @@ impl Runtime {
                     }
 
                     match rid {
+                        // 探测窗口期内的音频只归探测计数：这是我们自己发 MIC_ON
+                        // 引出来的流，不该惊动自愈逻辑和界面的帧计数
+                        RID_AUDIO if probe_until.is_some() => {
+                            probe_frames += 1;
+                        }
                         RID_AUDIO => {
                             status.audio_frames.fetch_add(1, Ordering::Relaxed);
                             let sink = voice.lock().clone();
@@ -1131,10 +1285,12 @@ impl Runtime {
                             }
                         }
                     }
+                    } // for reports
                 }
                 let _ = dev.write(&MIC_OFF);
                 pressed.lock().clear();
-            })?;
+            });
+        spawn_res?;
         Ok(())
     }
 
@@ -1464,7 +1620,18 @@ fn dispatch(
         let action_dbg = format!("{:?}", act.kind);
         let mut c = cfg.write();
         c.stats.record(slot_id, &action_dbg, is_voice, 0.0);
-        let _ = c.save();
+        // 落盘节流：这段跑在 HID 读线程里，原来**每按一键**做一次
+        // 「临时文件 + fsync + rename」——按键延迟里凭空多几毫秒盘刷，
+        // 还磨 SSD。统计丢最近 10 秒无所谓（配置的其它保存路径也会顺带带上）。
+        static LAST_SAVE: AtomicU64 = AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = LAST_SAVE.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 10 && LAST_SAVE.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            let _ = c.save();
+        }
     }
 
     // 按住说话要处理按下和松开两个方向

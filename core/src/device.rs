@@ -107,3 +107,35 @@ pub fn parse_vendor(payload: &[u8]) -> Vec<Key> {
         .map(|&u| Key::new(PAGE_VENDOR, u as u16))
         .collect()
 }
+
+// ───────────────────────── 「输入监控」授权自检 ─────────────────────────
+
+#[cfg(target_os = "macos")]
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    /// `IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)`
+    /// 返回 0=已授权 1=被拒 2=还没问过
+    fn IOHIDCheckAccess(request_type: u32) -> u32;
+}
+
+/// 「输入监控」到底给没给。
+///
+/// 加它是因为这个权限的失效方式特别隐蔽：**枚举设备照常、打开设备也成功，
+/// 只是一条输入报告都收不到**。表现成「设备连上了但按键没反应」，
+/// 极容易误判成设备坏了 —— 实际白查了大半天。
+/// 而系统设置里的开关**看着是开的**也不代表真生效（见 CLAUDE.md 的签名坑）。
+///
+/// 判据要用系统自己的答案，别靠猜。
+pub fn input_monitoring() -> &'static str {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        // kIOHIDRequestTypeListenEvent = 1
+        match IOHIDCheckAccess(1) {
+            0 => "已授权",
+            1 => "被拒绝",
+            _ => "还没问过",
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    "不适用"
+}

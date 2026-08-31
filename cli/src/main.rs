@@ -1555,6 +1555,7 @@ fn run_cli() -> anyhow::Result<()> {
                 Event::KeyEdge { key, down } => {
                     println!("  {} {}", if down { "边沿↓" } else { "边沿↑" }, key)
                 }
+                Event::MicModelProbed => println!("  · 开麦模型已探明"),
             }
         }
         if last_stat.elapsed() >= Duration::from_secs(2) {

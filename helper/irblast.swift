@@ -14,8 +14,11 @@
 //   ④ CONTROL 写 [5] —— 提交并发射
 //   ⑤ 等 notify 或轮询读 BLAST，首字节 == 2 即成功
 //
-// ⚠️ 只碰 CONTROL 的 2 / 5 两个操作码和 BLAST 特征。
-//    绝不写 MAPPING（`FE151501`，写坏持久化按键映射要重新配对才能恢复），
+// ⚠️ 默认只碰 CONTROL 的 2 / 5 两个操作码和 BLAST 特征。
+//    `--mapping` 会写 MAPPING（`FE151501`，持久化键位表）—— 仿品 0x0425 不实现
+//    blast，红外只能烧表，这是**唯一**允许写 MAPPING 的入口，而且必须整表
+//    （四行、每行两个动作）+ SHA-256 + CONTEXT_SWITCH 一气呵成。写坏了按键
+//    行为会不对，恢复办法是把一张完好的表整个重写一遍（或重跑电视的设备控制向导）。
 //    绝不碰 OTA 服务（`CFBFA000`，里面有 WIPE / WIPE_UNPAIR）。
 //
 // 用法：irblast <设备名片段> <表的十六进制> [--scan-id N]
@@ -185,6 +188,8 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
             bail(4)
         }
         p.setNotifyValue(true, for: blast)
+        // 写键位表时结果从 MAPPING 出来（读或 notify 都行），一起订上少等几拍
+        if toMapping, let mapping { p.setNotifyValue(true, for: mapping) }
         // --reset：只发一个裸 [2]（RESET_STAGING_TABLE）把暂存表状态机复位。
         // 会话没走完就退出会让设备后续拒收（写 CONTROL 报 Unknown ATT error）。
         if args.contains("--reset") {
@@ -255,6 +260,12 @@ final class Blaster: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                     if let m = self.mapping { p.readValue(for: m) }
                 }
             }
+            // 轮询完还没等到 0x02 就尽快判失败断开 —— 不然要挂满全局超时
+            //（--wait 90 时是 105 秒），期间连接一直占着，下一次写还会跟它撞车
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) {
+                note("MAPPING 状态迟迟不回 0x02，判失败（最后读到 0x\(String(format: "%02X", self.lastSeen))）")
+                bail(6)
+            }
             return
         }
         if step == chunks {
@@ -298,6 +309,8 @@ let b = Blaster()
 b.central = CBCentralManager(delegate: b, queue: nil)
 DispatchQueue.main.asyncAfter(deadline: .now() + waitSecs + 15) {
     note("等回执超时，最后读到 0x\(String(format: "%02X", b.lastSeen))")
-    exit(gotState ? 7 : 2)
+    // 必须 bail 不是 exit：超时时连接多半还挂着，不断开就往设备的会话池里
+    // 再攒一个 —— 攒多了它拒收所有写入（见 bail 的注释）
+    bail(gotState ? 7 : 2)
 }
 RunLoop.main.run()

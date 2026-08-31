@@ -682,8 +682,9 @@ impl FireVibe {
             if first {
                 // 启动时把关键权限状态打到 stderr，排障时一眼能看到
                 eprintln!(
-                    "[firevibe] 按键注入(辅助功能)={} 语音识别={}",
+                    "[firevibe] 按键注入(辅助功能)={} 输入监控={} 语音识别={}",
                     self.rt.inj.available(),
+                    firevibe_core::device::input_monitoring(),
                     firevibe_core::stt::auth_status()
                 );
                 // 上次异常退出可能把系统输入留在虚拟声卡上，开机先补救一下
@@ -829,6 +830,13 @@ impl FireVibe {
                     self.product = product;
                 }
                 Event::Disconnected(e) => self.err = Some(e),
+                Event::MicModelProbed => {
+                    // 刚探明开麦模型。连上那一刻模型还是 Unknown，红外表同步被
+                    // 跳过了（是不是仿品都判不出来），这里补一次。
+                    if let Some(m) = self.rt.maybe_sync_ir_table() {
+                        eprintln!("[firevibe] {m}");
+                    }
+                }
                 Event::Log(s) => {
                     if let Some(t) = s.strip_prefix("听写（").and_then(|r| r.split_once("）：")) {
                         self.last_stt = Some(t.1.to_string());
@@ -1493,6 +1501,10 @@ impl FireVibe {
             c.settings.device_pid = Some(format!("0x{pid:04x}"));
             // 换了设备，旧的开麦模型作废 —— 置回 Unknown，runtime 起来会重探一次
             c.settings.mic_model = firevibe_core::config::MicModel::Unknown;
+            // 红外表指纹也作废：它记的是「上一台遥控器里写着什么」，
+            // 带到新设备上会让自动同步误以为「表已经是最新的」而永远不写
+            //（或者反过来，把一张按旧设备判断的表往新设备上写）。
+            c.settings.ir_table_hash = String::new();
             let _ = c.save();
         }
         firevibe_core::hidremap::set_ids(vid, pid);
