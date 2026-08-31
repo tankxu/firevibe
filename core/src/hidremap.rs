@@ -41,6 +41,9 @@ fn ids() -> (u16, u16) {
 /// 麦克风键在 HID 里的来源 usage：Consumer page 0x0C，usage 0x0221 (AC Search)
 const SRC_MIC: u64 = 0x0C00_00_0221;
 
+/// 映射改成全局的之后不再用它下发（见 run 的注释），留着给以后
+/// 可能的按设备诊断用
+#[allow(dead_code)]
 fn matching() -> String {
     let (vid, pid) = ids();
     format!("{{\"ProductID\":0x{pid:04x},\"VendorID\":0x{vid:04x}}}")
@@ -76,8 +79,16 @@ pub const TARGETS: &[&str] = &[
 ];
 
 fn run(set: &str) -> Result<String> {
+    // ⚠️ **全局映射，不带 --matching**。按设备匹配的映射只对「下发那一刻在线」
+    // 的设备生效，断开重连就没了 —— 而这台遥控器闲置 8 秒必睡，每次说话的
+    // 第一下都是「唤醒键」：它到达系统时我们还没来得及重新下发映射，于是
+    // 以原始键码（AC Search）漏出去，Spotlight 弹出、第三方语音工具拿不到
+    // 硬件修饰键，用户只能按两下。全局映射常驻在 HID 事件系统里、对**之后
+    // 接入**的设备同样生效，唤醒那一下按键在到达的瞬间就被转成硬件来源的
+    // 目标键。误伤面：源是 Consumer AC Search（0x0221），普通键盘不发这个
+    // usage，实际只有遥控器命中。
     let out = Command::new("/usr/bin/hidutil")
-        .args(["property", "--matching", &matching(), "--set", set])
+        .args(["property", "--set", set])
         .output()
         .context("跑 hidutil 失败")?;
     if !out.status.success() {
@@ -98,9 +109,9 @@ pub fn apply(key: &str) -> Result<()> {
          \"HIDKeyboardModifierMappingDst\":0x{dst:X}}}]}}"
     );
     let out = run(&set)?;
-    // hidutil 对没连上的设备是静默成功的，所以回读确认
+    // 全局 set 的回显就是新映射本身；确认一下没有静默失败
     if !out.contains("HIDKeyboardModifierMappingDst") {
-        return Err(anyhow!("hidutil 没有回报映射，遥控器可能没连上"));
+        return Err(anyhow!("hidutil 没有回报映射"));
     }
     Ok(())
 }
@@ -113,13 +124,7 @@ pub fn clear() {
 /// 现在设着映射吗
 pub fn is_set() -> bool {
     Command::new("/usr/bin/hidutil")
-        .args([
-            "property",
-            "--matching",
-            &matching(),
-            "--get",
-            "UserKeyMapping",
-        ])
+        .args(["property", "--get", "UserKeyMapping"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains("HIDKeyboardModifierMappingDst"))
         .unwrap_or(false)

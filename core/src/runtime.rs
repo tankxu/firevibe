@@ -1786,6 +1786,20 @@ fn implied_session(
             if let Some(sink) = voice.lock().clone() {
                 gate_voice(cfg, status, &sink, prev, down, down);
             }
+            // 走硬件层映射的键**绝不补合成**：全局映射常驻事件系统，唤醒的
+            // 那一下已经以硬件 rightoption 的身份进了系统（豆包这类只认硬件
+            // 来源的工具就靠它）。再合成一份不但没用（合成的它不认），
+            // 还会把它的热键状态机搞乱。这里只负责音频闸门。
+            let via_hw = act.mods.is_empty()
+                && crate::hidremap::usage_of(&act.key).is_some()
+                && cfg.read().mic_remap_key().as_deref() == Some(act.key.as_str());
+            if via_hw {
+                return if down {
+                    format!("第三方语音输入 · {}（硬件层）", act.key)
+                } else {
+                    "松开".into()
+                };
+            }
             if down {
                 mark_hold(&act.key);
                 let _ = inj.key_down(&act.key, &act.mods);
