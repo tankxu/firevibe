@@ -436,12 +436,26 @@ impl L {
     // ── 仿品遥控器（PTT 那派）的红外：烧进遥控器，不是即时发射 ──
     pub fn ir_clone_note(&self) -> &'static str {
         t!(self.0,
-           "这台遥控器的红外是**烧进去**的：保存后 app 会把码写进遥控器（十几秒，要它醒着）。之后按这个实体键就直接发射 —— 电脑关着也照发。把动作删掉再保存，就能把它清掉。",
-           "On this remote the code is **burned in**: after saving, the app writes it into the remote (takes a dozen seconds, remote must be awake). From then on the physical key fires it directly — even with the Mac off. Delete the action and save again to clear it.")
+           "这台遥控器的红外是**烧进去**的：保存后到主界面顶部点「写入红外」，app 才会把码写进遥控器（十几秒，要它醒着）。之后按这个实体键就直接发射 —— 电脑关着也照发。把动作删掉再写入一次，就能把它清掉。",
+           "On this remote the code is **burned in**: after saving, click \u{201c}Write IR\u{201d} in the header to write it into the remote (takes a dozen seconds, remote must be awake). From then on the physical key fires it directly — even with the Mac off. Delete the action and write again to clear it.")
+    }
+    /// 顶栏「写入红外」按钮
+    pub fn ir_write_btn(&self) -> &'static str {
+        t!(self.0, "写入红外", "Write IR")
+    }
+    /// 顶栏「正在写入」状态
+    pub fn ir_writing(&self) -> &'static str {
+        t!(self.0, "正在写入红外…", "Writing IR…")
+    }
+    /// 保存了红外改动后的提示
+    pub fn ir_pending_hint(&self) -> &'static str {
+        t!(self.0,
+           "红外改动还没写进遥控器 —— 按一下遥控器让它醒着，再点顶部「写入红外」",
+           "IR changes not written yet — wake the remote with a key press, then click \u{201c}Write IR\u{201d} in the header")
     }
     pub fn ir_clone_untestable(&self) -> &'static str {
         t!(self.0,
-           "「测试一次」对这台遥控器没用 —— 红外由它自己发，电脑指挥不动。保存后按实体键试。",
+           "「测试一次」对这台遥控器没用 —— 红外由它自己发，电脑指挥不动。保存并在顶部点「写入红外」之后，按实体键试。",
            "\u{201c}Test once\u{201d} does nothing on this remote — it fires IR on its own, the Mac cannot trigger it. Save, then press the physical key.")
     }
     pub fn ir_clone_slots(&self) -> &'static str {

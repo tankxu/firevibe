@@ -620,10 +620,14 @@ l.hotkey_tap_hint()
             }
         }
         self.save();
-        // 仿品遥控器：红外码得真写进它的键位表才会生效。改完就同步 ——
-        // 四行一起写，所以「把动作删了」也要走这一趟，才能把旧码清掉。
+        // 仿品遥控器：红外码要写进它的键位表才生效，但**不再自动写**
+        //（写一次十几秒、GATT 会话容易和使用撞车）。这里只点亮顶栏的
+        // 「写入红外」提示，写不写、什么时候写由用户点。删动作也一样 ——
+        // 四行一起写，点一次写入才会把遥控器里的旧码清掉。
         if is_ir || was_ir {
-            if let Some(m) = self.rt.sync_ir_table() {
+            self.refresh_ir_pending();
+            if self.ir_pending {
+                let m = self.l().ir_pending_hint().to_string();
                 self.toast(m);
             }
         }

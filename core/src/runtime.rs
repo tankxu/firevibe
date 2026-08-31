@@ -415,81 +415,82 @@ impl Runtime {
         }
     }
 
+    /// 按当前方案编一张键位表。返回（表的 hex, 配了码的键数）。
+    /// 编译失败（比如某条码超长）返回一句能直接显示的话。
+    fn build_ir_table_hex(&self) -> Result<(String, usize), String> {
+        let cfg = self.cfg.read();
+        let prof = cfg.profile();
+        let mut codes: Vec<(crate::layout::Slot, Option<crate::ir::IrCode>)> = Vec::new();
+        for slot in crate::irtable::IR_SLOTS {
+            // 只看短按：表里没有「长按」这个概念，一个 scanId 一条码
+            let code = prof
+                .action(slot, false)
+                .filter(|a| a.kind == crate::config::ActionType::IrBlast)
+                .and_then(|a| crate::ir::IrCode::parse(&a.arg).ok());
+            codes.push((slot, code));
+        }
+        let n = codes.iter().filter(|(_, c)| c.is_some()).count();
+        let refs: Vec<_> = codes.iter().map(|(s, c)| (*s, c.as_ref())).collect();
+        let table = crate::irtable::build(&refs).map_err(|e| format!("红外表编译失败：{e}"))?;
+        Ok((crate::irtable::to_hex(&table), n))
+    }
+
+    /// 有没有一次红外写入正在进行（irblast 还没回来）
+    pub fn ir_sync_in_flight(&self) -> bool {
+        self.ir_sync_busy.load(Ordering::SeqCst)
+    }
+
+    /// 当前方案里的红外配置和遥控器里已写入的表**不一致**（有改动没写进去）。
+    /// 顶栏的「写入红外」提示就看它。
+    pub fn ir_table_pending(&self) -> bool {
+        if !self.cfg.read().settings.mic_model.is_ptt() {
+            return false; // 原厂走 blast，即配即用，没有「写入」这回事
+        }
+        let hash = self.cfg.read().settings.ir_table_hash.clone();
+        match self.build_ir_table_hex() {
+            // 编不出来（有超长码之类）也算「有改动」：让提示露出来，
+            // 点了会得到具体报错，总比默默藏着强
+            Err(_) => true,
+            Ok((_, 0)) if hash.is_empty() => false, // 没配过也没写过，无事发生
+            Ok((hex, _)) => hash != hex,
+        }
+    }
+
     /// 把当前方案里配的红外码**烧进仿品遥控器**（PID 0x0425 那条路）。
     ///
     /// 仿品没实现 blast，只能改它的持久化键位表 —— 所以红外不是「app 让它发」，
     /// 而是「按实体键它自己发」，电脑关着也照发。代价是只有 4 个键能挂
     /// （见 `irtable::scan_id`）、而且要先写进去，十几秒。
     ///
-    /// **四行永远都写**，没配码的行只有 `BLE_KEYPRESS` —— 这样用户把动作删掉，
-    /// 下一次同步就真的把那个键的红外清了，不会在遥控器里留着旧码。
+    /// **四行永远都写**，没配码的行只有 `BLE_KEYPRESS` —— 这样用户把动作删掉、
+    /// 再点一次写入，就真的把那个键的红外清了，不会在遥控器里留着旧码。
+    ///
+    /// ⚠️ **只由用户手动触发**（顶栏的「写入红外」按钮）。以前保存动作、
+    /// 连上遥控器都会自动写 —— 遥控器几秒睡一次、一按键就重连，写入窗口
+    /// 又长达 90 秒，自动写等于把十几秒的 GATT 会话随机撒在使用过程里，
+    /// 干扰正常使用还容易撞车。现在改动只点亮提示，写不写、什么时候写，用户说了算。
     ///
     /// 原厂遥控器（热麦克风那派）不走这条：它的 blast 是即时的，见 `ir_blast`。
-    /// 连上遥控器时自动补写：**只在用户确实配过红外、而且表变了的时候**。
-    ///
-    /// 不无条件写是有原因的 —— 见 `Settings::ir_table_hash` 的注释：
-    /// 没配过红外的人被写一张空表，等于把电视烧进去的音量控制抹掉。
-    pub fn maybe_sync_ir_table(&self) -> Option<String> {
-        if self.cfg.read().settings.ir_table_hash.is_empty() {
-            // 从没写过 —— 只有配了码才主动写
-            let has_ir = {
-                let cfg = self.cfg.read();
-                let prof = cfg.profile();
-                crate::irtable::IR_SLOTS.iter().any(|s| {
-                    prof.action(*s, false)
-                        .is_some_and(|a| a.kind == crate::config::ActionType::IrBlast)
-                })
-            };
-            if !has_ir {
-                return None;
-            }
-        }
-        self.sync_ir_table_inner(false)
-    }
-
     pub fn sync_ir_table(&self) -> Option<String> {
-        self.sync_ir_table_inner(true)
-    }
-
-    fn sync_ir_table_inner(&self, force: bool) -> Option<String> {
         if !self.cfg.read().settings.mic_model.is_ptt() {
             return None; // 原厂走 blast，不用烧表
         }
-        let (table, n) = {
-            let cfg = self.cfg.read();
-            let prof = cfg.profile();
-            let mut codes: Vec<(crate::layout::Slot, Option<crate::ir::IrCode>)> = Vec::new();
-            for slot in crate::irtable::IR_SLOTS {
-                // 只看短按：表里没有「长按」这个概念，一个 scanId 一条码
-                let code = prof
-                    .action(slot, false)
-                    .filter(|a| a.kind == crate::config::ActionType::IrBlast)
-                    .and_then(|a| crate::ir::IrCode::parse(&a.arg).ok());
-                codes.push((slot, code));
-            }
-            let n = codes.iter().filter(|(_, c)| c.is_some()).count();
-            let refs: Vec<_> = codes.iter().map(|(s, c)| (*s, c.as_ref())).collect();
-            match crate::irtable::build(&refs) {
-                Ok(t) => (t, n),
-                Err(e) => return Some(format!("红外表编译失败：{e}")),
-            }
+        let (hex, n) = match self.build_ir_table_hex() {
+            Ok(v) => v,
+            Err(e) => return Some(e),
         };
-        let hex = crate::irtable::to_hex(&table);
-        if !force && self.cfg.read().settings.ir_table_hash == hex {
-            return None; // 遥控器里已经是这张表了
-        }
         let name = ir_device_name();
         if name.is_empty() {
             // 还没连上过，不知道该找哪台蓝牙外设。irblast 拿空串去 contains 匹配
-            // 谁都配不上，白等 90 秒 —— 连上后 maybe_sync 会自动补。
-            return Some("还没连上遥控器，红外码会在连上时自动写入".into());
+            // 谁都配不上，白等 90 秒。
+            return Some("还没连上过遥控器 —— 按一下它任意键、等它连上再写".into());
         }
         // 在途锁：写一次要十几秒（还要等遥控器醒），期间编辑器再保存 / 遥控器
         // 重连都会再触发一次。两个 irblast 同时往同一组 GATT 特征交错写分片，
         // 表被写坏设备**照样回 0x02**，然后 CONTEXT_SWITCH 到一张坏表 ——
         // 绝不能并发。在途时直接跳过：写完 hash 没更新的话，下一次重连会补。
         if self.ir_sync_busy.swap(true, Ordering::SeqCst) {
-            return Some("上一次红外写入还在进行，这次先不写（完成后会自动补）".into());
+            return Some("上一次红外写入还在进行 —— 等它完成再点".into());
         }
         let busy = self.ir_sync_busy.clone();
         let tx = self.tx.clone();
@@ -825,6 +826,16 @@ impl Runtime {
                     };
                 let mut probe_frames = 0u32;
 
+                // 实验开关：FIREVIBE_KEEPALIVE=<秒> 时每隔几秒发一条无害命令
+                //（关麦，两派遥控器闲置时都等于空操作），试试 ATT 流量能不能
+                // 拦住仿品「几秒就休眠断链」。没设就完全不跑。若验证有效再做成配置。
+                let keepalive: Option<Duration> = std::env::var("FIREVIBE_KEEPALIVE")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|s| *s > 0)
+                    .map(Duration::from_secs);
+                let mut last_alive = Instant::now();
+
                 let mut mic_was = false;
                 let mut last_ka = Instant::now();
                 let mut idle_frames = status.audio_frames.load(Ordering::Relaxed);
@@ -859,8 +870,8 @@ impl Runtime {
                                 _ => "未知",
                             }
                         )));
-                        // 让 UI 补一次红外表同步：连上那一刻模型还是 Unknown，
-                        // maybe_sync_ir_table 被跳过了
+                        // 通知 UI：连上那一刻模型还是 Unknown，
+                        // 顶栏「写入红外」的判断这时才有效（UI 收到后会刷新提示）
                         let _ = tx.send(Event::MicModelProbed);
                     }
                     // 外面递进来的 OUTPUT 报文（--probe-all 的三轮对照用来试开麦）
@@ -893,6 +904,14 @@ impl Runtime {
                     if mic_now && last_ka.elapsed() >= Duration::from_secs(1) {
                         let _ = dev.write(&MIC_ON);
                         last_ka = Instant::now();
+                    }
+                    // 实验保活（见上面 keepalive 的注释）。开麦期间不需要 ——
+                    // 上面那条 MIC_ON keepalive 本身就是流量。
+                    if let Some(iv) = keepalive {
+                        if !mic_now && last_alive.elapsed() >= iv {
+                            let _ = dev.write(&MIC_OFF);
+                            last_alive = Instant::now();
+                        }
                     }
                     // 自愈：没开麦却还在收音频 → 设备侧还热着（上次强杀、或没收到命令），补关麦。
                     // PTT 遥控器上这是误触发 —— 它本来就是「按住才出流」，没开麦时收到音频

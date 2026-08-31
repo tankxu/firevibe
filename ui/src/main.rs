@@ -203,6 +203,10 @@ pub struct FireVibe {
     pub config_export_rx: Option<Receiver<Option<std::path::PathBuf>>>,
     /// 一次性提示
     pub toast: Option<(String, Instant)>,
+    /// 当前方案的红外配置和遥控器里写着的表不一致（顶栏亮「写入红外」）。
+    /// 值是缓存 —— 每秒在 pump 里重算一次，改动作后立刻重算。
+    pub ir_pending: bool,
+    pub ir_pending_at: Instant,
     pub product: String,
     pub err: Option<String>,
     /// 自检用：`FIREVIBE_BOOT=settings` 或 `FIREVIBE_BOOT=dialog:app1:long`
@@ -435,6 +439,8 @@ impl FireVibe {
             config_import_rx: None,
             config_export_rx: None,
             toast: None,
+            ir_pending: false,
+            ir_pending_at: Instant::now() - Duration::from_secs(60),
             product: String::new(),
             err: None,
             boot: std::env::var("FIREVIBE_BOOT").ok(),
@@ -559,6 +565,13 @@ impl FireVibe {
         self.toast = Some((s.into(), Instant::now()));
     }
 
+    /// 重算「红外有改动未写入」。改动作后 / 探明型号后立刻调；
+    /// pump 每秒也兜一次（写入完成后 hash 变了要让提示灭掉）。
+    pub fn refresh_ir_pending(&mut self) {
+        self.ir_pending = self.rt.ir_table_pending();
+        self.ir_pending_at = Instant::now();
+    }
+
     /// 还有动画在跑吗 —— 决定下一帧的间隔
     /// 界面「看起来」的样子的指纹。只有它变了才值得重画。
     ///
@@ -585,6 +598,9 @@ impl FireVibe {
         self.voice_ready.hash(&mut h);
         self.loopback.is_ready().hash(&mut h);
         self.rt.status.mic_on.load(Ordering::Relaxed).hash(&mut h);
+        // 顶栏「写入红外」：出现 / 变成写入中 / 消失 都要触发重画
+        self.ir_pending.hash(&mut h);
+        self.rt.ir_sync_in_flight().hash(&mut h);
         // 按下高亮：延迟最敏感，一定要进指纹
         let mut ks: Vec<_> = self.pressed.iter().map(|k| (k.page, k.usage)).collect();
         ks.sort_unstable();
@@ -660,6 +676,11 @@ impl FireVibe {
             if t.elapsed() > Duration::from_millis(2200) {
                 self.toast = None;
             }
+        }
+        // 「写入红外」提示的兜底刷新：写入完成（hash 更新）发生在后台线程，
+        // 没有事件通知，这里每秒重算一次让提示自己灭掉
+        if self.ir_pending_at.elapsed() > Duration::from_secs(1) {
+            self.refresh_ir_pending();
         }
         // HID 打开也会跑 run loop，同样不能放构造期。
         // 「设备没连上」是正常状态不是错误 —— 不弹错误条，靠状态卡高亮表示，
@@ -831,11 +852,9 @@ impl FireVibe {
                 }
                 Event::Disconnected(e) => self.err = Some(e),
                 Event::MicModelProbed => {
-                    // 刚探明开麦模型。连上那一刻模型还是 Unknown，红外表同步被
-                    // 跳过了（是不是仿品都判不出来），这里补一次。
-                    if let Some(m) = self.rt.maybe_sync_ir_table() {
-                        eprintln!("[firevibe] {m}");
-                    }
+                    // 刚探明开麦模型 —— 现在才知道是不是仿品，
+                    // 顶栏「写入红外」的提示这时才判得出来，刷新一下
+                    self.refresh_ir_pending();
                 }
                 Event::Log(s) => {
                     if let Some(t) = s.strip_prefix("听写（").and_then(|r| r.split_once("）：")) {
@@ -845,6 +864,12 @@ impl FireVibe {
                         self.last_stt = Some(s.clone());
                         self.toast(s.clone());
                     } else if s.starts_with("已学到") {
+                        self.toast(s);
+                    } else if s.contains("红外") || s.contains("遥控器睡着") {
+                        // 红外写入的进度/结果（成功、睡着了、写失败）都用 toast 报，
+                        // 别落进下面的 err 常驻错误条 —— 写失败不是连接坏了。
+                        // 顺手刷新提示：写成功 hash 变了，「写入红外」该灭了。
+                        self.refresh_ir_pending();
                         self.toast(s);
                     } else if s.contains("失败") || s.contains("error") {
                         self.err = Some(s);
@@ -928,6 +953,39 @@ impl FireVibe {
                             .child(SharedString::from(l.app_sub())),
                     ),
             )
+            .when(self.rt.ir_sync_in_flight(), |d| {
+                // 正在写：只报状态，不可点（在途锁挡得住重复点击，但别引诱用户点）
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .px(px(11.))
+                        .py(px(6.))
+                        .rounded(px(R_SM))
+                        .border_1()
+                        .border_color(c(LINE_STRONG))
+                        .text_color(c(INK3))
+                        .text_size(px(12.))
+                        .child(icon("loader-circle", 13.))
+                        .child(SharedString::from(l.ir_writing())),
+                )
+            })
+            .when(!self.rt.ir_sync_in_flight() && self.ir_pending, |d| {
+                // 红外配置改了还没写进遥控器 —— 亮个手动写入的入口。
+                // 不自动写：写一次十几秒、GATT 会话还容易和正常使用撞车，
+                // 什么时候写由用户决定（这时最好先按一下遥控器让它醒着）。
+                d.child(
+                    mini2_ico("ir-write", "zap", l.ir_write_btn()).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            if let Some(m) = this.rt.sync_ir_table() {
+                                this.toast(m);
+                            }
+                            cx.notify();
+                        },
+                    )),
+                )
+            })
             .child(icon_btn("gear", "settings").on_click(cx.listener(|this, _, _, cx| {
                 this.screen = Screen::Settings;
                 cx.notify();
@@ -1447,12 +1505,9 @@ impl FireVibe {
                 if let Some(m) = self.rt.sync_hid_remap() {
                     eprintln!("[firevibe] {m}");
                 }
-                // 仿品遥控器的红外码要烧进它自己的键位表 —— 写表走蓝牙、需要它
-                // 醒着，而它空闲几十秒就睡。所以「刚连上」是唯一可靠的时机。
-                // 里面有两道闸：没配过红外不写、表没变不写（见 maybe_sync_ir_table）。
-                if let Some(m) = self.rt.maybe_sync_ir_table() {
-                    eprintln!("[firevibe] {m}");
-                }
+                // 红外表**不再自动写**（写一次十几秒、GATT 会话还容易和使用撞车）。
+                // 有改动时顶栏会亮「写入红外」，由用户手动点。这里只刷新一下提示。
+                self.refresh_ir_pending();
                 match why {
                 StartWhy::Auto | StartWhy::Manual => {
                     self.err = None;
