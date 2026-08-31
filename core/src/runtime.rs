@@ -440,6 +440,82 @@ impl Runtime {
         self.ir_sync_busy.load(Ordering::SeqCst)
     }
 
+    /// 诊断钩子：`FIREVIBE_IR_WRITE=<蓝牙名片段>:<hex文件路径>` 时，启动后把
+    /// 文件里的表**原样**写进遥控器（走 --mapping，不经过 irtable::build）。
+    ///
+    /// 为什么存在：排查「写了哪张表让固件出毛病」要做 A/B —— 比如把电视原表
+    /// `tv_table.hex` 写回去对照。终端进程没有蓝牙授权（CoreBluetooth 对 shell
+    /// 卡在 unauthorized），irblast 只能由 app 拉起（TCC 归责到 FireVibe.app），
+    /// 所以从 app 里开这个口子。写入结果打到 stderr。
+    pub fn maybe_debug_ir_write(&self) {
+        let Ok(spec) = std::env::var("FIREVIBE_IR_WRITE") else {
+            return;
+        };
+        let Some((name, path)) = spec.split_once(':') else {
+            eprintln!("[irdbg] FIREVIBE_IR_WRITE 格式：<蓝牙名片段>:<hex文件路径>");
+            return;
+        };
+        let hex = match std::fs::read_to_string(path) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                eprintln!("[irdbg] 读不了 {path}: {e}");
+                return;
+            }
+        };
+        if self.ir_sync_busy.swap(true, Ordering::SeqCst) {
+            eprintln!("[irdbg] 已有写入在途，跳过");
+            return;
+        }
+        let busy = self.ir_sync_busy.clone();
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            struct Unlock(Arc<AtomicBool>);
+            impl Drop for Unlock {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            let _unlock = Unlock(busy);
+            let Some(exe) = ir_blaster_path() else {
+                eprintln!("[irdbg] 找不到 irblast");
+                return;
+            };
+            eprintln!("[irdbg] 写入 {}（{} 字节表）—— 什么时候按遥控器都行，持续等 30 分钟", name, hex.len() / 2);
+            // 循环重试：一轮等 60 秒，「等不到」（退出码 3）就再来一轮 ——
+            // 用户不一定守在旁边，一次性的 120 秒窗口错过就白装了一趟。
+            // 每轮新起 irblast（全新 CBCentralManager），比单个超长等待可靠。
+            for round in 1..=30 {
+                let out = std::process::Command::new(&exe)
+                    .arg(&name)
+                    .arg(&hex)
+                    .args(["--mapping", "--uuid-rand", "--wait", "60"])
+                    .output();
+                match out {
+                    Ok(o) if o.status.code() == Some(3) => {
+                        eprintln!("[irdbg] 第 {round} 轮没等到遥控器，继续蹲");
+                        continue;
+                    }
+                    Ok(o) => {
+                        for l in String::from_utf8_lossy(&o.stderr).lines() {
+                            eprintln!("[irdbg] {l}");
+                        }
+                        eprintln!(
+                            "[irdbg] 退出码 {:?} stdout={}",
+                            o.status.code(),
+                            String::from_utf8_lossy(&o.stdout).trim()
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("[irdbg] irblast 起不来: {e}");
+                        return;
+                    }
+                }
+            }
+            eprintln!("[irdbg] 30 分钟都没等到遥控器，放弃 —— 重开 app 再试");
+        });
+    }
+
     /// 当前方案里的红外配置和遥控器里已写入的表**不一致**（有改动没写进去）。
     /// 顶栏的「写入红外」提示就看它。
     pub fn ir_table_pending(&self) -> bool {
@@ -698,8 +774,15 @@ impl Runtime {
             }
         }
         let (fwd_tx, fwd_rx) = channel::<(u8, Vec<u8>)>();
+        // 排障开关：FIREVIBE_HID_SINGLE=1 时只开主 collection（v0.2.1 的打开方式）。
+        // 用来隔离「多 collection 全开」对遥控器行为的影响 —— 比如它的
+        // 闲置断链计时器是否因此变了脾气。
+        let single = std::env::var_os("FIREVIBE_HID_SINGLE").is_some();
+        if single {
+            eprintln!("[firevibe] FIREVIBE_HID_SINGLE=1：只开主 collection");
+        }
         for (i, (p, pg, us)) in all.iter().enumerate() {
-            if i == primary_idx {
+            if i == primary_idx || single {
                 continue;
             }
             let sec = match api.open_path(p) {

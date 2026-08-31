@@ -720,6 +720,8 @@ impl FireVibe {
                 if let Some(m) = self.rt.sync_hid_remap() {
                     eprintln!("[firevibe] {m}");
                 }
+                // 诊断钩子：FIREVIBE_IR_WRITE=<名字>:<hex文件> 时原样写一张表进遥控器
+                self.rt.maybe_debug_ir_write();
                 // 事件 tap：吞掉遥控器按键在系统那边的默认行为（麦克风键弹 Spotlight）
                 if let Err(e) = self.rt.start_tap() {
                     let m = self.l().toast_block_failed(&e.to_string());
@@ -850,7 +852,15 @@ impl FireVibe {
                     firevibe_core::battery::set_target(&product);
                     self.product = product;
                 }
-                Event::Disconnected(e) => self.err = Some(e),
+                // 断开不是错误，是这台遥控器的常态 —— macOS 拒绝它要的
+                // peripheral latency（>30 一律拒，bluetoothd 写死的策略），
+                // 它要不到打盹许可，约 8 秒没按键就主动断链省电（实测按住
+                // 不放能续命、主机发什么都不算数）。Fire TV 会批准 latency，
+                // 所以在电视上它「看起来」永远在线。断了 300ms 内会自动抓回、
+                // 按键即醒即用 —— 弹红色错误条只会让人以为坏了。
+                Event::Disconnected(e) => {
+                    eprintln!("[firevibe] 遥控器断开（多半是它自己休眠）：{e}");
+                }
                 Event::MicModelProbed => {
                     // 刚探明开麦模型 —— 现在才知道是不是仿品，
                     // 顶栏「写入红外」的提示这时才判得出来，刷新一下
