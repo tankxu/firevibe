@@ -1508,13 +1508,8 @@ impl FireVibe {
         self.start_rx = None;
         match res {
             Ok(_) => {
-                // 连上才补硬件层映射 —— hidutil 是按 VID/PID 匹配当下在线的设备，
-                // 设备不在线时下发是空操作。以前只在启动和改配置时下发，遥控器
-                // 后来才醒的话就永远没映射：麦克风键没被接管、Spotlight 照弹、
-                // 第三方语音工具拿不到硬件修饰键。这台仿品休眠很快，几乎必中。
-                if let Some(m) = self.rt.sync_hid_remap() {
-                    eprintln!("[firevibe] {m}");
-                }
+                // 硬件层映射已挪进 rt.start()（连接一建立就同步下发，
+                // 抢在唤醒按键漏进系统之前），这里不再重复跑 hidutil。
                 // 红外表**不再自动写**（写一次十几秒、GATT 会话还容易和使用撞车）。
                 // 有改动时顶栏会亮「写入红外」，由用户手动点。这里只刷新一下提示。
                 self.refresh_ir_pending();
