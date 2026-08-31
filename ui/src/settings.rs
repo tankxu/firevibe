@@ -583,7 +583,7 @@ impl FireVibe {
                     this.dismiss_menus_pub();
                     cx.notify();
                 }));
-            wrap = wrap.child(deferred(menu));
+            wrap = wrap.child(deferred(menu.occlude()));
         }
         wrap.into_any_element()
     }

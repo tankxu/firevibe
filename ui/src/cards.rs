@@ -219,6 +219,9 @@ impl FireVibe {
             // 不延后就会被 card-body 里后画的「测试 / 编辑」盖住
             wrap = wrap.child(deferred(
                 div()
+                    // occlude：不占坑的浮层挡得住视线挡不住鼠标 —— 没有它，
+                    // 点菜单项会穿透到下面的按钮（穿到「添加按键」实测踩过）
+                    .occlude()
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                         this.dismiss_menus_pub();
                         cx.notify();

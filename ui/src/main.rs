@@ -1452,7 +1452,7 @@ impl FireVibe {
                         })),
                 );
             }
-            wrap = wrap.child(deferred(menu.on_mouse_down_out(cx.listener(
+            wrap = wrap.child(deferred(menu.occlude().on_mouse_down_out(cx.listener(
                 |this, _, _, cx| {
                     this.dismiss_menus();
                     cx.notify();
@@ -2198,7 +2198,7 @@ impl FireVibe {
                         })),
                 );
             // 同理，方案下拉要压在下面的「自定义操作」标题和卡片之上
-            block = block.child(deferred(menu.on_mouse_down_out(cx.listener(
+            block = block.child(deferred(menu.occlude().on_mouse_down_out(cx.listener(
                 |this, _, _, cx| {
                     this.dismiss_menus();
                     cx.notify();

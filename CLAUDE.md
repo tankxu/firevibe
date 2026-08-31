@@ -292,6 +292,9 @@ AppKit 透明标题栏的真实拖拽区，不是 window_control_area 起作用�
 
 - **GPUI**：`cx.open_window()` 不能在 `render()` 里调（重入绘制，静默 abort），
   放定时器的 `this.update` 闭包里。
+- **`deferred()` 的浮层必须配 `.occlude()`**：deferred 只解决画在上面，
+  挡不住鼠标 —— 点下拉菜单项会穿透到下面的按钮（实测点输入源下拉穿到了
+  「添加按键」）。四个下拉（输入源/方案/卡片菜单/设置语言）都补过了。
 - **`.when(self.x.lock().is_some(), |d| ...)` 会死锁。** 临时的 `parking_lot`
   guard 活到整条语句结束，闭包里再取同一把锁就是自锁（非重入）。
   先把锁里的东西取出来（`let st = { ... };`），闭包只用取出来的值。
@@ -370,7 +373,12 @@ firectl --mic-listen --no-cmd # 对照组：一条命令都不发，只靠按键
 一台没连的设备 —— 麦克风键没被接管：Spotlight 照弹，而且第三方语音工具拿不到
 **硬件来源**的修饰键就不干活（合成事件对它无效，见 hidremap.rs 顶部注释）。
 现在 `sync_hid_remap()` 每次都先按配置 `set_ids`。
-验证：`hidutil property --matching '{"ProductID":0x0425,"VendorID":0x0171}' --get UserKeyMapping`
+❗ **2026-08-31 起映射改为全局（不带 --matching）**：按设备的映射只对下发
+那一刻在线的设备生效，断开重连即失效 —— 遥控器 8 秒一睡，每次唤醒的第一下
+按键到达时映射必然不在场（Spotlight 弹出、豆包拿不到硬件修饰键、要按两下）。
+全局映射常驻事件系统、对之后接入的设备也生效，app 启动时遥控器睡着照样预埋成功。
+源是 Consumer AC Search(0x0221)，普通键盘不发，无误伤面。
+验证：`hidutil property --get UserKeyMapping`（不带 --matching）
 应该看到 Src `0xC00000221`(AC Search) → Dst `0x7000000E6`(右 Option)。
 
 ⚠️ 改了配置要**重启 app** 才生效 —— runtime 是启动时读配置建 HID 线程的。
@@ -517,21 +525,30 @@ pub fn start(&self) -> Result<()> {
 
 **判据**：凡是「重连/重试」路径上被置位的状态，都要问一句「谁把它清回去」。
 
-## 打开 HID 必须认准 vendor collection
+## HID collection：三个全开，别再赌哪个送按键（2026-08-31 起）
 
 macOS 把这支遥控器拆成三个 top-level collection：
 `0x0001/0x06 键盘` · `0x000c/0x01 消费类` · **`0x00ff/0x00 厂商`**。
+「按键从哪个出来」会随枚举顺序 / 配对状态 / 写没写过键位表**漂移**，
+写死任何一个（包括厂商 0x00ff）都可能变成「连上了但一个报文都收不到」。
+现在 `Runtime::start()` **全部打开**：主 collection（优先 0x00ff，命令和
+音频从它走）留在主读线程，其余各起一条副线程转发报文进主循环，按
+report id 处理；按键状态集幂等，重复报文无害。`FIREVIBE_HID_USAGE_PAGE`
+覆盖主 collection，`FIREVIBE_HID_SINGLE=1` 退回单开（都是排障用）。
 
-`api.open(vid, pid)` 拿的是**枚举出来的第一个**（实测是键盘那个），
-而按键报文 `0x02`、音频 `0xF0` 都从**厂商**那个出来。枚举顺序不保证稳定，
-所以这是「看运气」，重新配对之后顺序变了就从能用变成不能用。
+## 掉线是遥控器固件常态，治不了只能无感化（2026-08-31 结案）
 
-```rust
-api.device_list()
-   .find(|d| d.vendor_id()==vid && d.product_id()==pid && d.usage_page()==0x00ff)
-   .or_else(|| /* 兜底：任意一个 */)
-```
-（firectl 的诊断命令当初就是这么挑的，但这个知识一直没搬进 `Runtime::start()`。）
+仿品每次连接请求 peripheral latency=49；bluetoothd **硬编码拒绝 >30**
+（"so we drain our battery and they don't - refusing"，strings 扫过无任何
+defaults 开关，插电照拒）。要不到打盹许可，它**约 8 秒没有物理按键就
+主动断链省电**：按住键续命、主机侧任何写入（HID/GATT）都不算活动
+（keepalive 实测无效）。Fire TV 批准 latency，所以在电视上"永远在线"。
+「以前能保持连接」是 connected 标志不清零的 bug 造成的 UI 假常亮。
+应对：断开只写日志不弹错误条、300ms 自动抓回、tap 无条件吞 0xb1
+（唤醒键到达时 connected 必为 false）、隐式按住会话（PTT 只有实体麦克风
+键按住才吐流 → "音频来了而没见过按下"=用户正按着，开音频闸门；对走
+硬件层映射的键**绝不补合成** —— 豆包只认硬件来源，合成的还会把它的
+热键状态机搞乱）。
 
 ## 配置文件必须原子写
 
