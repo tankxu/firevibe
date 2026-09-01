@@ -178,8 +178,15 @@ impl FireVibe {
                 if *over {
                     this.set_hover(Some(slot));
                 } else if this.hover_card == Some(slot) {
-                    this.set_hover(None);
-                    this.menu_open = None;
+                    // ⚠️ 菜单开着时**别**因为鼠标移到菜单上就收起 hover / 关菜单。
+                    // 菜单是 occlude 的浮层，鼠标一挪上去，卡片这里就收到
+                    // over=false（被菜单挡住了）—— 以前这里顺手 menu_open=None，
+                    // 于是「鼠标往『移除』划过去的路上菜单就消失了」。
+                    // 这是**点击**打开的菜单，本就该点外部才关（on_mouse_down_out），
+                    // 不该 hover 一离开就关。
+                    if this.menu_open != Some(slot) {
+                        this.set_hover(None);
+                    }
                 }
                 cx.notify();
             }))
