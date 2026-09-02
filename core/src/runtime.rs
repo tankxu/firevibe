@@ -947,6 +947,10 @@ impl Runtime {
                 let mut idle_at = Instant::now();
                 // 长按状态机：按下时间 + 是否已触发长按
                 let mut held: HashMap<Key, (Instant, bool)> = HashMap::new();
+                // 长按槽里的**映射按键**要连续重复（模拟键盘按住自动重复）——
+                // 合成事件在 macOS 上不会自己重复，得我们按节奏重发。每个正在重复
+                // 的键存一个停止标志，松手时置 false 让重复线程退出。
+                let mut key_repeats: HashMap<Key, Arc<AtomicBool>> = HashMap::new();
 
                 loop {
                     if stop.load(Ordering::Relaxed) {
@@ -1053,6 +1057,39 @@ impl Runtime {
                             }
                         }
                         for k in fire {
+                            // 长按到时，如果长按槽配的是**映射按键**，走「连续重复」——
+                            // 短按敲一下、长按按住连发（比如退格：短按删一个、长按连删）。
+                            // 其它长按动作（开应用、语音等）仍是触发一次，交给 dispatch。
+                            let long_key = {
+                                let c = cfg.read();
+                                c.action_for(k, true).and_then(|(_, a)| {
+                                    (a.kind == ActionType::Key)
+                                        .then(|| (a.key.clone(), a.mods.clone(), a.describe()))
+                                })
+                            };
+                            if let Some((key, mods, desc)) = long_key {
+                                let stop_flag = Arc::new(AtomicBool::new(true));
+                                key_repeats.insert(k, stop_flag.clone());
+                                let inj2 = inj.clone();
+                                std::thread::spawn(move || {
+                                    // 首击立刻（350ms 的长按阈值就是「初始延迟」），
+                                    // 之后每 ~60ms 连发一次，直到松手把标志清掉。
+                                    let _ = inj2.key_stroke(&key, &mods);
+                                    while stop_flag.load(Ordering::Relaxed) {
+                                        std::thread::sleep(Duration::from_millis(60));
+                                        if !stop_flag.load(Ordering::Relaxed) {
+                                            break;
+                                        }
+                                        let _ = inj2.key_stroke(&key, &mods);
+                                    }
+                                });
+                                let _ = tx.send(Event::Key {
+                                    key: k,
+                                    down: true,
+                                    result: format!("{desc}（按住连发）"),
+                                });
+                                continue;
+                            }
                             let r = dispatch(
                                 &cfg,
                                 &status,
@@ -1090,7 +1127,20 @@ impl Runtime {
                     let mut reports: Vec<(u8, Vec<u8>)> = Vec::new();
                     match dev.read_timeout(&mut buf, 50) {
                         Ok(0) => {}
-                        Ok(n) => reports.push((buf[0], buf[1..n].to_vec())),
+                        Ok(n) => {
+                            reports.push((buf[0], buf[1..n].to_vec()));
+                            // ⚠️ 抽干 hidapi 缓冲：**每圈只读一帧会攒延迟**。音频 50 帧/秒
+                            // （每 20ms 一帧），而主循环每圈还要跑开关麦/keepalive/自愈/
+                            // 长按判定/隐式会话那一串（好几把锁），一旦单圈超过 20ms 就
+                            // 追不上、帧堆在 hidapi 里，音频越积越晚——表现成「说完还得
+                            // 按一会儿豆包才收全」。0 超时连读到空，保证不落后。
+                            loop {
+                                match dev.read_timeout(&mut buf, 0) {
+                                    Ok(n) if n > 0 => reports.push((buf[0], buf[1..n].to_vec())),
+                                    _ => break,
+                                }
+                            }
+                        }
                         Err(e) => {
                             status.connected.store(false, Ordering::Relaxed);
                             let _ = tx.send(Event::Disconnected(e.to_string()));
@@ -1344,6 +1394,13 @@ impl Runtime {
                                         });
                                     }
                                 } else {
+                                    // 松手：如果这个键正在「连续重复」（长按映射键），
+                                    // 清掉停止标志让重复线程退出，别再往下走 dispatch。
+                                    if let Some(stop_flag) = key_repeats.remove(&k) {
+                                        stop_flag.store(false, Ordering::Relaxed);
+                                        held.remove(&k);
+                                        continue;
+                                    }
                                     match held.remove(&k) {
                                         // 长按已触发 -> 松手只给长按动作发 release（按住说话要停流）
                                         Some((_, true)) => {
@@ -1472,6 +1529,10 @@ impl Runtime {
                 }
                 let _ = dev.write(&MIC_OFF);
                 pressed.lock().clear();
+                // 退出前停掉所有还在连发的重复线程，否则它们会一直删字（泄漏）
+                for (_, stop_flag) in key_repeats.drain() {
+                    stop_flag.store(false, Ordering::Relaxed);
+                }
             });
         spawn_res?;
         Ok(())

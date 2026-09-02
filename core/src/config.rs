@@ -435,7 +435,9 @@ impl Default for VoiceConfig {
             // 豆包、闪电说会把「虚拟」设备从麦克风候选里滤掉，BlackHole 就是这么被漏掉的。
             // 装了就用它，没装回退 BlackHole（迁移逻辑在 Config::load 里）。
             device: preferred_voice_device(),
-            gain: 1.0,
+            // 遥控器麦克风电平偏小，1.0 不放大时豆包这类工具容易漏识别（尤其小声）。
+            // 2.5× 对语音安全 —— 正常说话远不到满刻度，偶有响亮爆音略微削顶也不影响识别。
+            gain: 2.5,
         }
     }
 }

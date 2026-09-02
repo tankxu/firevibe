@@ -120,13 +120,34 @@ impl VoiceSink {
             .ok_or_else(|| anyhow!("找不到名字以 {device_prefix:?} 开头的输出设备"))?;
 
         let name = dev.name().unwrap_or_else(|_| "?".into());
-        let cfg = dev.default_output_config().context("取默认输出配置失败")?;
+        let def = dev.default_output_config().context("取默认输出配置失败")?;
+        // ⚠️ **优先把输出流开成 16 kHz**（= OPUS_RATE，遥控器音频的原始采样率）。
+        // 为什么：豆包这类语音工具按 16 kHz 读这块虚拟声卡，会把整条链路的消费节奏
+        // 拉到 16 kHz；而设备 default_output_config 报的是 48 kHz。若按 48 kHz 上采样
+        // 往里灌，就是「灌 48000/秒、只消费 16000/秒」，缓冲几秒就爆、Doubao 听到的
+        // 永远是几秒前的音频（实测缓冲顶到 4 秒上限、每秒丢 3 万帧）。
+        // 开成 16 kHz 后 ratio=1、不上采样，cpal 回调也按 16 kHz 要数据，产销平衡。
+        // 设备硬件真实速率交给 CoreAudio 内部转换，不归我们管。
+        let cfg = dev
+            .supported_output_configs()
+            .ok()
+            .and_then(|mut it| {
+                it.find(|r| {
+                    r.min_sample_rate().0 <= OPUS_RATE && OPUS_RATE <= r.max_sample_rate().0
+                })
+                .map(|r| r.with_sample_rate(cpal::SampleRate(OPUS_RATE)))
+            })
+            .unwrap_or_else(|| def.clone());
         let out_rate = cfg.sample_rate().0;
         let out_ch = cfg.channels();
+        eprintln!("[voice] 输出流 {out_rate} Hz / {out_ch} 声道（设备默认 {} Hz）", def.sample_rate().0);
 
+        // 缓冲上限压到约 250ms —— 溢出丢**最旧**的（见 push_pcm），保证延迟封顶。
+        // 之前是 4 秒 + 丢新的：一旦产销错配，延迟直接攒到 4 秒还留着旧音频。
+        let cap = (out_rate as usize / 4).max(OPUS_RATE as usize / 4);
         let sh = Arc::new(Shared {
-            ring: Mutex::new(VecDeque::with_capacity(out_rate as usize * 4)),
-            cap: out_rate as usize * 4,
+            ring: Mutex::new(VecDeque::with_capacity(cap)),
+            cap,
             passing: AtomicBool::new(false),
             gain: AtomicU32::new(f32_to_bits(gain)),
             level: AtomicU32::new(0),
@@ -249,15 +270,31 @@ impl VoiceSink {
             }
             while *pos < 1.0 {
                 let v = *prev + (cur - *prev) * (*pos as f32);
-                if ring.len() >= self.sh.cap {
+                ring.push_back(v);
+                // 溢出丢**最旧**的:延迟必须封顶。留着旧音频只会让 Doubao 一直
+                // 听几秒前的话(之前丢新的、留旧的 4 秒,就是这个 bug)。
+                while ring.len() > self.sh.cap {
+                    ring.pop_front();
                     self.sh.dropped.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    ring.push_back(v);
                 }
                 *pos += 1.0 / ratio;
             }
             *pos -= 1.0;
             *prev = cur;
+        }
+        // 诊断：FIREVIBE_AUDIO_DEBUG=1 时每约 1 秒打一次环形缓冲深度(=下游延迟)。
+        // 深度大 → 延迟在 ring→虚拟声卡这段；深度一直很浅 → 延迟在上游(遥控器/HID)。
+        if std::env::var_os("FIREVIBE_AUDIO_DEBUG").is_some() {
+            use std::sync::atomic::AtomicU32;
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) % 50 == 0 {
+                let depth = ring.len();
+                eprintln!(
+                    "[audio] 缓冲深度 {depth} 采样 ≈ {}ms，累计丢帧 {}",
+                    depth as u32 * 1000 / self.out_rate,
+                    self.sh.dropped.load(Ordering::Relaxed)
+                );
+            }
         }
     }
 }
