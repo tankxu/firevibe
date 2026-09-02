@@ -199,6 +199,11 @@ pub struct FireVibe {
     started: bool,
     /// 上次尝试开 HID 的时刻，用来控制自动重连节奏
     hid_try_at: Instant,
+    /// 上次断开时刻，用来打印「离线多久」观察休眠/唤醒
+    last_disc_at: Option<Instant>,
+    /// 这台设备**这次会话里成功连过一次**没有。非 PTT 首连之前保持重试
+    /// （防开机时遥控器正睡着连不上），连上过就不再自动追（让它睡、不吵它）。
+    hid_ever_up: bool,
     /// 听写时屏幕底部那条悬浮电平窗
     hud: Option<gpui::WindowHandle<hud::Hud>>,
     pub update: UpdateStatus,
@@ -442,6 +447,8 @@ impl FireVibe {
             loopback_at: Instant::now() - Duration::from_secs(10),
             started: false,
             hid_try_at: Instant::now() - Duration::from_secs(10),
+            last_disc_at: None,
+            hid_ever_up: false,
             hud: None,
             update: UpdateStatus::Idle,
             update_rx: None,
@@ -703,8 +710,20 @@ impl FireVibe {
         // `HidApi::new()` ≈ 5ms、`open()` ≈ 1.7ms（设备不在时也是这个量级）。
         // 300ms 一次 = 每秒约 20ms，可以忽略；而抓住 3 秒窗口就变得很稳。
         // 已有 `start_rx` 的并发保护，不会叠着起。
-        const HID_RETRY: Duration = Duration::from_millis(300);
-        if !self.started || (!self.connected() && self.hid_try_at.elapsed() > HID_RETRY) {
+        //
+        // ⚠️ 但 300ms 死命重连 = 遥控器一断就被立刻拽回来、**永远睡不着**，很费电。
+        // 仿品(PTT)按一下只醒 ~3 秒，非快连不可；而**原厂(非 PTT)**没有那个短窗口，
+        // 放它睡、慢点重连更省电 —— 醒来(按键→广播→macOS 重连)时我们 2 秒内也能接上。
+        // 断开时打点时间戳，方便观察「休眠→唤醒」到底多快。
+        let is_ptt = self.rt.cfg.read().settings.mic_model.is_ptt();
+        // 实验：**非 PTT 断开后完全不自动重连**（只开机连一次），看它到底能不能睡。
+        // 2 秒重连还是不睡，说明可能是「只要 app 想连 macOS 就拽着它」。彻底不追，
+        // 让它睡；睡后按键唤醒、点状态卡的「连接」手动回来。能睡的话再上事件驱动重连。
+        // PTT 仍旧 300ms 快连（它按一下只醒 ~3 秒，非快连抓不住）。
+        // 非 PTT 只在「还没连上过」时保持重试（防开机遥控器正睡着）；连上过就不再追。
+        let want_retry = is_ptt || !self.hid_ever_up;
+        let auto_retry = !self.connected() && self.hid_try_at.elapsed() > Duration::from_millis(300);
+        if !self.started || (want_retry && auto_retry) {
             let first = !self.started;
             self.started = true;
             self.hid_try_at = Instant::now();
@@ -890,6 +909,11 @@ impl FireVibe {
                     // 否则一直读不到、界面显示上一台的陈旧电量
                     firevibe_core::battery::set_target(&product);
                     self.product = product;
+                    self.hid_ever_up = true;
+                    // 观察「休眠→唤醒」用：打出上次断开到现在过了多久
+                    if let Some(t) = self.last_disc_at.take() {
+                        eprintln!("[firevibe] 遥控器连上（离线 {:.1}s）", t.elapsed().as_secs_f32());
+                    }
                 }
                 // 断开不是错误，是这台遥控器的常态 —— macOS 拒绝它要的
                 // peripheral latency（>30 一律拒，bluetoothd 写死的策略），
@@ -898,6 +922,7 @@ impl FireVibe {
                 // 所以在电视上它「看起来」永远在线。断了 300ms 内会自动抓回、
                 // 按键即醒即用 —— 弹红色错误条只会让人以为坏了。
                 Event::Disconnected(e) => {
+                    self.last_disc_at = Some(Instant::now());
                     eprintln!("[firevibe] 遥控器断开（多半是它自己休眠）：{e}");
                 }
                 Event::MicModelProbed => {
