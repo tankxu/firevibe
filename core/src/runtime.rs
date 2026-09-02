@@ -1760,19 +1760,23 @@ impl Runtime {
             let c = self.cfg.read();
             (c.settings.prev_input_id, c.voice.device.to_lowercase())
         };
-        let Some(id) = id else { return };
         let cfg = self.cfg.clone();
         std::thread::spawn(move || {
-            // 只有当前确实停在虚拟声卡上才动，别把用户自己选的设备改掉
-            let stuck = crate::audio::default_input()
-                .map(|d| d.name.to_lowercase().contains(&want))
-                .unwrap_or(false);
-            if stuck {
-                let _ = crate::audio::set_default_input(id);
+            // 有记录的还原目标：只在当前确实停在虚拟声卡上才切回（别动用户自己选的）
+            if let Some(id) = id {
+                let stuck = crate::audio::default_input()
+                    .map(|d| d.name.to_lowercase().contains(&want))
+                    .unwrap_or(false);
+                if stuck {
+                    let _ = crate::audio::set_default_input(id);
+                }
+                let mut g = cfg.write();
+                g.settings.prev_input_id = None;
+                let _ = g.save();
             }
-            let mut g = cfg.write();
-            g.settings.prev_input_id = None;
-            let _ = g.save();
+            // 没有还原目标、却还卡在虚拟声卡上 = 上次切回丢了记录留下的烂摊子。
+            // 开机时绝不该停在静音的 FireVibe Mic 上，退回一个真麦克风。
+            ensure_off_loopback(&want);
         });
     }
 
@@ -2249,6 +2253,28 @@ fn gate_dictation(
 /// 实测切换本身 3~13ms，所以按下就切、松手切回是可行的。
 /// 切换必须在后台线程做 —— CoreAudio 调用会跑 run loop，
 /// 在 gpui 的 update 里同步调会炸（见 audio.rs 顶部注释）。
+/// 确保系统默认输入**没停在虚拟声卡上**。切回目标无效/丢失时（M4A Pro 这类
+/// USB/蓝牙麦在切回瞬间掉线、或 8 秒重连打断了切回），退到一个真麦克风，
+/// 而不是把默认永久卡在静音的 FireVibe Mic 上 —— 那会让会议软件用「系统默认
+/// 麦克风」时全程静音（用户「M4A Pro 总有问题」就是这么来的）。
+fn ensure_off_loopback(want: &str) {
+    let on_loop = crate::audio::default_input()
+        .map(|d| d.name.to_lowercase().contains(want))
+        .unwrap_or(false);
+    if !on_loop {
+        return;
+    }
+    // 找一个真输入设备：排除我们的虚拟声卡和其它常见虚拟设备
+    const VIRT: &[&str] = &["firevibe", "blackhole", "virtual", "soundflower", "loopback", "camo"];
+    if let Some(real) = crate::audio::input_devices().into_iter().find(|d| {
+        let n = d.name.to_lowercase();
+        !VIRT.iter().any(|v| n.contains(v))
+    }) {
+        let _ = crate::audio::set_default_input(real.id);
+        eprintln!("[voice] 默认输入卡在虚拟声卡，已退回真麦克风：{}", real.name);
+    }
+}
+
 fn gate_voice(
     cfg: &Arc<RwLock<Config>>,
     status: &Arc<Status>,
@@ -2314,6 +2340,9 @@ fn gate_voice(
                 g.settings.prev_input_id = None;
                 let _ = g.save();
             }
+            drop(g);
+            // 兜底：切回目标可能已失效/为 None，别把默认留在静音的虚拟声卡上
+            ensure_off_loopback(&want);
         }
     };
     // 开麦要同步等切换落地（第三方工具在抢设备）；关麦本来就要延迟 400ms，丢后台
