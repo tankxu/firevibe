@@ -920,6 +920,11 @@ impl FireVibe {
                         // 顺手刷新提示：写成功 hash 变了，「写入红外」该灭了。
                         self.refresh_ir_pending();
                         self.toast(s);
+                    } else if s.starts_with("HTTP") {
+                        // HTTP **动作**失败（比如按键配的请求超时）是动作结果，不是连接坏了。
+                        // 之前进了 err 常驻条、还套着「遥控器打不开」的标题 —— 张冠李戴。
+                        // 用 toast 一闪而过就行。
+                        self.toast(s);
                     } else if s.contains("失败") || s.contains("error") {
                         self.err = Some(s);
                     }
