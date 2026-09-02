@@ -26,6 +26,11 @@ struct Shared {
     gain: AtomicU32,
     level: AtomicU32,
     dropped: AtomicU64,
+    /// cpal 报了流错误（设备被拔/重配置）。置了就该重建。
+    dead: AtomicBool,
+    /// 输出回调累计消费的帧数。送流时它**不推进**=流停摆了（豆包收不到声，
+    /// 而我们 push_pcm 照样在填缓冲、电平照动）。UI 靠它判「该不该重建」。
+    out_frames: AtomicU64,
 }
 
 /// VoiceSink 是给 HID 读线程用的句柄；cpal 的 Stream 不是 Send，
@@ -152,6 +157,8 @@ impl VoiceSink {
             gain: AtomicU32::new(f32_to_bits(gain)),
             level: AtomicU32::new(0),
             dropped: AtomicU64::new(0),
+            dead: AtomicBool::new(false),
+            out_frames: AtomicU64::new(0),
         });
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -164,21 +171,28 @@ impl VoiceSink {
             std::thread::Builder::new()
                 .name("firevibe-audio".into())
                 .spawn(move || {
+                    let sh_err = sh.clone();
                     let build = || -> Result<cpal::Stream> {
                         let ch = out_ch as usize;
                         let s = dev.build_output_stream(
                             &cfg.config(),
                             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
                                 let mut ring = sh.ring.lock();
+                                let mut n = 0u64;
                                 for frame in out.chunks_mut(ch) {
                                     let v = ring.pop_front().unwrap_or(0.0);
                                     // 单声道复制到所有声道，不依赖驱动的声道映射
                                     for s in frame.iter_mut() {
                                         *s = v;
                                     }
+                                    n += 1;
                                 }
+                                sh.out_frames.fetch_add(n, Ordering::Relaxed);
                             },
-                            |e| eprintln!("音频流错误: {e}"),
+                            move |e| {
+                                eprintln!("音频流错误: {e}");
+                                sh_err.dead.store(true, Ordering::Relaxed);
+                            },
                             None,
                         )?;
                         s.play()?;
@@ -233,6 +247,14 @@ impl VoiceSink {
     }
     pub fn dropped(&self) -> u64 {
         self.sh.dropped.load(Ordering::Relaxed)
+    }
+    /// cpal 报过流错误吗（设备被拔/重配置）
+    pub fn dead(&self) -> bool {
+        self.sh.dead.load(Ordering::Relaxed)
+    }
+    /// 输出回调累计消费的帧数。送流时它不涨=流停摆了，该重建。
+    pub fn out_frames(&self) -> u64 {
+        self.sh.out_frames.load(Ordering::Relaxed)
     }
 
     /// 推一帧解码后的 16-bit 单声道 PCM（16 kHz）

@@ -149,6 +149,12 @@ pub struct FireVibe {
     /// 语音链路是否已就绪 / 正在建
     voice_ready: bool,
     voice_rx: Option<Receiver<Result<(), String>>>,
+    /// 输出流健康监测：上次看到的 out_frames + 那一刻。送流时 out_frames 停着不动
+    /// 超过阈值 = 流停摆（豆包收不到而我们电平还在动），触发重建。
+    out_frames_last: u64,
+    out_frames_at: Instant,
+    /// 上次因流不健康自动重建的时刻，加冷却防抖动
+    voice_rebuild_at: Instant,
     /// 系统默认输入设备 + 可选列表（后台线程刷新，CoreAudio 会跑 run loop）
     pub audio_cur: Option<InputDevice>,
     pub audio_list: Vec<InputDevice>,
@@ -407,6 +413,9 @@ impl FireVibe {
             pressed: HashSet::new(),
             soft: None,
             voice_ready: false,
+            out_frames_last: 0,
+            out_frames_at: Instant::now(),
+            voice_rebuild_at: Instant::now() - Duration::from_secs(10),
             voice_rx: None,
             audio_cur: None,
             audio_list: Vec::new(),
@@ -726,6 +735,36 @@ impl FireVibe {
                 if let Err(e) = self.rt.start_tap() {
                     let m = self.l().toast_block_failed(&e.to_string());
                     self.toast(m);
+                }
+            }
+        }
+        // 输出流健康监测：cpal 报错(dead) 或 送流时输出回调停摆 → 拆掉 sink 让下面重建。
+        // 症状:豆包电平死了、而我们的电平还在动(push_pcm 照填缓冲、没人往声卡吐)。
+        if self.voice_rx.is_none() {
+            if let Some(sink) = self.rt.voice_sink() {
+                let of = sink.out_frames();
+                if of != self.out_frames_last {
+                    self.out_frames_last = of;
+                    self.out_frames_at = Instant::now();
+                }
+                let streaming = self.rt.status.mic_on.load(Ordering::Relaxed)
+                    || self.rt.dictating.lock().is_some();
+                // dead:立刻重建。停摆:送流中且输出帧数 800ms 没动才算(空闲时回调本就慢)。
+                let stalled = streaming && self.out_frames_at.elapsed() > Duration::from_millis(800);
+                if (sink.dead() || stalled)
+                    && self.voice_rebuild_at.elapsed() > Duration::from_secs(3)
+                {
+                    self.voice_rebuild_at = Instant::now();
+                    eprintln!(
+                        "[firevibe] 输出流{}—— 重建语音链路",
+                        if sink.dead() { "报错" } else { "停摆(豆包收不到而电平还在动)" }
+                    );
+                    self.rt.stop_voice();
+                    self.voice_ready = false;
+                    self.out_frames_last = 0;
+                    self.out_frames_at = Instant::now();
+                    // 逼 loopback 状态尽快重查,下面的重建分支就能进
+                    self.loopback_at = Instant::now() - Duration::from_secs(4);
                 }
             }
         }
