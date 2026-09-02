@@ -91,18 +91,17 @@ fn recent_series(st: &Stats) -> Vec<(String, u64)> {
         .collect()
 }
 
-/// 最近使用折线图：面积渐隐 + 折线 + 起止日期 + 峰值。
-fn usage_chart(days: &[(String, u64)], peak_label: &str) -> AnyElement {
+/// 最近使用折线图：面积渐隐 + 折线 + 数据点。峰值当 y 轴最大值标左上角，
+/// x 轴均匀铺几个日期（正常折线图画法）。
+fn usage_chart(days: &[(String, u64)]) -> AnyElement {
     let peak = days.iter().map(|(_, v)| *v).max().unwrap_or(1).max(1);
     let vals: Vec<f32> = days.iter().map(|(_, v)| *v as f32 / peak as f32).collect();
     let n = vals.len();
-    let first = days.first().map(|(d, _)| short_date(d)).unwrap_or_default();
-    let last = days.last().map(|(d, _)| short_date(d)).unwrap_or_default();
 
     // ⚠️ canvas 元素默认 0×0（remote.rs 那处只用 bounds.origin 按绝对坐标画，
     // 所以没暴露这点）。这里要用 bounds.size，必须给 canvas **显式撑满**，
     // 否则读到 0×0、所有点被压到顶部成一条平线。
-    let chart = div().h(px(96.)).w_full().child(
+    let plot = div().h(px(96.)).w_full().child(
         canvas(
             |_, _, _| (),
             move |bounds, _, window, _| {
@@ -160,15 +159,40 @@ fn usage_chart(days: &[(String, u64)], peak_label: &str) -> AnyElement {
         .size_full(),
     );
 
-    let axis = div()
+    // 图区：折线 + 左上角 y 轴峰值参考（0 在底、peak 在顶）
+    let chart = div()
+        .relative()
+        .child(plot)
+        .child(
+            div()
+                .absolute()
+                .top(px(-2.))
+                .left(px(0.))
+                .text_size(px(10.5))
+                .text_color(c(INK3))
+                .child(SharedString::from(peak.to_string())),
+        )
+        .child(
+            div()
+                .absolute()
+                .bottom(px(-2.))
+                .left(px(0.))
+                .text_size(px(10.5))
+                .text_color(c(INK3))
+                .child("0"),
+        );
+
+    // x 轴：均匀取 5 个日期，按位置铺开（justify_between：首左、尾右、中间散开）
+    let mut axis = div()
         .flex()
         .justify_between()
-        .mt(px(6.))
+        .mt(px(8.))
         .text_size(px(11.))
-        .text_color(c(INK3))
-        .child(SharedString::from(first))
-        .child(SharedString::from(format!("{peak_label} {peak}")))
-        .child(SharedString::from(last));
+        .text_color(c(INK3));
+    for k in 0..5 {
+        let i = (k * (n - 1) / 4).min(n - 1);
+        axis = axis.child(SharedString::from(short_date(&days[i].0)));
+    }
 
     group()
         .p(px(14.))
@@ -331,7 +355,7 @@ impl FireVibe {
             .child(section_lab(l.stats_overview()).mt(px(20.)).mb(px(8.)))
             .child(overview)
             .child(section_lab(l.stats_recent()).mt(px(22.)).mb(px(8.)))
-            .child(usage_chart(&recent_series(&st), l.stats_peak()))
+            .child(usage_chart(&recent_series(&st)))
             .child(section_lab(l.stats_by_key()).mt(px(22.)).mb(px(8.)))
             .child(group().p(px(16.)).child(slot_rows))
             .child(section_lab(l.stats_by_action()).mt(px(22.)).mb(px(8.)))
