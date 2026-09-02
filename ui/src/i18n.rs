@@ -287,6 +287,12 @@ impl L {
         t!(self.0, "按下说话键把系统默认输入切到虚拟声卡，说完切回原来的（实测 3~13ms）",
            "While the mic key is held, switch the system input to the virtual device, then switch back.")
     }
+    pub fn mic_gain(&self) -> &'static str { t!(self.0, "麦克风增益", "Mic gain") }
+    pub fn mic_gain_hint(&self) -> &'static str {
+        t!(self.0,
+           "放大遥控器麦克风音量 —— 遥控器麦偏小，调大让第三方语音输入工具识别更稳；太大响的时候会破音。",
+           "Amplify the remote's quiet mic so voice tools recognize you more reliably; too high clips on loud sounds.")
+    }
     pub fn show_hud(&self) -> &'static str { t!(self.0, "说话时显示电平条", "Show level bar while talking") }
     pub fn show_hud_hint(&self) -> &'static str {
         t!(self.0, "屏幕底部浮出一条电平，让你知道确实在收音",

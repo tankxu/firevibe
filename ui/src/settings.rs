@@ -20,6 +20,7 @@ impl FireVibe {
         let long_ms = cfg.settings.long_press_ms;
         let auto_in = cfg.settings.auto_switch_input;
         let hud = cfg.settings.show_level_hud;
+        let gain = cfg.voice.gain;
         let stt_locale = cfg.settings.stt_locale.clone();
         let stt_enter = cfg.settings.stt_auto_enter;
         drop(cfg);
@@ -134,6 +135,51 @@ impl FireVibe {
                                     cx.notify();
                                 },
                             ))),
+                    )
+                    .child(hline())
+                    // 麦克风增益（实时改运行中的 sink，不用重建）
+                    .child(
+                        group_row()
+                            .child(row_icon("mic"))
+                            .child(row_text(l.mic_gain(), Some(l.mic_gain_hint())))
+                            .child(
+                                stepper_wrap()
+                                    .child(stepper_btn("gain-dec", "−").on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            let nv = {
+                                                let mut g = this.rt.cfg.write();
+                                                g.voice.gain = (g.voice.gain - 0.5).max(1.0);
+                                                g.voice.gain
+                                            };
+                                            if let Some(s) = this.rt.voice_sink() {
+                                                s.set_gain(nv);
+                                            }
+                                            this.save();
+                                            cx.notify();
+                                        },
+                                    )))
+                                    .child(
+                                        div()
+                                            .min_w(px(38.))
+                                            .text_center()
+                                            .text_size(px(12.5))
+                                            .child(SharedString::from(format!("{gain:.1}×"))),
+                                    )
+                                    .child(stepper_btn("gain-inc", "+").on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            let nv = {
+                                                let mut g = this.rt.cfg.write();
+                                                g.voice.gain = (g.voice.gain + 0.5).min(5.0);
+                                                g.voice.gain
+                                            };
+                                            if let Some(s) = this.rt.voice_sink() {
+                                                s.set_gain(nv);
+                                            }
+                                            this.save();
+                                            cx.notify();
+                                        },
+                                    ))),
+                            ),
                     )
                     .child(hline())
                     // 长按阈值
