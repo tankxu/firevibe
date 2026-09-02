@@ -145,8 +145,8 @@ impl L {
     /// 系统输入停在虚拟声卡上、但我们并没有在送流 —— 此时所有应用都收不到声音
     pub fn input_stuck(&self) -> &'static str {
         t!(self.0,
-           "其它应用收不到声音 · 点这里换回麦克风",
-           "Other apps hear silence \u{2014} click to switch back")
+           "正被当作系统麦克风 · 点这里换回真麦克风",
+           "Set as the system mic \u{00b7} click to switch back")
     }
     pub fn repo(&self) -> &'static str { t!(self.0, "源码与文档", "Source & docs") }
     pub fn repo_sub(&self) -> &'static str {

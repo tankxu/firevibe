@@ -1322,7 +1322,9 @@ impl FireVibe {
         // 所以只把话说清楚，切不切让用户点。
         let streaming = self.rt.status.mic_on.load(Ordering::Relaxed)
             || self.rt.dictating.lock().is_some();
-        let stuck = on_loopback && !streaming;
+        // FIREVIBE_FORCE_STUCK=1：强制显示「卡在虚拟声卡」态，用来自检这条提示的样子
+        let stuck = (on_loopback && !streaming)
+            || std::env::var_os("FIREVIBE_FORCE_STUCK").is_some();
 
         let head = div()
             .id("input-switch")
@@ -1334,9 +1336,10 @@ impl FireVibe {
             .px(px(12.))
             .py(px(9.))
             .border_1()
-            .bg(c(SURFACE))
+            // stuck 态调软：柔和琥珀边 + 极浅底，别用刺眼的橙。是提醒不是报错。
+            .bg(if stuck { c(WARN_BG) } else { c(SURFACE) })
             .border_color(if stuck {
-                c(WARN)
+                c(WARN_LINE)
             } else if on_loopback {
                 c(ACCENT)
             } else {
@@ -1344,7 +1347,15 @@ impl FireVibe {
             })
             .shadow(sh1())
             .cursor_pointer()
-            .hover(|s| s.border_color(if on_loopback { c(ACCENT) } else { c(LINE_STRONG) }))
+            .hover(|s| {
+                s.border_color(if stuck {
+                    c(WARN_LINE)
+                } else if on_loopback {
+                    c(ACCENT)
+                } else {
+                    c(LINE_STRONG)
+                })
+            })
             .on_click(cx.listener(|this, _, _, cx| {
                 if !this.just_dismissed() {
                     this.input_open = !this.input_open;
@@ -1353,7 +1364,14 @@ impl FireVibe {
             }))
             .child(
                 div()
-                    .text_color(if on_loopback { c(ACCENT) } else { c(INK2) })
+                    // stuck 时用中性灰，不用「正在听」的蓝，也不用刺眼橙
+                    .text_color(if stuck {
+                        c(INK3)
+                    } else if on_loopback {
+                        c(ACCENT)
+                    } else {
+                        c(INK2)
+                    })
                     .flex_none()
                     .child(icon("mic", 15.)),
             )
@@ -1370,13 +1388,13 @@ impl FireVibe {
                             .text_ellipsis()
                             .text_size(px(12.5))
                             .font_weight(w(580.))
-                            .text_color(if on_loopback { c(ACCENT_INK) } else { c(INK) })
+                            .text_color(if on_loopback && !stuck { c(ACCENT_INK) } else { c(INK) })
                             .child(SharedString::from(name)),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(if stuck { c(WARN) } else { c(INK3) })
+                            .text_color(c(INK3))
                             .child(SharedString::from(if stuck {
                                 l.input_stuck()
                             } else {
