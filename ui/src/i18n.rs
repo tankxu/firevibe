@@ -33,6 +33,8 @@ impl L {
     pub fn stats_since(&self) -> String { t!(self.0, "起始", "Since").into() }
     pub fn stats_by_key(&self) -> &'static str { t!(self.0, "按键排行", "BY KEY") }
     pub fn stats_by_action(&self) -> &'static str { t!(self.0, "动作类型", "BY ACTION") }
+    pub fn stats_recent(&self) -> &'static str { t!(self.0, "最近使用", "RECENT ACTIVITY") }
+    pub fn stats_peak(&self) -> &'static str { t!(self.0, "峰值", "peak") }
     pub fn stats_voice(&self) -> &'static str { t!(self.0, "语音", "VOICE") }
     pub fn stats_voice_count(&self) -> String { t!(self.0, "语音次数", "Voice uses").into() }
     pub fn stats_voice_dur(&self) -> String { t!(self.0, "累计时长", "Total time").into() }

@@ -6,7 +6,176 @@ use crate::widget::*;
 use crate::{FireVibe, Screen};
 use firevibe_core::config::Stats;
 use firevibe_core::layout::Slot;
-use gpui::{div, prelude::*, px, relative, AnyElement, Context, SharedString};
+use gpui::{
+    canvas, div, point, prelude::*, px, relative, AnyElement, Context, PathBuilder, SharedString,
+};
+
+/// 最近 N 天用来画折线图。`by_day` 只存有活动的日子，这里从最后一天往回补齐
+/// 连续 N 个自然日（没活动的天补 0），这样折线才反映真实的「用/没用」。
+const RECENT_DAYS: usize = 14;
+
+fn days_in_month(y: i32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+/// "YYYY-MM-DD" 的前一天。整数运算，不依赖 chrono，也不 spawn `date`。
+fn prev_day(s: &str) -> Option<String> {
+    let p: Vec<&str> = s.split('-').collect();
+    if p.len() != 3 {
+        return None;
+    }
+    let (mut y, mut m, mut d) = (
+        p[0].parse::<i32>().ok()?,
+        p[1].parse::<u32>().ok()?,
+        p[2].parse::<u32>().ok()?,
+    );
+    if d > 1 {
+        d -= 1;
+    } else {
+        if m > 1 {
+            m -= 1;
+        } else {
+            m = 12;
+            y -= 1;
+        }
+        d = days_in_month(y, m);
+    }
+    Some(format!("{y:04}-{m:02}-{d:02}"))
+}
+
+/// "YYYY-MM-DD" -> "M/D"，x 轴标签用
+fn short_date(s: &str) -> String {
+    let p: Vec<&str> = s.split('-').collect();
+    if p.len() == 3 {
+        let m = p[1].trim_start_matches('0');
+        let d = p[2].trim_start_matches('0');
+        format!("{m}/{d}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// 从 by_day 取最近 RECENT_DAYS 天（补 0），返回按时间正序的 (日期, 次数)。
+fn recent_series(st: &Stats) -> Vec<(String, u64)> {
+    let Some(last) = st.by_day.keys().last().cloned() else {
+        return Vec::new();
+    };
+    let mut days: Vec<String> = vec![last.clone()];
+    let mut cur = last;
+    for _ in 1..RECENT_DAYS {
+        match prev_day(&cur) {
+            Some(p) => {
+                days.push(p.clone());
+                cur = p;
+            }
+            None => break,
+        }
+    }
+    days.reverse();
+    days.into_iter()
+        .map(|d| {
+            let n = st.by_day.get(&d).copied().unwrap_or(0);
+            (d, n)
+        })
+        .collect()
+}
+
+/// 最近使用折线图：面积渐隐 + 折线 + 起止日期 + 峰值。
+fn usage_chart(days: &[(String, u64)], peak_label: &str) -> AnyElement {
+    let peak = days.iter().map(|(_, v)| *v).max().unwrap_or(1).max(1);
+    let vals: Vec<f32> = days.iter().map(|(_, v)| *v as f32 / peak as f32).collect();
+    let n = vals.len();
+    let first = days.first().map(|(d, _)| short_date(d)).unwrap_or_default();
+    let last = days.last().map(|(d, _)| short_date(d)).unwrap_or_default();
+
+    // ⚠️ canvas 元素默认 0×0（remote.rs 那处只用 bounds.origin 按绝对坐标画，
+    // 所以没暴露这点）。这里要用 bounds.size，必须给 canvas **显式撑满**，
+    // 否则读到 0×0、所有点被压到顶部成一条平线。
+    let chart = div().h(px(96.)).w_full().child(
+        canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                if n < 2 {
+                    return;
+                }
+                let o = bounds.origin;
+                let w = f32::from(bounds.size.width);
+                let h = f32::from(bounds.size.height);
+                let (padx, padtop, padbot) = (6.0f32, 10.0f32, 6.0f32);
+                let plot_w = (w - padx * 2.0).max(1.0);
+                let plot_h = (h - padtop - padbot).max(1.0);
+                let base_y = padtop + plot_h;
+                let xat = |i: usize| padx + plot_w * (i as f32 / (n - 1) as f32);
+                // 峰值不顶到最上沿，留一点头
+                let yat = |v: f32| padtop + plot_h * (1.0 - v * 0.92);
+                let pt = |x: f32, y: f32| point(o.x + px(x), o.y + px(y));
+
+                // 面积（accent 半透明，往下渐隐靠 alpha 两段实现不了，就用一层浅填充）
+                let mut area = PathBuilder::fill();
+                area.move_to(pt(xat(0), base_y));
+                for i in 0..n {
+                    area.line_to(pt(xat(i), yat(vals[i])));
+                }
+                area.line_to(pt(xat(n - 1), base_y));
+                area.close();
+                if let Ok(p) = area.build() {
+                    window.paint_path(p, hsla_of(ACCENT, 0.13));
+                }
+                // 折线
+                let mut line = PathBuilder::stroke(px(2.0));
+                line.move_to(pt(xat(0), yat(vals[0])));
+                for i in 1..n {
+                    line.line_to(pt(xat(i), yat(vals[i])));
+                }
+                if let Ok(p) = line.build() {
+                    window.paint_path(p, hsla_of(ACCENT, 1.0));
+                }
+                // 数据点：小方点（gpui 画圆麻烦，2.6px 圆角方点在这尺寸看着就是圆点）
+                for i in 0..n {
+                    let (cx, cy) = (xat(i), yat(vals[i]));
+                    let mut dot = PathBuilder::fill();
+                    let r = 2.2;
+                    dot.move_to(pt(cx - r, cy));
+                    dot.line_to(pt(cx, cy - r));
+                    dot.line_to(pt(cx + r, cy));
+                    dot.line_to(pt(cx, cy + r));
+                    dot.close();
+                    if let Ok(p) = dot.build() {
+                        window.paint_path(p, hsla_of(ACCENT, 1.0));
+                    }
+                }
+            },
+        )
+        .size_full(),
+    );
+
+    let axis = div()
+        .flex()
+        .justify_between()
+        .mt(px(6.))
+        .text_size(px(11.))
+        .text_color(c(INK3))
+        .child(SharedString::from(first))
+        .child(SharedString::from(format!("{peak_label} {peak}")))
+        .child(SharedString::from(last));
+
+    group()
+        .p(px(14.))
+        .child(chart)
+        .child(axis)
+        .into_any_element()
+}
 
 /// slot id -> 界面显示名（用当前语言）
 fn slot_name(l: &crate::i18n::L, id: &str) -> String {
@@ -161,6 +330,8 @@ impl FireVibe {
             .child(header)
             .child(section_lab(l.stats_overview()).mt(px(20.)).mb(px(8.)))
             .child(overview)
+            .child(section_lab(l.stats_recent()).mt(px(22.)).mb(px(8.)))
+            .child(usage_chart(&recent_series(&st), l.stats_peak()))
             .child(section_lab(l.stats_by_key()).mt(px(22.)).mb(px(8.)))
             .child(group().p(px(16.)).child(slot_rows))
             .child(section_lab(l.stats_by_action()).mt(px(22.)).mb(px(8.)))
