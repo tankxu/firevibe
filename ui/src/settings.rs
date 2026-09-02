@@ -736,17 +736,14 @@ impl FireVibe {
         let mut row = group_row()
             .when(has, |d| d.bg(c(ALT_ROW)))
             .child(
+                // app 图标本尊（彩色 PNG，svg() 是单色掩码渲染不了颜色，用 img）
                 div()
                     .size(px(38.))
                     .flex_none()
                     .rounded(px(10.))
-                    .bg(grad(160., BADGE_MIC.0, BADGE_MIC.1))
-                    .text_color(c(SURFACE))
+                    .overflow_hidden()
                     .shadow(sh1())
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(icon("mic", 18.)),
+                    .child(gpui::img("icons/appicon.png").size(px(38.))),
             )
             .child(
                 div()
