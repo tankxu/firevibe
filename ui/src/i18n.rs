@@ -287,6 +287,15 @@ impl L {
         t!(self.0, "按下说话键把系统默认输入切到虚拟声卡，说完切回原来的（实测 3~13ms）",
            "While the mic key is held, switch the system input to the virtual device, then switch back.")
     }
+    pub fn mic_type(&self) -> &'static str { t!(self.0, "麦克风类型", "Mic type") }
+    pub fn mic_type_hint(&self) -> &'static str {
+        t!(self.0,
+           "原厂遥控器是「热麦克风」(发命令就一直出流)，仿品多是「按住说话」(松键立停)。自动检测偶尔会判错——判错会导致麦克风关不干净、电平赖着不走，这时手动指定。",
+           "The original remote is a hot mic (streams once told to); clones are usually push-to-talk (stops on release). Auto-detect sometimes gets it wrong (mic won't turn off, level stays on) — set it manually then.")
+    }
+    pub fn mic_auto(&self) -> &'static str { t!(self.0, "自动", "Auto") }
+    pub fn mic_hot(&self) -> &'static str { t!(self.0, "热麦克风", "Hot mic") }
+    pub fn mic_ptt(&self) -> &'static str { t!(self.0, "按住说话", "Push-to-talk") }
     pub fn mic_gain(&self) -> &'static str { t!(self.0, "麦克风增益", "Mic gain") }
     pub fn mic_gain_hint(&self) -> &'static str {
         t!(self.0,

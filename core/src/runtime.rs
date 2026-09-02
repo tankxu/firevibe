@@ -934,13 +934,6 @@ impl Runtime {
                     .map(Duration::from_secs);
                 let mut last_alive = Instant::now();
 
-                // 隐式按住会话（见 implied_session）：Some = 会话进行中，
-                // 时间戳 = 最后一帧音频 + 400ms，到点视为实体键已松开。
-                let mut implied: Option<(crate::config::Action, Instant)> = None;
-                // 连按下报文带音频一起到的场景里，别抢在按下报文前面开会话：
-                // 攒满 3 帧（约 60ms）还没见到按下才算数
-                let mut implied_warmup: u8 = 0;
-
                 let mut mic_was = false;
                 let mut last_ka = Instant::now();
                 let mut idle_frames = status.audio_frames.load(Ordering::Relaxed);
@@ -982,16 +975,6 @@ impl Runtime {
                         // 通知 UI：连上那一刻模型还是 Unknown，
                         // 顶栏「写入红外」的判断这时才有效（UI 收到后会刷新提示）
                         let _ = tx.send(Event::MicModelProbed);
-                    }
-                    // 隐式按住会话收针：音频停了 400ms = 实体麦克风键已松开
-                    // （PTT 遥控器松键即停流，这个判据很硬）
-                    if implied.as_ref().is_some_and(|(_, t)| Instant::now() >= *t) {
-                        let (a, _) = implied.take().unwrap();
-                        implied_warmup = 0;
-                        let r = implied_session(
-                            &cfg, &status, &inj, &dictating, &tx, &voice, &prev_input, &a, false,
-                        );
-                        eprintln!("[firevibe] 音频停了 —— 隐式按住会话结束（{r}）");
                     }
                     // 外面递进来的 OUTPUT 报文（--probe-all 的三轮对照用来试开麦）
                     {
@@ -1153,8 +1136,7 @@ impl Runtime {
                     if reports.is_empty() {
                         continue;
                     }
-                    // 键报文排在音频前面处理：同一批里按下和首帧音频一起到时，
-                    // 先看到按下，就不会误开隐式会话
+                    // 键报文排在音频前面处理：同一批里按下和首帧音频一起到时先处理按键
                     reports.sort_by_key(|(rid, _)| u8::from(*rid == RID_AUDIO));
                     for (rid, payload) in reports {
                     let payload = &payload[..];
@@ -1175,52 +1157,6 @@ impl Runtime {
                         }
                         RID_AUDIO => {
                             status.audio_frames.fetch_add(1, Ordering::Relaxed);
-                            // 隐式按住会话（见 implied_session 的注释）
-                            if let Some((_, t)) = implied.as_mut() {
-                                *t = Instant::now() + Duration::from_millis(400);
-                            } else if cfg.read().settings.mic_model.is_ptt()
-                                && !learn.load(Ordering::Relaxed)
-                            {
-                                let mic_seen = cfg
-                                    .read()
-                                    .slot_key(crate::layout::Slot::Mic)
-                                    .map(|k| active.contains(&k) || held.contains_key(&k))
-                                    .unwrap_or(false);
-                                let busy = voice.lock().as_ref().map(|s| s.passing()).unwrap_or(false)
-                                    || dictating.lock().is_some()
-                                    || recording.lock().is_some();
-                                if mic_seen || busy {
-                                    implied_warmup = 0;
-                                } else {
-                                    implied_warmup = implied_warmup.saturating_add(1);
-                                    if implied_warmup >= 3 {
-                                        let act = cfg
-                                            .read()
-                                            .profile()
-                                            .action(crate::layout::Slot::Mic, true)
-                                            .filter(|a| match a.kind {
-                                                ActionType::VoicePtt => true,
-                                                ActionType::VoiceHotkey
-                                                | ActionType::VoiceDictate => a.arg == "hold",
-                                                _ => false,
-                                            });
-                                        if let Some(a) = act {
-                                            let r = implied_session(
-                                                &cfg, &status, &inj, &dictating, &tx, &voice,
-                                                &prev_input, &a, true,
-                                            );
-                                            eprintln!(
-                                                "[firevibe] 音频先到、没看到按下 —— 隐式开启按住会话（{r}）"
-                                            );
-                                            implied = Some((
-                                                a,
-                                                Instant::now() + Duration::from_millis(400),
-                                            ));
-                                        }
-                                        implied_warmup = 0;
-                                    }
-                                }
-                            }
                             let sink = voice.lock().clone();
                             let passing = sink.as_ref().map(|s| s.passing()).unwrap_or(false);
                             // 听写不经过虚拟声卡，passing 是假的 ——
@@ -1815,66 +1751,6 @@ impl Runtime {
     }
 }
 
-/// 隐式按住会话：遥控器休眠后第一下就是按住说话时，「按下」事件发生在
-/// 我们打开设备之前，永远看不到 —— 但这台 PTT 遥控器**只有实体麦克风键
-/// 按住时才吐音频**，所以「音频来了而我们没见过按下」= 用户此刻正按着。
-/// 用这个事实替他把会话开起来，第一下按住就能直接说话，不用再按第二下。
-///
-/// 不走 dispatch：它的 via_hw 分支假设「硬件按下事件已经进了系统」，而隐式
-/// 场景里那一下要么被 tap 吞了、要么以原始键码漏走了，第三方工具什么都没
-/// 收到，必须补合成按键（豆包实测认合成修饰键）。就算 hidremap 赢了竞速、
-/// 硬件事件也到了，重复一份合成 down/up 对修饰键无害。
-fn implied_session(
-    cfg: &Arc<RwLock<Config>>,
-    status: &Arc<Status>,
-    inj: &Arc<dyn Injector>,
-    dictating: &Arc<Mutex<Option<crate::stt::Recorder>>>,
-    tx: &Sender<Event>,
-    voice: &Arc<Mutex<Option<Arc<VoiceSink>>>>,
-    prev: &Arc<Mutex<Option<u32>>>,
-    act: &Action,
-    down: bool,
-) -> String {
-    match act.kind {
-        ActionType::VoicePtt => {
-            let Some(sink) = voice.lock().clone() else {
-                return "语音未启动".into();
-            };
-            gate_voice(cfg, status, &sink, prev, down, false);
-            if down { "开始送流".into() } else { "停止送流".into() }
-        }
-        ActionType::VoiceHotkey => {
-            if let Some(sink) = voice.lock().clone() {
-                gate_voice(cfg, status, &sink, prev, down, down);
-            }
-            // 走硬件层映射的键**绝不补合成**：全局映射常驻事件系统，唤醒的
-            // 那一下已经以硬件 rightoption 的身份进了系统（豆包这类只认硬件
-            // 来源的工具就靠它）。再合成一份不但没用（合成的它不认），
-            // 还会把它的热键状态机搞乱。这里只负责音频闸门。
-            let via_hw = act.mods.is_empty()
-                && crate::hidremap::usage_of(&act.key).is_some()
-                && cfg.read().mic_remap_key().as_deref() == Some(act.key.as_str());
-            if via_hw {
-                return if down {
-                    format!("第三方语音输入 · {}（硬件层）", act.key)
-                } else {
-                    "松开".into()
-                };
-            }
-            if down {
-                mark_hold(&act.key);
-                let _ = inj.key_down(&act.key, &act.mods);
-                format!("第三方语音输入 · {}（合成）", act.key)
-            } else {
-                hold_long_enough(&act.key);
-                let _ = inj.key_up(&act.key, &act.mods);
-                "松开".into()
-            }
-        }
-        ActionType::VoiceDictate => gate_dictation(cfg, status, inj, dictating, tx, down),
-        _ => String::new(),
-    }
-}
 
 fn dispatch(
     cfg: &Arc<RwLock<Config>>,

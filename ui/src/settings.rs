@@ -4,7 +4,7 @@ use crate::theme::*;
 use crate::widget::*;
 use crate::{FireVibe, Screen};
 use firevibe_core::{
-    config::{config_path, Config, Lang},
+    config::{config_path, Config, Lang, MicModel},
     update::{UpdateStatus, VERSION},
 };
 use gpui::{deferred, div, prelude::*, px, AnyElement, Context, SharedString};
@@ -21,6 +21,7 @@ impl FireVibe {
         let auto_in = cfg.settings.auto_switch_input;
         let hud = cfg.settings.show_level_hud;
         let gain = cfg.voice.gain;
+        let mic_model = cfg.settings.mic_model;
         let stt_locale = cfg.settings.stt_locale.clone();
         let stt_enter = cfg.settings.stt_auto_enter;
         drop(cfg);
@@ -135,6 +136,40 @@ impl FireVibe {
                                     cx.notify();
                                 },
                             ))),
+                    )
+                    .child(hline())
+                    // 麦克风类型（自动检测偶尔判错，可手动指定）
+                    .child(
+                        group_row()
+                            .child(row_icon("mic"))
+                            .child(row_text(l.mic_type(), Some(l.mic_type_hint())))
+                            .child(
+                                seg_wrap()
+                                    .child(
+                                        seg_item("mm-auto", l.mic_auto(), mic_model == MicModel::Unknown)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.rt.cfg.write().settings.mic_model = MicModel::Unknown;
+                                                this.save();
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        seg_item("mm-hot", l.mic_hot(), mic_model == MicModel::Hot)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.rt.cfg.write().settings.mic_model = MicModel::Hot;
+                                                this.save();
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        seg_item("mm-ptt", l.mic_ptt(), mic_model == MicModel::Ptt)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.rt.cfg.write().settings.mic_model = MicModel::Ptt;
+                                                this.save();
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
                     )
                     .child(hline())
                     // 麦克风增益（实时改运行中的 sink，不用重建）
