@@ -125,6 +125,22 @@ impl VoiceSink {
             .ok_or_else(|| anyhow!("找不到名字以 {device_prefix:?} 开头的输出设备"))?;
 
         let name = dev.name().unwrap_or_else(|_| "?".into());
+        // ⚠️ **先把这块虚拟声卡的标称采样率设成 16kHz**（= OPUS_RATE），再打开流。
+        // 声卡默认 48kHz，而遥控器音频是 16kHz。如果只把「我们的输出流」开成 16kHz、
+        // 声卡还留在 48kHz，那是「16k 流架在 48k 设备上」的错配 —— CoreAudio 在设备
+        // 重配置时（豆包开/停录音、别的 app 碰一下）容易把这条流直接掐掉，表现成
+        // 「豆包电平死了、我们电平还在动」。把声卡本身也设成 16kHz，声卡 / 我们的流 /
+        // 豆包读取三头对齐，流才稳、延迟才低、也不丢帧。
+        if crate::audio::device_sample_rate(device_prefix) != Some(OPUS_RATE as f64) {
+            match crate::audio::set_device_sample_rate(device_prefix, OPUS_RATE as f64) {
+                Ok(()) => {
+                    // 设完等一下让它真的切过去（CoreAudio 设属性是异步的）
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                    eprintln!("[voice] 已把 {device_prefix} 声卡设为 {OPUS_RATE} Hz");
+                }
+                Err(e) => eprintln!("[voice] 设声卡采样率失败（退回默认档）：{e}"),
+            }
+        }
         let def = dev.default_output_config().context("取默认输出配置失败")?;
         // ⚠️ **优先把输出流开成 16 kHz**（= OPUS_RATE，遥控器音频的原始采样率）。
         // 为什么：豆包这类语音工具按 16 kHz 读这块虚拟声卡，会把整条链路的消费节奏

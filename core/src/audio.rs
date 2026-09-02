@@ -26,6 +26,7 @@ mod imp {
     const DEFAULT_INPUT: u32 = fourcc(b"dIn ");
     const NAME: u32 = fourcc(b"lnam");
     const STREAMS: u32 = fourcc(b"stm#");
+    const NOMINAL_SR: u32 = fourcc(b"nsrt"); // kAudioDevicePropertyNominalSampleRate
     const SCOPE_GLOBAL: u32 = fourcc(b"glob");
     const SCOPE_INPUT: u32 = fourcc(b"inpt");
 
@@ -177,6 +178,75 @@ mod imp {
             Err(anyhow!("设置默认输入设备失败，CoreAudio 返回 {ok}"))
         }
     }
+
+    /// 枚举所有音频设备 id
+    fn all_devices() -> Vec<u32> {
+        let addr = Addr::new(DEVICES, SCOPE_GLOBAL);
+        let mut size = 0u32;
+        if unsafe { AudioObjectGetPropertyDataSize(SYSTEM_OBJECT, &addr, 0, null(), &mut size) }
+            != 0
+        {
+            return Vec::new();
+        }
+        let n = size as usize / std::mem::size_of::<u32>();
+        let mut ids = vec![0u32; n];
+        if unsafe {
+            AudioObjectGetPropertyData(
+                SYSTEM_OBJECT,
+                &addr,
+                0,
+                null(),
+                &mut size,
+                ids.as_mut_ptr() as *mut c_void,
+            )
+        } != 0
+        {
+            return Vec::new();
+        }
+        ids
+    }
+
+    /// 读一个设备当前的标称采样率
+    pub fn device_sample_rate(name_prefix: &str) -> Option<f64> {
+        let want = name_prefix.to_lowercase();
+        let id = all_devices()
+            .into_iter()
+            .find(|&id| device_name(id).map(|n| n.to_lowercase().starts_with(&want)) == Some(true))?;
+        let addr = Addr::new(NOMINAL_SR, SCOPE_GLOBAL);
+        let mut sr = 0f64;
+        let mut size = std::mem::size_of::<f64>() as u32;
+        let ok = unsafe {
+            AudioObjectGetPropertyData(id, &addr, 0, null(), &mut size, &mut sr as *mut _ as *mut c_void)
+        };
+        (ok == 0 && sr > 0.0).then_some(sr)
+    }
+
+    /// 把某块声卡的**标称采样率**设成 `rate`。
+    /// 我们的虚拟声卡默认 48kHz，而遥控器音频是 16kHz；把声卡也设成 16kHz，
+    /// 三头（声卡 / 我们的输出流 / 豆包读取）就都对齐，流才稳、延迟才低。
+    pub fn set_device_sample_rate(name_prefix: &str, rate: f64) -> Result<()> {
+        let want = name_prefix.to_lowercase();
+        let id = all_devices()
+            .into_iter()
+            .find(|&id| device_name(id).map(|n| n.to_lowercase().starts_with(&want)) == Some(true))
+            .ok_or_else(|| anyhow!("找不到设备 {name_prefix:?}"))?;
+        let addr = Addr::new(NOMINAL_SR, SCOPE_GLOBAL);
+        let ok = unsafe {
+            AudioObjectSetPropertyData(
+                id,
+                &addr,
+                0,
+                null(),
+                std::mem::size_of::<f64>() as u32,
+                &rate as *const _ as *const c_void,
+            )
+        };
+        if ok == 0 {
+            Ok(())
+        } else {
+            Err(anyhow!("设置采样率失败，CoreAudio 返回 {ok}"))
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -197,9 +267,18 @@ mod imp {
     pub fn set_default_input(_id: u32) -> Result<()> {
         Err(anyhow!("这个平台还没做输入设备切换"))
     }
+    pub fn device_sample_rate(_name_prefix: &str) -> Option<f64> {
+        None
+    }
+    pub fn set_device_sample_rate(_name_prefix: &str, _rate: f64) -> Result<()> {
+        Err(anyhow!("这个平台还没做采样率设置"))
+    }
 }
 
-pub use imp::{default_input, input_devices, set_default_input, InputDevice};
+pub use imp::{
+    default_input, device_sample_rate, input_devices, set_default_input, set_device_sample_rate,
+    InputDevice,
+};
 
 /// 切默认输入并**等到真的生效**。
 ///
