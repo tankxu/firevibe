@@ -2,6 +2,7 @@ pub mod audio;
 pub mod audiodriver;
 pub mod autostart;
 pub mod battery;
+pub mod btlink;
 pub mod config;
 pub mod device;
 pub mod file_dialog;

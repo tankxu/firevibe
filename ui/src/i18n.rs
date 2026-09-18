@@ -23,6 +23,7 @@ impl L {
     // 菜单栏（tray）
     pub fn tray_show(&self) -> &'static str { t!(self.0, "显示窗口", "Show Window") }
     pub fn tray_quit(&self) -> &'static str { t!(self.0, "退出", "Quit") }
+    pub fn tray_profiles(&self) -> &'static str { t!(self.0, "切换方案", "Switch Profile") }
     // 使用统计
     pub fn stats_title(&self) -> &'static str { t!(self.0, "使用统计", "Usage") }
     pub fn stats_empty(&self) -> &'static str { t!(self.0, "还没有使用记录 —— 按几下遥控器就有了", "No usage yet — press a few keys to get started") }
@@ -111,6 +112,11 @@ impl L {
         t!(self.0, format!("屏蔽系统默认行为失败: {e}"), format!("Couldn't block the system default action: {e}"))
     }
     pub fn toast_voice_start_failed(&self, e: &str) -> String { t!(self.0, format!("语音链路启动失败: {e}"), format!("Voice pipeline failed to start: {e}")) }
+    pub fn toast_profile_switched(&self, name: &str) -> String { t!(self.0, format!("已切换到方案「{name}」"), format!("Switched to profile “{name}”")) }
+    // 切换方案动作（编辑器）
+    pub fn switch_profile_target(&self) -> &'static str { t!(self.0, "切换到", "Switch to") }
+    pub fn switch_profile_next(&self) -> &'static str { t!(self.0, "下一个方案", "Next profile") }
+    pub fn switch_profile_prev(&self) -> &'static str { t!(self.0, "上一个方案", "Previous profile") }
     // 更新状态里的版本行
     pub fn update_available_ver(&self, cur: &str, new: &str) -> String { t!(self.0, format!("{cur} → {new} 可更新"), format!("{cur} → {new} available")) }
 
@@ -271,6 +277,21 @@ impl L {
     pub fn long_ms_hint(&self) -> &'static str {
         t!(self.0, "按住超过这个时间算长按", "Held longer than this counts as a hold")
     }
+    pub fn idle_sleep(&self) -> &'static str { t!(self.0, "闲置后让遥控器休眠", "Sleep when idle") }
+    pub fn idle_sleep_hint(&self) -> &'static str {
+        t!(
+            self.0,
+            "窗口收起后这么久没按键，就断开蓝牙链路让遥控器真正休眠、不再耗电。按任意键唤醒 —— 唤醒的那一下只叫醒它，不触发动作",
+            "After this long with no button press (window tucked away), drop the Bluetooth link so the remote really sleeps instead of draining. Any key wakes it — that press only wakes it, it triggers nothing"
+        )
+    }
+    pub fn idle_sleep_off(&self) -> &'static str { t!(self.0, "不休眠", "Never") }
+    /// PTT（按住说话）那派遥控器自己会断链省电，这项对它不起作用
+    pub fn idle_sleep_ptt(&self) -> &'static str {
+        t!(self.0, "你这支遥控器会自己休眠，不用设这项",
+           "Your remote sleeps on its own — this setting doesn't apply")
+    }
+    pub fn minutes_unit(&self) -> &'static str { t!(self.0, "分钟", "min") }
     pub fn check_update(&self) -> &'static str { t!(self.0, "检查更新", "Check for updates") }
     pub fn do_update(&self) -> &'static str { t!(self.0, "更新", "Update") }
     pub fn up_to_date(&self) -> &'static str { t!(self.0, "已是最新", "Up to date") }
@@ -342,10 +363,10 @@ impl L {
         t!(self.0, "系统设置 › 蓝牙 里把遥控器和 Mac 配上（长按遥控器 home 键进配对）。",
            "Pair the remote in System Settings › Bluetooth (hold the remote's home key to enter pairing).")
     }
-    pub fn onb_im(&self) -> &'static str { t!(self.0, "开启「输入监控」权限", "Enable Input Monitoring") }
+    pub fn onb_im(&self) -> &'static str { t!(self.0, "开启「辅助功能」权限", "Enable Accessibility") }
     pub fn onb_im_desc(&self) -> &'static str {
-        t!(self.0, "系统设置 › 隐私与安全性 › 输入监控 → 勾上 FireVibe。读按键和麦克风都要它。",
-           "System Settings › Privacy & Security › Input Monitoring → enable FireVibe. Needed for both keys and mic.")
+        t!(self.0, "系统设置 › 隐私与安全性 › 辅助功能 → 勾上 FireVibe。读遥控器按键、帮你按快捷键都要它。",
+           "System Settings › Privacy & Security › Accessibility → enable FireVibe. Needed to read the remote and to press keys for you.")
     }
     pub fn onb_card(&self) -> &'static str { t!(self.0, "安装虚拟声卡「FireVibe Mic」", "Install the \"FireVibe Mic\" virtual device") }
     pub fn onb_card_desc(&self) -> &'static str {
@@ -408,8 +429,8 @@ impl L {
     pub fn toast_card_not_ready(&self) -> &'static str { t!(self.0, "虚拟声卡还没就绪", "Virtual device isn't ready yet") }
     pub fn toast_link_not_ready(&self) -> &'static str { t!(self.0, "语音链路还没建起来，稍等一下", "Voice link isn't ready yet, hold on") }
 
-    // 错误条（HID / 输入监控）
-    pub fn hid_no_perm(&self) -> &'static str { t!(self.0, "遥控器打不开：缺「输入监控」权限", "Can't open the remote: missing Input Monitoring") }
+    // 错误条（HID / 权限）
+    pub fn hid_no_perm(&self) -> &'static str { t!(self.0, "遥控器打不开：缺「辅助功能」权限", "Can't open the remote: missing Accessibility") }
     pub fn hid_not_connected(&self) -> &'static str { t!(self.0, "遥控器没连上", "Remote isn't connected") }
     pub fn hid_not_found_hint(&self) -> &'static str {
         t!(self.0,
@@ -520,8 +541,8 @@ impl L {
     pub fn hid_open_failed(&self) -> &'static str { t!(self.0, "遥控器打不开", "Can't open the remote") }
     pub fn hid_perm_hint(&self) -> &'static str {
         t!(self.0,
-           "到 系统设置 › 隐私与安全性 › 输入监控 勾上本应用，然后完全退出重开；已经勾着还报这个，就点「重置授权」再勾一次",
-           "In System Settings › Privacy & Security › Input Monitoring, enable this app, then fully quit and reopen. If it's already on and you still see this, hit Reset access and enable it again.")
+           "到 系统设置 › 隐私与安全性 › 辅助功能 勾上本应用，然后完全退出重开。（「输入监控」不用单独开，辅助功能已经覆盖它。）已经勾着还报这个，就点「重置授权」再勾一次",
+           "In System Settings › Privacy & Security › Accessibility, enable this app, then fully quit and reopen. (Input Monitoring doesn't need a separate entry — Accessibility covers it.) If it's already on and you still see this, hit Reset access and enable it again.")
     }
     pub fn retry(&self) -> &'static str { t!(self.0, "重试", "Retry") }
     pub fn open_settings(&self) -> &'static str { t!(self.0, "打开设置", "Open Settings") }

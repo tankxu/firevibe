@@ -9,6 +9,20 @@ use crate::layout::{default_slots, Slot, SlotBinding};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// 「方案切换代数」——每次切方案就 +1。切换可能发生在**三个线程**：HID 读线程
+/// （按键触发）、主线程（tray 菜单）、UI（界面点击）。谁切了就 `bump`，
+/// UI 的 pump 每帧比对这个数，变了就刷新 tray 标签/菜单 + 重下硬件层映射 + 重绘。
+/// 用一个全局代数比拉事件通道简单，三个源头都能无脑 +1。
+static PROFILE_GEN: AtomicU64 = AtomicU64::new(0);
+
+pub fn bump_profile_gen() {
+    PROFILE_GEN.fetch_add(1, Ordering::Relaxed);
+}
+pub fn profile_gen() -> u64 {
+    PROFILE_GEN.load(Ordering::Relaxed)
+}
 
 // ---------------- 遥控器开麦模型 ----------------
 
@@ -71,9 +85,12 @@ pub enum ActionType {
     /// 让遥控器打一发红外。`arg` 存红外码 JSON（见 `crate::ir::IrCode`）。
     /// 走 BLE GATT 的 KeyMap 服务，不是 HID —— 遥控器自带发射管，我们只是告诉它发什么。
     IrBlast,
+    /// 切换方案（像自制键盘按键切 layer）。`arg`：空 / `"next"` = 循环到下一个；
+    /// 否则是目标方案名（按名字找，找不到就不动）。
+    SwitchProfile,
 }
 impl ActionType {
-    pub const ALL: [ActionType; 13] = [
+    pub const ALL: [ActionType; 14] = [
         ActionType::None,
         ActionType::Key,
         ActionType::Text,
@@ -87,6 +104,7 @@ impl ActionType {
         ActionType::VoiceDictate,
         ActionType::Record,
         ActionType::IrBlast,
+        ActionType::SwitchProfile,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -103,6 +121,7 @@ impl ActionType {
             ActionType::VoiceDictate => "语音转文字",
             ActionType::Record => "录音",
             ActionType::IrBlast => "红外遥控",
+            ActionType::SwitchProfile => "切换方案",
         }
     }
     pub fn hint(self) -> &'static str {
@@ -121,6 +140,7 @@ ActionType::Record => "按住录音、松手保存到「下载」。录的是遥
 ActionType::IrBlast => "按下时让遥控器打一发红外 —— 它自带发射管。红外码粘在下面",
 ActionType::VoiceHotkey => {"发一个快捷键去唤起第三方语音输入工具，由它识别并把文字打进当前焦点。短按 = 敲一下，长按 = 按住不放"
 }
+ActionType::SwitchProfile => "按下切换到另一套按键方案（像自制键盘切 layer）。可选「下一个 / 上一个」循环，或指定某套方案。配了它，菜单栏图标右侧会显示当前方案名。",
 }
     }
     /// 这个动作需要一个文本参数吗（UI 用来决定是否显示输入框）
@@ -252,6 +272,13 @@ impl Action {
                     "敲一下"
                 };
                 format!("第三方语音输入 · {k}（{mode}）")
+            }
+            ActionType::SwitchProfile => {
+                if self.arg.is_empty() || self.arg == "next" {
+                    "切换方案 · 下一个".into()
+                } else {
+                    format!("切换到方案 · {}", self.arg)
+                }
             }
         }
     }
@@ -541,6 +568,19 @@ pub struct Settings {
     /// ⚠️ 更重要的是**它为空时绝不自动写**。用户没配过红外就去写一张空表，
     /// 等于把电视「设备控制」烧进去的音量/静音红外平白抹掉 —— 装个 app
     /// 把人家遥控器搞残，没有比这更糟的。清空只在用户自己删掉动作时发生。
+
+
+    /// 闲置多少分钟后主动断开遥控器的 BLE 链路、让它真睡。0 = 不断（一直连着）。
+    ///
+    /// 为什么需要：遥控器**睡着 ≠ 断开** —— 链路只要还挂着，它作为从设备就得按
+    /// connection interval 持续应答，而它要的打盹许可被 bluetoothd 拒（latency 49 > 30），
+    /// 这才是待机掉电的来源。断开之后它是真睡：实测一小时零广播、不被 macOS 拽回来，
+    /// 按一下键就醒。详见 `btlink.rs`。
+    ///
+    /// 代价：**唤醒它的那一下按键会丢**（那一下用来让它重新广播、让 macOS 重连）。
+    /// 所以默认给得宽松，真正在用的时候碰不到；放一晚上就能省下一整夜的待机电流。
+    #[serde(default = "default_idle_sleep_min")]
+    pub idle_sleep_min: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ir_table_hash: String,
 }
@@ -553,6 +593,9 @@ fn default_stt_locale() -> String {
 }
 fn default_long_ms() -> u64 {
     350
+}
+fn default_idle_sleep_min() -> u64 {
+    30
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -574,6 +617,7 @@ impl Default for Settings {
             device_vid: None,
             device_pid: None,
             mic_model: MicModel::Unknown,
+            idle_sleep_min: 30,
             ir_table_hash: String::new(),
         }
     }
@@ -876,6 +920,46 @@ impl Config {
     pub fn profile_mut(&mut self) -> &mut Profile {
         let i = self.active.min(self.profiles.len() - 1);
         &mut self.profiles[i]
+    }
+
+    /// 当前方案名
+    pub fn profile_name(&self) -> &str {
+        &self.profile().name
+    }
+
+    /// 所有方案名，按顺序
+    pub fn profile_names(&self) -> Vec<String> {
+        self.profiles.iter().map(|p| p.name.clone()).collect()
+    }
+
+    /// 有没有**任何一个方案**配了「切换方案」动作 —— 决定 tray 要不要显示方案名。
+    pub fn has_profile_switch(&self) -> bool {
+        self.profiles.iter().any(|p| {
+            p.actions.iter().any(|s| {
+                [&s.short, &s.long]
+                    .iter()
+                    .any(|a| a.kind == ActionType::SwitchProfile)
+            })
+        })
+    }
+
+    /// 切换到某个方案。`arg`：空/"next" = 循环下一个；"prev" = 循环上一个；
+    /// 否则按名字找。返回新的 active 下标（没变化返回 None）。
+    pub fn switch_profile(&mut self, arg: &str) -> Option<usize> {
+        if self.profiles.is_empty() {
+            return None;
+        }
+        let n = self.profiles.len();
+        let target = match arg {
+            "" | "next" => (self.active + 1) % n,
+            "prev" => (self.active + n - 1) % n,
+            name => self.profiles.iter().position(|p| p.name == name)?,
+        };
+        if target == self.active {
+            return None;
+        }
+        self.active = target;
+        Some(target)
     }
 
     pub fn add_profile(&mut self, name: impl Into<String>) {

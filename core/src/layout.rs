@@ -80,6 +80,12 @@ impl Slot {
         Slot::App4,
     ];
 
+    /// 物理布局序号（自上而下，= `ALL` 里的位置）。按键列表用它排序，
+    /// 让卡片永远按遥控器上的实体顺序显示，不受添加先后影响。
+    pub fn order(self) -> usize {
+        Self::ALL.iter().position(|s| *s == self).unwrap_or(usize::MAX)
+    }
+
     pub fn id(self) -> &'static str {
         match self {
             Slot::Power => "power",

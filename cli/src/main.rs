@@ -1081,7 +1081,7 @@ fn run_cli() -> anyhow::Result<()> {
         "--no-voice", "--descriptor", "--probe-all", "--probe-mic", "--keys", "--mic-off-test", "--mic-probe",
         "--adapt", "--map", "--sniff", "--tap", "--watch-mods", "--modcmp", "--mic", "--hold",
         "--run", "--type", "--inputs", "--set-input", "--config", "--battery", "--hid-list",
-        "--loopback-test", "--feed-tone", "--pin-input", "--all", "--collection-test", "--mic-listen", "--no-cmd", "--secs", "--mic-check", "--ir-blast",
+        "--loopback-test", "--feed-tone", "--pin-input", "--all", "--collection-test", "--mic-listen", "--no-cmd", "--secs", "--mic-check", "--ir-blast", "--linkcheck", "--disconnect",
     ];
     if let Some(bad) = args.iter().find(|a| {
         a.starts_with("--")
@@ -1127,7 +1127,10 @@ fn run_cli() -> anyhow::Result<()> {
              \x20 --probe-all        ★换遥控器就跑这个：一条命令走完全套，生成报告文件\n\
              \x20 --adapt            只做「选设备 + 逐键认键」（--probe-all 的子集）\n\
              \x20 --probe-mic        旧名，等同 --probe-all\n\
-             \x20 --hid-list         列出所有 HID 设备的 VID/PID\n\
+             \x20 --disconnect       断开遥控器的 BLE 链路让它真睡（省电；按任意键即醒）\n\
+\x20 --linkcheck        读某个 collection 30 秒，数报文（不走 Runtime，用来分清\n\
+\x20                    「app 的 bug」和「这台机器读不到 HID」）\n\
+\x20 --hid-list         列出所有 HID 设备的 VID/PID\n\
              \x20 --map              按键测绘：逐个记录每个物理键的真实 HID usage\n\
              \x20 --sniff            原始 report 嗅探：打印每一条报文（含 vendor 0xEF/0xF1）\n\
              \x20 --keys             按键边沿追踪：每个键的按下/松开带时间戳，诊断长按瞬断\n\
@@ -1365,6 +1368,106 @@ fn run_cli() -> anyhow::Result<()> {
     // 我们是按 VID/PID 打开设备的，标识不一样就完全看不到它。
     // 验证「电量能不能主动读」：0x03 是 1 字节 INPUT 报文（电池强度 0-100），
     // 设备想发才发，所以界面常常空着。HID 允许 GetReport(Input, id) 主动取。
+    // 「设备连着、却一个报文都收不到」时用它划定范围：**能不能从某个 collection
+    // 读到 input report**。
+    //
+    // 关键价值是它**不走 Runtime**（直接 hidapi open + read），所以能把
+    // 「app/Runtime 的 bug」和「这台机器根本读不到 HID」分开 —— `--sniff` 走的是
+    // Runtime 同一份代码，两者一起失败时说明不了任何问题（我误判过一次）。
+    //
+    // 拿内置键盘/触控板做对照最好使（一直有报文，不用等遥控器）：
+    //   FIREVIBE_CONFIG=/tmp/kb.json FIREVIBE_LC_UP=0x0001 FIREVIBE_LC_USAGE=0x02 \
+    //     firectl --linkcheck        # 把临时配置的 device_vid/pid 指到 0x05ac/0x0342
+    // 动触控板却零报文 = 这台机器谁都读不到（见 CLAUDE.md「HID 栈会坏，重启即恢复」）。
+    // 断开 BLE 链路让遥控器真睡 —— 待机耗电的唯一有效解（见 core/src/btlink.rs）。
+    // 断开后它一小时零广播、不会被 macOS 拽回来；按遥控器任意键就正常连回来。
+    if has("--disconnect") {
+        let name = std::env::var("FIREVIBE_BT_NAME").unwrap_or_default();
+        let name = if name.trim().is_empty() { "Amazon".to_string() } else { name };
+        println!("断开「{name}」的 BLE 链路…");
+        match firevibe_core::btlink::disconnect(&name) {
+            Ok(firevibe_core::btlink::Outcome::Closed) => {
+                println!("✅ 已断开 —— 它现在真的在睡，按遥控器任意键即醒")
+            }
+            Ok(firevibe_core::btlink::Outcome::Already) => println!("它本来就没连着，什么都没做"),
+            Err(e) => println!("❌ {e}"),
+        }
+        return Ok(());
+    }
+
+    if has("--linkcheck") {
+        let cfg = firevibe_core::config::Config::load();
+        let (vid, pid) = cfg.device_ids();
+        let mut api = hidapi::HidApi::new()?;
+        // ⚠️ hidapi 在 macOS 上**默认独占(seize)打开**，而独占要 root：
+        // 普通用户直接撞 `0xE00002C1 privilege violation`（和 CLAUDE.md 里
+        // 「别用 cfg.exclusive」是同一个坑，只是这次踩在默认值上）。
+        api.set_open_exclusive(false);
+        // ⚠️ collection 选错就必然零报文，而那和「读不到」长得一模一样 ——
+        // 拿内置键盘做对照时栽过：默认挑到一个 vendor collection，
+        // 触控板报文压根不从那儿出。所以允许显式指定。
+        let want_up = std::env::var("FIREVIBE_LC_UP").ok()
+            .and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+        let want_us = std::env::var("FIREVIBE_LC_USAGE").ok()
+            .and_then(|v| u16::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+        let all: Vec<_> = api
+            .device_list()
+            .filter(|d| d.vendor_id() == vid && d.product_id() == pid)
+            .collect();
+        println!("0x{vid:04x}/0x{pid:04x} 的 collection：");
+        for d in &all {
+            println!("  usage_page 0x{:04x} usage 0x{:02x}", d.usage_page(), d.usage());
+        }
+        let pick = all
+            .iter()
+            .find(|d| match (want_up, want_us) {
+                (Some(p), Some(u)) => d.usage_page() == p && d.usage() == u,
+                (Some(p), None) => d.usage_page() == p,
+                _ => d.usage_page() == 0x00ff,
+            })
+            .or_else(|| all.first())
+            .ok_or_else(|| anyhow::anyhow!("没枚举到 0x{vid:04x}/0x{pid:04x}"))?;
+        println!("→ 打开 usage_page 0x{:04x} usage 0x{:02x}", pick.usage_page(), pick.usage());
+        let dev = api.open_path(&pick.path().to_owned())?;
+        // ⚠️ 探针先自证：没有「输入监控」时**一条报文都收不到而且不报错**，
+        // 看起来和「没人按键」一模一样。踩过，所以先把授权状态打出来。
+        // （但它也不是全部真相：这个 API 说「已授权」时也可能读不到 —— 见 CLAUDE.md）
+        println!("输入监控授权：{}", firevibe_core::device::input_monitoring());
+        println!("开始读，30 秒。请持续操作这台设备（按键 / 动触控板）——");
+        println!("零报文只在「你确实在操作」的前提下才有意义。");
+        println!("────────────────────────────────────────────");
+        let t0 = std::time::Instant::now();
+        let mut reports = 0u32;
+        let mut buf = [0u8; 128];
+        loop {
+            if t0.elapsed() > std::time::Duration::from_secs(30) {
+                break;
+            }
+            match dev.read_timeout(&mut buf, 200) {
+                Ok(0) => {}
+                Ok(n) => {
+                    reports += 1;
+                    if reports <= 5 || reports % 50 == 0 {
+                        println!("[{:6.1}s] 报文 #{reports} id=0x{:02x} {n}B",
+                                 t0.elapsed().as_secs_f32(), buf[0]);
+                    }
+                }
+                Err(e) => {
+                    println!("[{:6.1}s] read 报错：{e}", t0.elapsed().as_secs_f32());
+                    break;
+                }
+            }
+        }
+        println!("────────────────────────────────────────────");
+        if reports == 0 {
+            println!("共 0 条报文。若你确实在操作这台设备 → 这台机器读不到 HID，");
+            println!("先重启 Mac（见 CLAUDE.md「HID 栈会坏」那节），别去查 app 的代码。");
+        } else {
+            println!("共 {reports} 条报文 —— 读取通路正常。");
+        }
+        return Ok(());
+    }
+
     if has("--battery") {
         let cfg = firevibe_core::config::Config::load();
         let (vid, pid) = cfg.device_ids();

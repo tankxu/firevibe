@@ -204,6 +204,16 @@ pub struct FireVibe {
     /// 这台设备**这次会话里成功连过一次**没有。非 PTT 首连之前保持重试
     /// （防开机时遥控器正睡着连不上），连上过就不再自动追（让它睡、不吵它）。
     hid_ever_up: bool,
+    /// 上次连上的时刻。闲置计时从「最后一次按键」和「连上」里较晚的那个算起 ——
+    /// 连上了却一次没按（开机就摆着不动）也得能睡。
+    last_conn_at: Option<Instant>,
+    /// 主动断链期间抑制自动重连：断链要等 helper 最多 20 秒，这期间别让重连
+    /// 把刚放手的设备又抓回来。
+    sleep_hold_until: Option<Instant>,
+    /// 连续几次自动重连没成功。用来退避：遥控器可能整晚不在，1.5 秒一次地枚举
+    /// 既是白烧 CPU，也是在反复走 hidapi 的枚举路径（那条路上趴过一个 PAC 崩溃，
+    /// 见 device::hid_api）。连上就清零。
+    retry_fails: u32,
     /// 听写时屏幕底部那条悬浮电平窗
     hud: Option<gpui::WindowHandle<hud::Hud>>,
     pub update: UpdateStatus,
@@ -218,6 +228,8 @@ pub struct FireVibe {
     /// 值是缓存 —— 每秒在 pump 里重算一次，改动作后立刻重算。
     pub ir_pending: bool,
     pub ir_pending_at: Instant,
+    /// 上次见到的方案切换代数：pump 里比对，变了就刷 tray/映射/界面。
+    profile_gen_seen: u64,
     pub product: String,
     pub err: Option<String>,
     /// 自检用：`FIREVIBE_BOOT=settings` 或 `FIREVIBE_BOOT=dialog:app1:long`
@@ -449,6 +461,9 @@ impl FireVibe {
             hid_try_at: Instant::now() - Duration::from_secs(10),
             last_disc_at: None,
             hid_ever_up: false,
+            last_conn_at: None,
+            sleep_hold_until: None,
+            retry_fails: 0,
             hud: None,
             update: UpdateStatus::Idle,
             update_rx: None,
@@ -457,6 +472,7 @@ impl FireVibe {
             toast: None,
             ir_pending: false,
             ir_pending_at: Instant::now() - Duration::from_secs(60),
+            profile_gen_seen: firevibe_core::config::profile_gen(),
             product: String::new(),
             err: None,
             boot: std::env::var("FIREVIBE_BOOT").ok(),
@@ -671,6 +687,7 @@ impl FireVibe {
 
     fn pump(&mut self) {
         self.poll_runtime_start();
+        self.poll_idle_sleep();
         self.poll_hotkey_grab();
         self.poll_battery();
         self.poll_config_file_io();
@@ -698,6 +715,18 @@ impl FireVibe {
         if self.ir_pending_at.elapsed() > Duration::from_secs(1) {
             self.refresh_ir_pending();
         }
+        // 方案切换（按键触发的 SwitchProfile、或 tray 菜单点选）走全局代数信号：
+        // dispatch/run_action_at 和 tray 改完 active 后 bump 代数，这里比对到变化就
+        // 刷新硬件层映射（新方案的语音键要重新接管）、刷 tray、重画、冒个提示。
+        let g = firevibe_core::config::profile_gen();
+        if g != self.profile_gen_seen {
+            self.profile_gen_seen = g;
+            let _ = self.rt.sync_hid_remap();
+            firevibe_core::tray::set_profiles();
+            let name = self.rt.cfg.read().profile_name().to_string();
+            let m = self.l().toast_profile_switched(&name);
+            self.toast(m);
+        }
         // HID 打开也会跑 run loop，同样不能放构造期。
         // 「设备没连上」是正常状态不是错误 —— 不弹错误条，靠状态卡高亮表示，
         // 后台自己重试，遥控器一醒就自动连上。
@@ -711,18 +740,36 @@ impl FireVibe {
         // 300ms 一次 = 每秒约 20ms，可以忽略；而抓住 3 秒窗口就变得很稳。
         // 已有 `start_rx` 的并发保护，不会叠着起。
         //
-        // ⚠️ 但 300ms 死命重连 = 遥控器一断就被立刻拽回来、**永远睡不着**，很费电。
-        // 仿品(PTT)按一下只醒 ~3 秒，非快连不可；而**原厂(非 PTT)**没有那个短窗口，
-        // 放它睡、慢点重连更省电 —— 醒来(按键→广播→macOS 重连)时我们 2 秒内也能接上。
         // 断开时打点时间戳，方便观察「休眠→唤醒」到底多快。
         let is_ptt = self.rt.cfg.read().settings.mic_model.is_ptt();
-        // 实验：**非 PTT 断开后完全不自动重连**（只开机连一次），看它到底能不能睡。
-        // 2 秒重连还是不睡，说明可能是「只要 app 想连 macOS 就拽着它」。彻底不追，
-        // 让它睡；睡后按键唤醒、点状态卡的「连接」手动回来。能睡的话再上事件驱动重连。
-        // PTT 仍旧 300ms 快连（它按一下只醒 ~3 秒，非快连抓不住）。
-        // 非 PTT 只在「还没连上过」时保持重试（防开机遥控器正睡着）；连上过就不再追。
-        let want_retry = is_ptt || !self.hid_ever_up;
-        let auto_retry = !self.connected() && self.hid_try_at.elapsed() > Duration::from_millis(300);
+        //
+        // ❗ 2026-09-10/11 实测，`23c4bdc`「非 PTT 连上过就不再自动重连、让它睡」
+        // 那个改动**前提和后果都错了**，已撤回：
+        //
+        // · 前提错：原厂遥控器压根不会自己断链，链路是 macOS 维持的 —— 把 FireVibe
+        //   整个退掉、六分钟后它照样 Connected。所以「不追它」一点电也省不下来。
+        // · 后果严重：链路**真断了**的时候（在系统设置里点「断开连接」是真能断的，
+        //   两个探针同步归零、不碰遥控器就一直断着；偶发掉线同理），这条重试是
+        //   **唯一**的恢复路径。不追 = 遥控器按键唤醒、macOS 都把它连回来了，
+        //   FireVibe 那边还是「未连接」，只能手动点「连接」或重启 app。用户实际
+        //   撞上了这个。
+        //
+        // 代价实测可以忽略：`HidApi::new()` ≈ 5ms、`open()` ≈ 1.7ms（设备不在时
+        // 也是这个量级）。所以谁都追，只是节奏分两档。
+        let want_retry = true;
+        // 仿品(PTT)按一下只醒 ~3 秒，非 300ms 快连抓不住那个窗口；原厂醒了不会
+        // 自己再睡，1.5 秒足够，顺手省掉大半的枚举开销（这条是常年在跑的）。
+        // 首连之前一律快连：开机时遥控器可能正睡着，早一点抓到早一点可用。
+        // PTT 不退避：它按一下只醒 ~3 秒，慢一拍就整个窗口错过。
+        // 非 PTT 退避到 5 秒封顶 —— 它醒了不会自己再睡，晚几秒接上无所谓。
+        let gap = if is_ptt || !self.hid_ever_up {
+            300
+        } else {
+            (1500u64 << self.retry_fails.min(2)).min(5000)
+        };
+        let holding = self.sleep_hold_until.is_some_and(|t| Instant::now() < t);
+        let auto_retry =
+            !holding && !self.connected() && self.hid_try_at.elapsed() > Duration::from_millis(gap);
         if !self.started || (want_retry && auto_retry) {
             let first = !self.started;
             self.started = true;
@@ -741,13 +788,37 @@ impl FireVibe {
                 // 电量跟踪器要在主线程建
                 if !self.batt_started {
                     self.batt_started = true;
-                    // 每 5 分钟读一次 —— 电量变化慢，没必要频繁连蓝牙
-                    firevibe_core::battery::spawn_tracker(300);
+                    // 半小时一轮，而且**只在该读的时候读**（见 spawn_tracker 的
+                    // 说明）：每一轮都是一次完整的 GATT 连接，原来 5 分钟一轮、
+                    // 连没连都读，一天 288 次连接活动全砸在电池上。
+                    //
+                    // 闸门：连着、且（这次启动还没读到过 ‖ 两小时内按过键）。
+                    // 「还没读到过」那条是为了开机先拿一个值填界面；之后长期
+                    // 没人碰遥控器就不读了 —— 电量变化慢，读它只是白耗电。
+                    // 界面在这期间显示的是配置里存的上一次读数，不会空着。
+                    let grt = self.rt.clone();
+                    firevibe_core::battery::spawn_tracker(
+                        1800,
+                        Box::new(move || {
+                            if !grt.status.connected.load(Ordering::Relaxed) {
+                                return false;
+                            }
+                            firevibe_core::battery::last().is_none()
+                                || grt
+                                    .last_hid_key
+                                    .lock()
+                                    .is_some_and(|t| t.elapsed() < Duration::from_secs(2 * 3600))
+                        }),
+                    );
                 }
                 // 按配置重下 HID 层映射：设了就下（幂等，顺带盖掉上次残留），没设就清
                 if let Some(m) = self.rt.sync_hid_remap() {
                     eprintln!("[firevibe] {m}");
                 }
+                // 把共享配置交给 tray：菜单要读方案名/active，点方案要改 active。
+                // 随即刷一次（图标右侧方案名 + 菜单方案列表）。
+                firevibe_core::tray::attach_cfg(self.rt.cfg.clone());
+                self.profile_gen_seen = firevibe_core::config::profile_gen();
                 // 诊断钩子：FIREVIBE_IR_WRITE=<名字>:<hex文件> 时原样写一张表进遥控器
                 self.rt.maybe_debug_ir_write();
                 // 事件 tap：吞掉遥控器按键在系统那边的默认行为（麦克风键弹 Spotlight）
@@ -910,6 +981,7 @@ impl FireVibe {
                     firevibe_core::battery::set_target(&product);
                     self.product = product;
                     self.hid_ever_up = true;
+                    self.last_conn_at = Some(Instant::now());
                     // 观察「休眠→唤醒」用：打出上次断开到现在过了多久
                     if let Some(t) = self.last_disc_at.take() {
                         eprintln!("[firevibe] 遥控器连上（离线 {:.1}s）", t.elapsed().as_secs_f32());
@@ -981,6 +1053,8 @@ impl FireVibe {
         let _ = self.rt.cfg.read().save();
         // 硬件层映射是从动作配置推导出来的，动作一改就得跟着重下 / 清掉
         let _ = self.rt.sync_hid_remap();
+        // 方案名/顺序/active/是否配了切换 都可能变 —— 同步 tray 图标旁的方案名和菜单。
+        firevibe_core::tray::set_profiles();
     }
 
     pub fn check_update(&mut self) {
@@ -1572,6 +1646,69 @@ impl FireVibe {
     /// 就是 RefCell 二次借用 —— 直接 abort，不是 panic 提示，是进程没了。
     /// 配对时一选设备就闪退就是这个。`list_hid` 早因同样原因被要求走后台线程，
     /// `start()` 当初漏了。
+    /// 闲置久了主动断开遥控器的 BLE 链路，让它真睡（待机省电的唯一有效手段）。
+    ///
+    /// 机制见 `core/src/btlink.rs`：**睡着 ≠ 断开**，链路挂着它就得持续应答。
+    /// 断开后实测一小时零广播、不被 macOS 拽回来，按一下键就醒。
+    ///
+    /// 几条守则（都踩过）：
+    /// - **只在窗口缩起来时计时**：界面开着多半正在调按键，断掉会让「测试」白失败一次
+    /// - **正在说话/送流时绝不断**
+    /// - **PTT（仿品）不用管**：它自己 8 秒没按键就断链省电
+    /// - 断链要等 helper 最多 20 秒，**绝不能在 UI 线程调**
+    /// - 断开后**必须保持自动重连**（`want_retry` 恒为 true）——否则用户按键唤醒、
+    ///   macOS 都把它连回来了，FireVibe 那边还是「未连接」，只能手动点
+    fn poll_idle_sleep(&mut self) {
+        let (mins, is_ptt) = {
+            let c = self.rt.cfg.read();
+            (c.settings.idle_sleep_min, c.settings.mic_model.is_ptt())
+        };
+        if mins == 0 || is_ptt || !self.connected() {
+            return;
+        }
+        if !firevibe_core::tray::is_hidden() {
+            return;
+        }
+        if self.rt.status.mic_on.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.sleep_hold_until.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        let last_key = *self.rt.last_hid_key.lock();
+        let idle = match (last_key, self.last_conn_at) {
+            (Some(a), Some(b)) => a.max(b).elapsed(),
+            (Some(a), None) => a.elapsed(),
+            (None, Some(b)) => b.elapsed(),
+            (None, None) => return,
+        };
+        // 排障用：FIREVIBE_IDLE_SEC=<秒> 把阈值改成秒，不然验一次要等半小时
+        let thresh = match std::env::var("FIREVIBE_IDLE_SEC").ok().and_then(|v| v.parse::<u64>().ok()) {
+            Some(sec) => Duration::from_secs(sec),
+            None => Duration::from_secs(mins.saturating_mul(60)),
+        };
+        if idle < thresh {
+            return;
+        }
+        self.sleep_hold_until = Some(Instant::now() + Duration::from_secs(25));
+        let rt = self.rt.clone();
+        let name = firevibe_core::battery::target_name();
+        eprintln!("[firevibe] 闲置 {:.0} 分钟：断开链路让遥控器睡（按任意键即醒）", idle.as_secs_f32() / 60.0);
+        std::thread::spawn(move || {
+            // 先放开 HID 句柄再断链 —— 反过来也能断，只是读线程会先吐一条读错误
+            rt.stop_light();
+            match firevibe_core::btlink::disconnect(&name) {
+                Ok(firevibe_core::btlink::Outcome::Closed) => {
+                    eprintln!("[firevibe] ✅ 链路已断开，遥控器进入休眠")
+                }
+                Ok(firevibe_core::btlink::Outcome::Already) => {
+                    eprintln!("[firevibe] 链路本来就不在，没动它")
+                }
+                Err(e) => eprintln!("[firevibe] 断链失败：{e}"),
+            }
+        });
+    }
+
     fn start_runtime(&mut self, why: StartWhy) {
         if self.start_rx.is_some() {
             return; // 已经有一次在路上，别叠
@@ -1600,6 +1737,7 @@ impl FireVibe {
                 // 红外表**不再自动写**（写一次十几秒、GATT 会话还容易和使用撞车）。
                 // 有改动时顶栏会亮「写入红外」，由用户手动点。这里只刷新一下提示。
                 self.refresh_ir_pending();
+                self.retry_fails = 0;
                 match why {
                 StartWhy::Auto | StartWhy::Manual => {
                     self.err = None;
@@ -1622,6 +1760,7 @@ impl FireVibe {
             Err(m) => match why {
                 // 后台自动重连：不覆盖用户主动点出来的错，没连上就安静等
                 StartWhy::Auto => {
+                    self.retry_fails = self.retry_fails.saturating_add(1);
                     if !self.err_sticky {
                         self.err = if m.starts_with("HID_NOT_FOUND") { None } else { Some(m) };
                     }
@@ -2217,7 +2356,7 @@ impl FireVibe {
                         .child(SharedString::from(n))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.rt.cfg.write().active = i;
-                            this.save();
+                            this.save(); // save() 顺带刷 HID 映射 + tray 方案名
                             this.profile_open = false;
                             cx.notify();
                         })),
@@ -2574,13 +2713,20 @@ impl FireVibe {
                             Some(open_url("onb-bt", l.onb_open_bt(), "x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth", cx)),
                             false,
                         ))
+                        // ⚠️ 这里引导的是**辅助功能**，不是「输入监控」。
+                        // 辅助功能是更高一级的权限，拿到之后 `IOHIDCheckAccess(ListenEvent)`
+                        // 就返回「已授权」——所以读 HID 报文也靠它，用户的输入监控列表里
+                        // 根本不需要有 FireVibe（实测：列表里没有它，app 照常工作）。
+                        // 而合成按键（映射按键、给第三方语音工具发快捷键）本来就只有它能做。
+                        // 完成状态用 `inj.available()`（AXIsProcessTrusted）真实反映 ——
+                        // 以前这里写死 false，勾上了也永远不打勾。
                         .child(step(
                             "keyboard", BADGE_DEFAULT,
                             l.onb_im(),
                             l.onb_im_desc(),
                             l.onb_ready(),
-                            false,
-                            Some(open_url("onb-im", l.onb_open_settings(), "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent", cx)),
+                            self.rt.inj.available(),
+                            Some(open_url("onb-im", l.onb_open_settings(), "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility", cx)),
                             false,
                         ))
                         .child(step(
@@ -3160,6 +3306,14 @@ impl Render for FireVibe {
 }
 
 fn main() {
+    // ⚠️ 必须是第一件事：崩溃/强杀过之后，macOS 会在处理 open event 时弹
+    // 「要恢复窗口吗」的模态框，把主线程卡死在 runModal 上（进程活着但什么都不干）。
+    // 放晚一点就永远跑不到这行 —— 详见 tray::disable_window_restore 的说明。
+    firevibe_core::tray::disable_window_restore();
+    // ⚠️ 同样必须趁早：hidapi 的全局 manager 会绑死在「第一个调用它的线程」的
+    // run loop 上，落到临时线程上的话，那个线程一结束 manager 就指向一个死 run loop，
+    // 之后设备一出现就 PAC 崩溃。详见 device::warm_up_hid_api。
+    firevibe_core::device::warm_up_hid_api();
     // 被信号杀掉时也要清掉 HID 设备层映射。
     //
     // `cx.on_app_quit` 只在 AppKit 走正常退出流程时跑；`kill`（SIGTERM）、
@@ -3271,6 +3425,7 @@ fn main() {
             include_bytes!("../assets/tray/tray@2x.png"),
             tl.tray_show(),
             tl.tray_quit(),
+            tl.tray_profiles(),
         );
         // 让窗口背景可拖（含整个 header）—— gpui 的 window_control_area/start_window_move
         // 在 mac 上是空实现，只能靠 NSWindow.movableByWindowBackground。

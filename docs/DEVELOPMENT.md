@@ -36,8 +36,14 @@ codesign -d --requirements - "target/FireVibe.app" | grep designated   # 不该�
 已经踩进去了：`tccutil reset ListenEvent com.tankxu.firevibe`，再去设置里勾一次。
 界面上那条警示里也有个「重置授权」按钮干这件事。
 
-**必须给「输入监控」权限**（系统设置 › 隐私与安全性 › 输入监控），
+**必须给「辅助功能」权限**（系统设置 › 隐私与安全性 › 辅助功能），
 授权后要**完全退出再重开**才生效 —— 界面上打不开遥控器时会直接提示并给一个跳转按钮。
+
+⚠️ **「输入监控」不用单独开**：辅助功能是更高一级的权限，拿到之后
+`IOHIDCheckAccess(kIOHIDRequestTypeListenEvent)` 就返回 granted，读 HID 报文靠的就是它
+（实测：用户的输入监控列表里没有 FireVibe，app 照常工作）。所以
+`tccutil reset ListenEvent` 那条命令对 app 其实没有作用 —— 权限压根不来自那条记录。
+独立的 firectl 是另一个授权主体，它才需要自己那一份。
 
 配对：遥控器一次只能配一台设备，配 Mac 前先把 Fire TV Stick 断电。
 必须用 1.5V 碱性 AAA，1.2V 充电电池会让 BLE 射频 brownout。
@@ -147,6 +153,9 @@ Spotlight（id 64）是 `enabled = 0`，Spotlight 照样弹，说明走的是更
 
 ```bash
 firectl --tap          # 然后按遥控器上的键
+firectl --disconnect   # 断开 BLE 链路让遥控器真睡（省电；按任意键即醒）
+firectl --linkcheck    # 读某个 collection 30 秒数报文。**不走 Runtime**，用来分清
+                       # 「app 的 bug」和「这台机器读不到 HID」——后者只能重启 Mac
 ```
 
 它**只打印非字符键**（功能/媒体键区、修饰键、systemDefined），你打的字一个都不记录。
@@ -185,7 +194,11 @@ firectl --tap          # 然后按遥控器上的键
   从来没写过（mod.rs 里那两个 cfg 分支指向不存在的文件，非 macOS 压根编译不过），
   现已统一落到 fallback —— 别的功能都在，只有注入报「这个平台没有按键注入」。
 - 「开机启动」写 `~/Library/LaunchAgents/com.tankxu.firevibe.plist`，未实机验证。
-- 按键注入（含媒体键）还需要**「辅助功能」权限**，和读 HID 的「输入监控」是两回事。
+- 权限只需要**「辅助功能」**一项：按键注入（含媒体键）要它，读 HID 报文也靠它覆盖
+  （见上面「跑起来」那节）。
+- **遥控器待机耗电**：睡着 ≠ 断开，链路挂着它就得持续应答。`Settings.idle_sleep_min`
+  （默认 30 分钟）到点会调 `btlink::disconnect()` 主动断链让它真睡，按键即醒、自动重连。
+  手动断用 `firectl --disconnect`。PTT（仿品）那派自己会断链省电，这项对它跳过。
 - 「检查更新」需要在设置里配一个 JSON 清单地址（`settings.update_endpoint`），
   格式 `{"version":"0.2.0","url":"...","notes":"..."}`；没配就显示「未配置更新源」。
 

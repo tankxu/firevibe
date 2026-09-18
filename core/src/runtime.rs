@@ -673,12 +673,31 @@ impl Runtime {
         }
         self.stop.store(false, Ordering::Relaxed);
         let exclusive = self.cfg.read().exclusive;
-        let api = hidapi::HidApi::new().context("hidapi 初始化失败")?;
+        // ⚠️ 用全进程唯一的句柄，**不要 `HidApi::new()`** —— 反复 new/drop 会把
+        // 进程级 IOHIDManager 拆了又建，撞死在 PAC 校验上（见 device::hid_api
+        // 上那段说明）。枚举见下面 add_devices 那段 —— 不要用 refresh_devices。
+        let mut api = crate::device::hid_api()?;
         #[cfg(target_os = "macos")]
         api.set_open_exclusive(exclusive);
         // 错误分类用 ASCII 前缀，别让界面去匹配中文 ——
         // 原来消息里永远带「输入监控」四个字，结果「设备没连上」也被显示成权限问题。
         let (vid, pid) = self.cfg.read().device_ids();
+        // ⚠️ **只枚举这一台**，绝不用 `refresh_devices()`。
+        //
+        // `refresh_devices()` 内部是 `add_devices(0, 0)` → hidapi 给
+        // `IOHIDManagerSetDeviceMatching` 传 NULL = 匹配系统里**每一个** HID 设备，
+        // 然后挨个 `IOHIDDeviceScheduleWithRunLoop`。这条路一跑快就把 CF 对象写坏，
+        // PAC 校验当场打死进程（崩溃栈顶 `__CFCheckCFInfoPACSignature`，
+        // 2026-09-14 / 09-16 各崩过一次，见 CLAUDE.md）。
+        //
+        // 而 `add_devices(vid, pid)` 的过滤**发生在 IOKit 层**（hidapi 会构造
+        // VID/PID 匹配字典再 SetDeviceMatching）：遥控器不在时匹配集为空、一个
+        // schedule 都不会发生 —— 崩溃恰恰全发生在「设备不在、反复重试」的时候，
+        // 等于把崩溃场景整个拆掉；设备在时也只碰它自己那三个 collection。
+        //
+        // `reset_devices()` 必须先调：`add_devices` 是 append，不清会越攒越多。
+        api.reset_devices().ok();
+        api.add_devices(vid, pid).context("枚举 HID 设备失败")?;
         // ⚠️ **必须认准 vendor collection**，不能用 `api.open(vid, pid)`。
         //
         // macOS 把这支遥控器拆成三个 top-level collection：
@@ -816,7 +835,11 @@ impl Runtime {
             let spawned = std::thread::Builder::new()
                 .name(format!("firevibe-hid-{pg:04x}"))
                 .spawn(move || {
+                    // drop 顺序同主读线程（见那边的长注释）：`_count` 先声明→最后 drop
+                    // （计数最后减到 0），`sec` 后声明→先 drop（先把这台设备的 run loop
+                    // 关干净）。否则 start() 的 enumerate 会撞上没拆的旧 run loop → PAC 崩。
                     let _count = count;
+                    let sec = sec;
                     let mut buf = [0u8; 128];
                     loop {
                         if stop2.load(Ordering::Relaxed) {
@@ -876,9 +899,13 @@ impl Runtime {
                 // 而界面的重连是 `!connected()` 才触发的 —— 标志不清，
                 // **300ms 重试永远不跑**，app 从此不再抓着设备。
                 //
-                // 后果比听起来严重：这台遥控器**只要 app 握着 HID 句柄就不休眠**，
-                // 一旦不抓了，它几秒就掉线、而且再也回不来（没人去连它）。
+                // 后果比听起来严重：**没人去连它，它就再也回不来** —— 那条 300ms
+                // 重试是唯一的发现机制（仿品 8 秒就自己断链，断了得靠重试抓回来）。
                 // 表现就是「刚配好能用几秒，然后彻底掉，重启 app 才好」。
+                //
+                // ⚠️ 2026-09-10 更正：这里原本写的是「这台遥控器只要 app 握着
+                // HID 句柄就不休眠」—— **错的**。原厂那台的链路由 macOS 维持，
+                // 把 app 整个退掉它照样连着六分钟以上（见 CLAUDE.md 那一节）。
                 struct Alive(ThreadCount, Arc<Status>);
                 impl Drop for Alive {
                     fn drop(&mut self) {
@@ -888,6 +915,17 @@ impl Runtime {
                     }
                 }
                 let _alive = Alive(main_count, status.clone());
+                // ⚠️ drop 顺序是这个进程崩溃的真凶（EXC_BREAKPOINT / PAC 校验失败，
+                // 崩在 IOHIDManagerSetDeviceMatching → deviceAdded → ScheduleWithRunLoop）。
+                // `start()` 在放行 `HidApi::new()` 枚举前会等 `hid_threads` 归零，但计数减
+                // 在 `_alive`(ThreadCount)的 Drop 里、而设备 `dev` 是**闭包捕获变量**——
+                // 捕获变量在闭包体局部之后才析构，于是计数先归零、`dev` 的 hid_close
+                // （同步 CFRunLoopStop + join 掉这台设备的 run loop）还没跑。start() 一放行
+                // 就 enumerate，新 IOHIDManager 撞上没拆干净的旧设备 run loop → CF 对象写坏。
+                // 把 `dev` move 成体内局部、且**声明在 `_alive` 之后** → 逆序析构时 `dev`
+                // 先 drop（设备关干净）、`_alive` 后 drop（这才把计数减到 0）。所有退出路径
+                // （正常、`?`、探测失败 return、panic）都走这套体末逆序，一并覆盖。
+                let dev = dev;
                 let mut dec = match opus::Decoder::new(OPUS_RATE, opus::Channels::Mono) {
                     Ok(d) => d,
                     Err(e) => {
@@ -1664,6 +1702,26 @@ impl Runtime {
                 return ir_blast(&self.tx, act, ptt, slot);
                 // slot 为 None 时（CLI 直接跑动作）只能说通用的那句
             }
+            ActionType::SwitchProfile => {
+                if !down {
+                    return String::new();
+                }
+                let switched = {
+                    let mut c = self.cfg.write();
+                    c.switch_profile(&act.arg).map(|i| {
+                        let n = c.profiles[i].name.clone();
+                        let _ = c.save();
+                        n
+                    })
+                };
+                return match switched {
+                    Some(name) => {
+                        crate::config::bump_profile_gen();
+                        format!("方案 → {name}")
+                    }
+                    None => String::new(),
+                };
+            }
             ActionType::VoiceDictate => {
                 let long = act.arg == "hold";
                 if !long && !down {
@@ -2057,6 +2115,25 @@ fn dispatch(
         ActionType::None => "未设置".into(),
         // 上面已经提前返回了，这条只是让 match 穷尽
         ActionType::Record => String::new(),
+        ActionType::SwitchProfile => {
+            // 切方案（像键盘切 layer）。改 active 后 bump 代数，UI 的 pump 会刷新
+            // tray/界面并重下硬件层映射；这里只管切 + 落盘 + 回一句话。
+            let switched = {
+                let mut c = cfg.write();
+                c.switch_profile(&act.arg).map(|i| {
+                    let name = c.profiles[i].name.clone();
+                    let _ = c.save();
+                    name
+                })
+            };
+            match switched {
+                Some(name) => {
+                    crate::config::bump_profile_gen();
+                    format!("方案 → {name}")
+                }
+                None => String::new(),
+            }
+        }
         ActionType::IrBlast => ir_blast(tx, &act, cfg.read().settings.mic_model.is_ptt(), Some(slot)),
         ActionType::Key => match inj.key_stroke(&act.key, &act.mods) {
             Ok(_) => act.describe(),

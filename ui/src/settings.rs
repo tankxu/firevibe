@@ -18,6 +18,10 @@ impl FireVibe {
         let launch = cfg.settings.launch_at_login;
         let lang = cfg.settings.lang;
         let long_ms = cfg.settings.long_press_ms;
+        let idle_min = cfg.settings.idle_sleep_min;
+        // PTT（仿品）自己 8 秒没按键就断链省电，闲时断链对它是空操作 ——
+        // 不说明的话用户会调了半天纳闷「怎么没反应」
+        let idle_is_ptt = cfg.settings.mic_model.is_ptt();
         let auto_in = cfg.settings.auto_switch_input;
         let hud = cfg.settings.show_level_hud;
         let gain = cfg.voice.gain;
@@ -258,6 +262,52 @@ impl FireVibe {
                                             .text_color(c(INK3))
                                             .child("ms"),
                                     ),
+                            ),
+                    )
+                    .child(hline())
+                    // 闲置后让遥控器休眠（主动断 BLE 链路）——
+                    // 睡着 ≠ 断开，链路挂着它就得持续应答，见 core/src/btlink.rs
+                    .child(
+                        group_row()
+                            .child(row_icon("moon"))
+                            .child(row_text(
+                                l.idle_sleep(),
+                                Some(if idle_is_ptt { l.idle_sleep_ptt() } else { l.idle_sleep_hint() }),
+                            ))
+                            .child(
+                                stepper_wrap()
+                                    .child(stepper_btn("idle-dec", "−").on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            let mut g = this.rt.cfg.write();
+                                            // 10 分钟往下直接到 0（0 = 一直连着）
+                                            g.settings.idle_sleep_min =
+                                                g.settings.idle_sleep_min.saturating_sub(10);
+                                            drop(g);
+                                            this.save();
+                                            cx.notify();
+                                        },
+                                    )))
+                                    .child(
+                                        div()
+                                            .min_w(px(56.))
+                                            .text_center()
+                                            .text_size(px(12.5))
+                                            .child(SharedString::from(if idle_min == 0 {
+                                                l.idle_sleep_off().to_string()
+                                            } else {
+                                                format!("{idle_min} {}", l.minutes_unit())
+                                            })),
+                                    )
+                                    .child(stepper_btn("idle-inc", "+").on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            let mut g = this.rt.cfg.write();
+                                            g.settings.idle_sleep_min =
+                                                (g.settings.idle_sleep_min + 10).min(240);
+                                            drop(g);
+                                            this.save();
+                                            cx.notify();
+                                        },
+                                    ))),
                             ),
                     ),
             )

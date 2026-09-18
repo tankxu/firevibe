@@ -498,11 +498,58 @@ irblast "BLE_TEST" "$(cat 表.hex)" --mapping --uuid-rand --wait 80   # OK = 回
 不用 `setprop log.tag.*`（会被 SELinux 挡）。**比在黑盒里试参数快一个数量级** ——
 我先黑盒试了几小时，回去看日志 20 分钟拿到全部答案。
 
+## ★★★ 「连上了但一个报文都收不到」：先怀疑机器，别先查代码（2026-09-19 结案）
+
+**症状**：app 显示已连接、三个 collection 全部打开成功、hidremap 下发了、语音链路也建好了
+—— 但按键毫无反应、软遥控不亮、`stats` 一次都不涨。而**系统自己收得一清二楚**
+（遥控器方向键在 terminal 里照常翻历史、麦克风键照样唤起第三方语音工具）。
+
+**真相**：**macOS 的 HID 读取通路会坏，而且坏得非常安静。** 那台 Mac 连续运行 12 天后，
+**任何进程都读不到任何 HID 设备的 input report** —— 拿内置触控板做对照，画圈 25 秒
+**零报文**；而 `IOHIDCheckAccess` 从头到尾回答「已授权」。**重启 Mac 立刻恢复**
+（重启当天就正常记了 11 次按键）。统计上也对得起来：`by_day` 从 09-06 断到 09-18，
+而上一次开机正是 09-05。
+
+### 排查顺序（照这个走，能省一整晚）
+
+1. `pgrep -f MacOS/firevibe` —— **app 在不在跑**。不在就看 `~/Library/Logs/DiagnosticReports/`
+2. `sample <pid>` —— 主线程**卡没卡在 `runModal`**（崩溃后的「要恢复窗口吗」模态框，见下一节）
+3. **拿内置触控板做对照**（关键的一步，我这次绕了很久才做）：
+   ```bash
+   python3 -c "import json,os;p=os.path.expanduser('~/Library/Application Support/FireVibe/config.json');c=json.load(open(p));c['settings']['device_vid']='0x05ac';c['settings']['device_pid']='0x0342';json.dump(c,open('/tmp/kb.json','w'))"
+   FIREVIBE_CONFIG=/tmp/kb.json FIREVIBE_LC_UP=0x0001 FIREVIBE_LC_USAGE=0x02 firectl --linkcheck
+   ```
+   **画圈 25 秒零报文 → 机器坏了，重启 Mac**，别再查代码。
+4. 以上都正常，才轮到 Runtime（stop 标志、collection 路由那些，见下面两节）
+
+### ⚠️ 这次的误判，一条都别再走
+
+- ❌ **「是输入监控授权失效」** —— 查了很久。`tccutil reset ListenEvent` 跑了（报成功、没用）、
+  用户在系统设置里关开开关、**最后把整条记录删掉** —— app 重启后**照样报「已授权」**。
+  **`IOHIDCheckAccess` 在这种坏状态下会说谎**：记录都删了它还说有，而实际一条报文不给。
+  以后别拿它当判据，**判据只有「实际读到没读到」**。
+  （旁证：用户说以前手动删那条记录时，app 会立刻提示权限失效；这次删了毫无反应。）
+- ❌ **「app 和 firectl 是两个独立授权主体，都失败所以是系统问题」** —— 推理本身没错，
+  但前提是错的：**`--sniff` 走的正是 Runtime 同一份代码**（旧版这份文档里「firectl 不走
+  Runtime 那条路」已经过时）。两个一起失败说明不了任何事。要独立验证必须用**不走 Runtime**
+  的路径 —— `firectl --linkcheck` 就是为此加的（直接 hidapi open + read）。
+- ❌ 还怀疑过并排除了：旧句柄失效（重启 app 无效）、hidremap 吞报文（清空映射无效，
+  且方向键根本不在映射里）、遥控器没电（换电池前后一样，且方向键在 terminal 里能用）、
+  Karabiner（`org.pqrs.Karabiner-DriverKit-VirtualHIDDevice` 确实 activated，
+  但 `karabiner_grabber` 没在跑，不 grab 设备）。
+- ⚠️ **最大的时间黑洞是「你按一下我看看」**：零报文分不清「设备没发」还是「用户没按」，
+  我为此来回问了七八轮。**改用触控板画圈**——高频、可持续、而且用户本来就在动它，
+  一次就能定性。**任何「零事件」结论，先让探针自证**（`--linkcheck` 会打印所有
+  collection 和授权状态；battprobe `--scan` 会打印「所有设备的广播条数」）。
+
 ## ★★★ 「连上了、但一个 HID 报文都收不到」—— stop 标志没复位
 
 **症状特别像硬件坏了**：设备打开成功、`Connected` 事件照发、hidremap 照下发、
 蓝牙电量也读得到、语音链路也建好了 —— 就是**软遥控器不亮、按键毫无反应、
-语音没有音频**。而 `firectl --sniff` 单独跑一切正常（它不走 Runtime 那条路）。
+语音没有音频**。
+⚠️ **更正：`firectl --sniff` 走的正是 Runtime 同一份代码**（当年那句「它不走 Runtime
+那条路」已经不成立了），所以它**不能**用来验证 Runtime 的 bug —— 两者会一起失败。
+要独立验证用 `firectl --linkcheck`（直接 hidapi open + read，不碰 Runtime）。
 
 根因：`Runtime.stop` 是挂在 Runtime 上的 `Arc<AtomicBool>`，**跨连接存活**，
 而 `start()` 里**没有把它复位成 false**。`start_runtime` 又永远是
@@ -524,6 +571,84 @@ pub fn start(&self) -> Result<()> {
 | `Settings.prev_input_id` | 卡在虚拟声卡上而没有还原目标 → 所有 app 的麦克风永久哑掉 |
 
 **判据**：凡是「重连/重试」路径上被置位的状态，都要问一句「谁把它清回去」。
+
+## ★★★ 点连接偶发闪退（EXC_BREAKPOINT / PAC）—— 读线程的 drop 顺序反了
+
+**crash 签名**（`~/Library/Logs/DiagnosticReports/firevibe-*.ips`，认 faulting thread 顶几帧）：
+`__CFCheckCFInfoPACSignature > CFRunLoopAddSource > IOHIDDeviceScheduleWithRunLoop >
+__IOHIDManagerDeviceAdded > IOHIDManagerSetDeviceMatchingMultiple`。0.2.0/0.2.1/0.2.2
+签名一模一样 —— 长期潜伏，遥控器整晚不在、pump 反复重连时放大概率。
+
+`start()` 明明有保护（等 `hid_threads` 归零再放行 `HidApi::new()` 枚举），却仍崩。漏洞在
+**读线程退出时的析构顺序**：计数减在 `ThreadCount`/`Alive` 的 `Drop` 里（闭包体内**局部**
+变量），而 `HidDevice`（`dev`/`sec`）是闭包**捕获**变量 —— 捕获变量在闭包体局部之后才析构。
+于是计数先归零、`hid_close`（同步 `CFRunLoopStop`+join 掉这台设备的 run loop）还没跑，
+`start()` 一放行就 enumerate，新 IOHIDManager 撞上没拆干净的旧设备 run loop → CF 对象写坏。
+修法：把设备 move 成体内局部、且声明在计数 guard **之后**（逆序析构 → 设备先 drop、
+计数后 drop）。主读线程 `let dev = dev;` 放 `_alive` 之后；副读线程 `let _count = count;
+let sec = sec;`。所有退出路径（正常/`?`/return/panic）都走体末逆序，一并覆盖。
+⚠️ 判据延伸：不只问「谁把标志清回去」，还要问「持有系统资源的对象和它的计数 guard，谁先析构」。
+
+## ★★★ PAC 崩溃的真凶是 `HidApi::new()` 反复 new/drop（2026-09-14 复发，已根治）
+
+上一节那个 drop 顺序的修复**没修干净** —— 同样的签名在 0.2.3 又崩了一次
+（`~/Library/Logs/DiagnosticReports/firevibe-2026-09-14-031315.ips`，栈顶一模一样：
+`__CFCheckCFInfoPACSignature → CFRunLoopAddSource → IOHIDDeviceScheduleWithRunLoop
+→ __IOHIDManagerDeviceAdded → IOHIDManagerSetDeviceMatchingMultiple`）。
+
+**真因（前后归因错了两次，第三次才拿到源码证据 —— 过程本身是教训）**：
+
+```c
+/* hidapi/mac/hid.c :: init_hid_manager() */
+hid_mgr = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+IOHIDManagerSetDeviceMatching(hid_mgr, NULL);
+IOHIDManagerScheduleWithRunLoop(hid_mgr, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+//                                       ^^^^^^^^^^^^^^^^^^^ 谁先调用 hid_init，就绑谁的 run loop
+```
+
+全局 `hid_mgr` 被**绑死在「第一个调用 hidapi 的线程」的 run loop** 上。而
+`Runtime::start()` 跑在 `start_runtime` spawn 出来的**临时线程**里 —— 那个线程做完就
+结束、run loop 随之销毁，manager 却还记着它。此后任何一次枚举只要**匹配到设备**，
+`__IOHIDManagerDeviceAdded` 就会往那个**已经死掉的 run loop** 上 `CFRunLoopAddSource`
+→ PAC 校验失败 → 进程当场被打死。
+
+**修法**：`device::warm_up_hid_api()`，在 **`main()` 第一屏、主线程**上先把 hidapi
+初始化掉 —— 主线程 run loop 和进程同寿，永不失效。⚠️ 它必须早于任何后台线程碰
+`hid_api()` / `list_hid()`，否则 init 又落到别的线程上。
+
+**两次错误归因，都别再走**：
+
+1. ❌「`HidApi` 反复 new/drop 把 manager 拆了又建」→ 改成全局单例后**崩得更狠**：
+   以前每次 new/drop 至少跟当次线程同生共死（偶发才撞），单例之后它**永久**绑在
+   第一个临时线程的尸体上，于是**设备一出现就必崩**。
+2. ❌「`refresh_devices()` 用 NULL 匹配、把系统每个 HID 设备都 schedule 进去」→
+   这条**方向没错但不是根因**：改成 `reset_devices()` + `add_devices(vid, pid)` 后，
+   设备不在时确实不崩了（匹配集为空、不触发 deviceAdded），可**设备一回来照样崩**，
+   崩溃栈还多出一帧 `IOHIDManagerSetDeviceMatching`（带匹配字典那条路）。
+   这个改动**保留**了（只碰自己那三个 collection，触发面更小、也更快），但别把它
+   当解药。
+
+**教训**：崩溃栈指向 `IOHIDManagerSetDeviceMatching*` 时，**别猜调用频率、别猜对象
+生命周期，去读 `hid.c`**。两次错误归因各自都「讲得通」，而且第一次还伴随着一次
+「三分钟没崩」的假阳性验证 —— 那次其实是 app 卡在恢复窗口的模态框上、压根没跑到
+枚举（见下一条）。**验证崩溃修复前，先确认进程真的在跑那条路径。**
+
+❗ **配套的第二个坑：崩溃之后下一次启动会卡死在「要恢复窗口吗」的模态框上。**
+`_handleAEOpenEvent → NSPersistentUIRestorer promptToIgnorePersistentStateWithCrashHistory:
+→ NSAlert runModal` —— 主线程停在 `runModal`，app 在进程列表里活着、状态栏图标也在，
+但**什么都不干**：连不上遥控器、按键毫无反应。这和「HID 读线程失效」长得一模一样，
+我为此往 HID 层查了很久。
+- 判据：`sample <pid>` 看主线程，栈里有 `runModal` 就是它，不是 HID 的事
+- ⚠️ **Info.plist 的 `NSQuitAlwaysKeepsWindows=false` 挡不住它**（实测，别再试）——
+  那个键管的是「正常退出时保不保存窗口」，这个框走崩溃历史那条路。
+- 根治：只有 `ApplePersistenceIgnoreState` 管用，所以 **app 自己写进自家 defaults**
+  （`core/src/tray.rs::install()` 开头，下次启动生效；装机时没人会手动 defaults write）
+- 救急（当场解卡）：`defaults write com.tankxu.firevibe ApplePersistenceIgnoreState -bool YES`
+  \+ 删掉 `~/Library/Saved Application State/com.tankxu.firevibe.savedState`，再重启 app
+
+❗ **排障顺序（这一晚又验证了一遍）**：遥控器"没反应"时，先 `pgrep` 看 app 在不在 →
+不在就查 `~/Library/Logs/DiagnosticReports/` → 在就 `sample <pid>` 看主线程卡没卡。
+**这两步都排除了再去查 HID**。
 
 ## HID collection：三个全开，别再赌哪个送按键（2026-08-31 起）
 
@@ -549,6 +674,135 @@ defaults 开关，插电照拒）。要不到打盹许可，它**约 8 秒没有
 键按住才吐流 → "音频来了而没见过按下"=用户正按着，开音频闸门；对走
 硬件层映射的键**绝不补合成** —— 豆包只认硬件来源，合成的还会把它的
 热键状态机搞乱）。
+
+## ★★★ 原厂遥控器待机耗电：链路是 macOS 维持的，用户空间断不掉（2026-09-10 结案）
+
+**症状**：四天一次没按，电量从满掉到 12%。
+
+实测（每条都有可信探针）：
+
+| 检查 | 结果 |
+|---|---|
+| `system_profiler SPBluetoothDataType` | 四天没碰它，一直在 `Connected` |
+| **把 FireVibe 整个退掉**，观察六分钟 | 照样 `Connected` |
+| 麦克风热着吗（`firectl --sniff` 十秒） | **零报文**，没热着 |
+| 系统休眠 | Amphetamine 按着 113 小时没睡 |
+| `stats.by_day` | 最后一条就是四天前，确实没按 |
+
+❗ **推翻旧结论两条**：
+
+1. runtime.rs 里那句「这台遥控器只要 app 握着 HID 句柄就不休眠」——**不准确**，
+   句柄放了（app 完全退出）它照样连着。链路是 **macOS** 维持的。
+2. `23c4bdc`「非 PTT 连上过就不再自动重连，让它睡、不吵它」——**前提和后果都错了，
+   已撤回**（`want_retry` 现在恒为 true，只是非 PTT 的重试间隔放到 1.5 秒）。
+   前提错：原厂压根不会自己断链，不追它也照样在线，一点电都省不下来。
+   后果错得更疼：链路**真断了**的时候（见下面「系统设置那个按钮是真能断的」），
+   这条重试是**唯一**的恢复路径 —— 不追的话遥控器已经按键唤醒、macOS 也连回来了，
+   FireVibe 那边还是「未连接」，只能手动点「连接」或重启 app。用户实际撞上了。
+   会自己断链的只有仿品（PTT，要不到 latency，8 秒就断，见上一节）。
+
+### ✅ 断链是**能做到**的（2026-09-19 实测通，推翻此前结论）
+
+**配方**（`helper/battprobe.swift --disconnect` / `core/src/btlink.rs` / `firectl --disconnect`）：
+
+1. `CBCentralManager.retrieveConnectedPeripherals(withServices:)` 找到它
+2. **先 `connect(p)`** ← **关键的一步**
+3. `cancelPeripheralConnection(p)`（公开 API）；三秒后还连着就降级到私有的
+   `cancelPeripheralConnection:force:`（force=YES）
+
+实测：三个探针同步归零（`ioreg -c IOHIDDevice` 节点消失、`blueutil --paired` 变
+not connected、CB 的已连接列表里也没了），断开**保持三分钟以上不被拽回来**，
+和手动点系统设置那个按钮效果一致。
+
+❌ **此前错在哪（别再走）**：
+
+- `IOBluetoothDevice.closeConnection()` 是**空转** —— 返回 `kIOReturnSuccess` 却什么
+  都没发生。那套 API 是给 classic 蓝牙的，对已配对的 BLE HID 无效；`blueutil --disconnect`
+  同理。**佐证**：系统设置的蓝牙面板（`/System/Library/ExtensionKit/Extensions/Bluetooth.appex`）
+  `otool -L` 看下去**只链 CoreBluetooth，根本没链 IOBluetooth**。
+- **只调 `cancelPeripheralConnection` 而不先 `connect`** —— 它的语义是「取消**我自己**
+  的连接」，没 connect 过就无从取消，**静默无效**。我卡在这里，据此下了
+  「断链在用户空间是死的」的结论，**并且把整个「闲时自动断链」功能删掉了** ——
+  两件事都是错的。
+- ⚠️ **`blueutil --is-connected` 对 BLE 设备会骗人**：它报 `0` 的同时
+  `blueutil --paired` 和 `system_profiler` 都说 connected，`firectl --sniff` 还能正常
+  打开这台设备。判据用 **`blueutil --paired` 那行的 connected 字段**，或
+  **`ioreg -c IOHIDDevice | grep -c "Amazon Remote"`**。
+- ⚠️ **IOBluetooth 现在内部包着 CoreBluetooth**：`+[IOBluetoothDevice pairedDevices]`
+  → `IOBluetoothCoreBluetoothCoordinator` → `semaphore_wait`。在**没有蓝牙授权**的
+  进程里它**永久挂住**，不报错不超时 —— 又是 battery.rs 顶部那套症状。
+- 真正的功耗旋钮（connection interval / slave latency）由从设备请求、主机批准，
+  而 `bluetoothd` 硬编码拒绝 latency > 30（见上一节），那条确实调不了。
+
+**找到答案的方法**（比黑盒试快一个数量级，值得记）：去翻**系统设置自己**用了什么 ——
+`otool -L` 看它链了哪些框架（只有 CoreBluetooth ⇒ IOBluetooth 那条路从一开始就不可能），
+`otool -v -s __TEXT __objc_methname` 看它调了什么 selector（挖出 `disconnectWithCompletion:`），
+再用 objc 运行时反查宿主类（`objc_copyClassNamesForImage` + `class_getInstanceMethod`；
+⚠️ 别用 `NSStringFromClass` 扫全部类，碰到 `__NSGenericDeallocHandler` 会 abort，
+用纯 C 的 `class_getName`）。
+
+❗ **2026-09-16 补完机制（一小时实测，探针全程自证）**：断开之后遥控器是**真睡着**的
+—— 一小时**零广播**（同期其他设备 39458 条，证明扫描一直在工作）、658 次状态采样
+全程 `not connected`，**没有「自己周期性醒来招人连」这回事**。所以完整的因果是：
+
+1. 它会休眠，睡着时不广播、基本不耗电；
+2. 但**睡着 ≠ 断开** —— 只要链路还挂着，它作为从设备就得按 connection interval
+   持续醒来应答，而它要的打盹许可被 `bluetoothd` 拒（latency 49 > 30），这才是掉电来源；
+3. 链路一旦建立**不会自己散**（2026-09-14 03:12 那次是唯一见过的例外），macOS 也不主动断；
+4. 唤醒只要物理碰一下：碰到 → 它广播 → macOS 见到已配对设备立刻连上 → 从此一直挂着。
+
+**所以「几天没按却一直连着」= 某次碰到它之后就再没断过**，不是它在反复招人。
+用户侧唯一有效的省电手段：不用时在系统设置点一次「断开连接」，它能一直睡到你按它。
+用 `helper/battprobe.swift --scan`（只扫描不连接，带「所有设备广播数」自证）复验。
+
+❗ **「系统设置 › 蓝牙 › 断开连接」那个按钮是真能断的**（2026-09-11 用户点、我在录）：
+两个探针**同步归零**（`ioreg -c IOHIDDevice` 里的节点消失、`blueutil --paired` 变
+not connected），而且**不碰遥控器它就一直断着**，macOS 不会自己把它拽回来；
+按一下遥控器就正常连回来。对比 `closeConnection` 的「返回成功、什么都没发生」，
+说明**系统里确实存在一条能断掉的路径，只是不是 IOBluetooth 那个 API**。
+下次要做省电，从这里查（系统设置用的是哪条调用），别再碰 `closeConnection`。
+
+### 结论：怎么省、各自值多少（别高估 app 能做的事）
+
+| 手段 | 归谁 | 效果 | 证据 |
+|---|---|---|---|
+| **`firectl --disconnect`**（或手动点系统设置那个按钮） | 用户/CLI | **唯一真正有效**：它立刻真睡，一小时零广播、不会被连回来 | 一小时扫描 + 658 次状态采样；CLI 版 2026-09-19 实测通 |
+| 让 Mac 睡 / 取消配对 | 用户 | 同理有效（链路没了它就睡） | 推论，未单独实测 |
+| 麦克风别热着（开局补关麦 + 自愈） | app | 防「一两天吃掉 30%」那种量级的漏电 | 早就在做；本轮 `--sniff` 十秒零报文，确认没热着 |
+| 电量轮询改按需 | app | 把**我们自己**制造的连接活动从一天 288 次降到 ≤48 次、长期不用趋近 0 | `spawn_tracker(1800, gate)`；实测 5.5 小时 11 轮 ≈ 30 分钟一轮 |
+| 在 app 里做「一键断链 / 闲时自动断」 | app | **可以做**（底座已就绪，还没接进界面） | `btlink::disconnect()`，见上面的配方 |
+
+⚠️ **别把电量轮询那条当成解药**：主因是**链路常驻时的持续应答**，轮询只是我们自己
+额外叠上去的一点活动，**收益没有量化过**。真正把电量拉回来的是「不用就断开」。
+（本轮实测佐证：用户换电池后 `last_battery` 73%，而这几天 app 侧行为没变。）
+
+⚠️ 闸门有个已知缺陷：`battery::last().is_none()` 那条是为了「开机先拿一个值填界面」，
+但**电量一直读不到时它每轮都会放行**（`last()` 永远是 None）。30 分钟一轮仍比原来的
+5 分钟好 6 倍，先这样；真要修就加个「本次启动已尝试过 N 次就不再试」的计数。
+
+✅ **「闲时自动断链」已实现**（2026-09-19，端到端验证过：连上 → 闲置 → 自动断开 →
+按键唤醒 → app 自动抓回来）。
+
+- 配置：`Settings.idle_sleep_min`，默认 **30 分钟**，设置页可调（10 分钟一档，0=不休眠）
+- 逻辑：`ui/src/main.rs::poll_idle_sleep()`。触发条件 = **窗口收起**（`tray::is_hidden()`）
+  + 非 PTT + 没在送流（`status.mic_on`）+ 距「最后一次按键 / 连上」超过阈值
+- 断链在**后台线程**做（要等 helper 最多 20 秒，绝不能卡 UI），期间 `sleep_hold_until`
+  抑制重连；断开后**必须保持自动重连**（`want_retry` 恒为 true），否则用户按键唤醒、
+  macOS 都连回来了，FireVibe 还是「未连接」
+- 排障开关：`FIREVIBE_IDLE_SEC=<秒>` 把阈值改成秒 —— 不然验一次要等半小时。
+  ⚠️ **窗口开着不计时**，用这个开关测的时候记得先点红叉把窗口收起，否则永远不触发
+  （我第一次就栽在这，以为逻辑没生效）
+
+⚠️ **实现时踩的两个坑（都会表现成「断链失败」）**：
+
+1. **别给断链加「优先公开 API」的降级**——除非中间**重新 connect**。
+   公开的那次 `cancelPeripheralConnection` 会把**我们自己的连接引用取消掉**，
+   紧接着调 force 变体时已经没有引用可 force，必然失败（退出码 5）。
+   我加完这个"稳妥"的降级，原本验证通过的配方就一直断不掉。
+2. **helper 的兜底超时要给够**。断链流程 ≈ 11 秒（connect 2s + 公开 cancel 3s +
+   重连 2s + 检查 4s），而 battprobe 原来沿用读电量那个 **8 秒**兜底，会抢在流程完成前
+   `exit(5)` —— 表现成**「报失败但设备其实断开了」**，极具误导性。现在断链模式单独用
+   18 秒（父进程 `btlink.rs` 超时 20 秒）。
 
 ## 配置文件必须原子写
 

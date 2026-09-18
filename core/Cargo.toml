@@ -24,7 +24,7 @@ core-foundation = "=0.10.0"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSEvent", "NSGraphicsContext", "NSWorkspace", "NSRunningApplication", "objc2-core-graphics", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSButton", "NSControl", "NSView", "NSResponder", "NSApplication", "NSWindow", "NSImage", "NSPanel", "NSOpenPanel", "NSSavePanel"] }
 objc2-core-graphics = "0.3"
-objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSURL", "NSLocale", "NSError", "NSArray", "NSObject", "NSData"] }
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSString", "NSURL", "NSLocale", "NSError", "NSArray", "NSObject", "NSData", "NSUserDefaults"] }
 block2 = "0.6"
 objc2-speech = { version = "0.3", features = [
     "SFSpeechRecognizer", "SFSpeechRecognitionRequest",

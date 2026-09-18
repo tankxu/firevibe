@@ -1,6 +1,6 @@
 //! 编辑操作弹窗。改的是临时状态，点保存才写回配置。
 
-use crate::cards::{new_input, to_action, new_line_input};
+use crate::cards::{new_input, to_action, new_line_input, new_line_input_ph};
 use crate::theme::*;
 use crate::widget::*;
 use crate::{EditState, FireVibe};
@@ -38,8 +38,16 @@ impl FireVibe {
 
         let input = new_input(&a.arg, window, cx);
         let body_in = new_input(&a.body, window, cx);
-        // 数字用真单行 —— new_input 是 auto_grow 的，装一个「0」也会占掉多行的高度
-        let retries_in = new_line_input(&a.retries.to_string(), window, cx);
+        // 数字用真单行 —— new_input 是 auto_grow 的，装一个「0」也会占掉多行的高度。
+        // 0 次重试就留**空**，靠 placeholder 显示灰「0」—— 用户点进去直接输数字，
+        // 不用先删掉一个实心的 0（保存时空串 parse 兜底回 0，行为不变）。
+        let retries_str = if a.retries > 0 { a.retries.to_string() } else { String::new() };
+        let retries_in = new_line_input_ph(&retries_str, "0", window, cx);
+        // URL 框（HTTP）给个示例占位。d.input 是各类型共用的输入框，所以按当前类型
+        // 决定占位；切换类型时在下面的回调里同步更新（切走要清掉，免得串味）。
+        if a.kind == ActionType::Http {
+            input.update(cx, |s, c| s.set_placeholder("https://example.com/webhook", window, c));
+        }
         let timeout_in = new_line_input(
             &(if a.timeout_ms > 0 { a.timeout_ms } else { 2000 }).to_string(),
             window,
@@ -171,6 +179,9 @@ impl FireVibe {
                 cx.listener(move |this, _, window, cx| {
                     if let Some(dd) = &mut this.dialog {
                         dd.kind = k;
+                        // URL 占位随类型走：HTTP 才显示示例，切到别的类型清掉（共用输入框）
+                        let ph = if k == ActionType::Http { "https://example.com/webhook" } else { "" };
+                        dd.input.update(cx, |s, c| s.set_placeholder(ph, window, c));
                         // 选了要热键的类型、又还没设过键 —— 直接开始录，
                         // 省得再点一下输入框
                         let needs_hotkey = matches!(k, ActionType::Key | ActionType::VoiceHotkey);
@@ -423,6 +434,42 @@ l.hotkey_tap_hint()
             }
             ActionType::Text => {
                 body = body.child(div().child(field_lab(l.text_arg())).child(text_field(d)));
+            }
+            ActionType::SwitchProfile => {
+                // 目标存进 arg：空/"next" = 下一个、"prev" = 上一个（都循环），
+                // 否则是方案名。一排 chip 选：下一个 + 上一个 + 每个方案名，选中的高亮。
+                let cur = d.input.read(cx).value().to_string();
+                let is_next = cur.is_empty() || cur == "next";
+                let is_prev = cur == "prev";
+                let rel = |id: &'static str, label: &'static str, on: bool, val: &'static str| {
+                    chip_sm(id, label, on).on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(d) = &this.dialog {
+                            d.input.update(cx, |s, cx| s.set_value(val, window, cx));
+                        }
+                        cx.notify();
+                    }))
+                };
+                let mut row = div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(6.))
+                    .child(rel("sp-next", l.switch_profile_next(), is_next, "next"))
+                    .child(rel("sp-prev", l.switch_profile_prev(), is_prev, "prev"));
+                for (i, n) in self.rt.cfg.read().profile_names().into_iter().enumerate() {
+                    let active = !is_next && !is_prev && cur == n;
+                    let val = n.clone();
+                    row = row.child(chip_sm(("sp", i), n, active).on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            if let Some(d) = &this.dialog {
+                                d.input.update(cx, |s, cx| s.set_value(val.clone(), window, cx));
+                            }
+                            cx.notify();
+                        },
+                    )));
+                }
+                body = body
+                    .child(hint_box(d.kind.hint()))
+                    .child(div().child(field_lab(l.switch_profile_target())).child(row));
             }
             _ if ptt_note => {
                 body = body.child(note_box(l.ptt_short_note(), Note::Warn));
@@ -823,6 +870,10 @@ fn pretty_key(k: &str) -> String {
         "down" => "↓".into(),
         "left" => "←".into(),
         "right" => "→".into(),
+        // 标点键统一显示成键面符号（`rightbracket` → `]`），见 cards::punct_label
+        other if crate::cards::punct_label(other).is_some() => {
+            crate::cards::punct_label(other).unwrap().into()
+        }
         other if other.len() == 1 => other.to_uppercase(),
         other => other.to_uppercase(),
     }

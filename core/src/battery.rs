@@ -55,7 +55,7 @@ pub fn last() -> Option<i32> {
 
 /// 辅助程序的位置：bundle 里的 Contents/MacOS/battprobe，
 /// 开发时退回 /tmp（package.sh 会编到 bundle 里）
-fn probe_path() -> Option<PathBuf> {
+pub(crate) fn probe_path() -> Option<PathBuf> {
     // 诊断用：指向另一份新编的 battprobe，省得为改 helper 整包重签。蓝牙授权归责到
     // 父进程（FireVibe.app），helper 在不在 bundle 里都行。
     if let Ok(p) = std::env::var("FIREVIBE_PROBE") {
@@ -134,9 +134,15 @@ pub fn set_target(name_contains: &str) {
     }
 }
 
-/// 起一个后台线程定时读。`every_secs` 建议 300（电量变化慢，别频繁连蓝牙）。
-/// 读哪台设备看 `set_target()`，每轮重新取 —— 中途换遥控器也能跟上。
-pub fn spawn_tracker(every_secs: u64) {
+/// 起一条后台线程周期读电量。读哪台设备看 `set_target()`，每轮重新取 ——
+/// 中途换遥控器也能跟上。
+///
+/// `should_read` 是闸门：返回 false 就跳过这一轮，一个字节都不发。
+/// ⚠️ **别再无条件轮询**：每一轮都是一次 fork + 完整的 GATT 连接（扫描 → connect →
+/// 读 0x2A19 → 断开）。原来是 5 分钟一轮、连没连都读，一天 288 次连接活动
+/// 全砸在一支纽扣电池上，而电量本来就变得很慢。遥控器断开时更糟：每轮白扫 8 秒
+/// 才超时退出。
+pub fn spawn_tracker(every_secs: u64, should_read: Box<dyn Fn() -> bool + Send>) {
     if probe_path().is_none() {
         eprintln!("[batt] 没找到 battprobe，跳过电量读取");
         return;
@@ -189,7 +195,7 @@ pub fn spawn_tracker(every_secs: u64) {
             loop {
                 let g = GEN.load(Ordering::Relaxed);
                 let want = TARGET.lock().ok().map(|t| t.clone()).unwrap_or_default();
-                if !want.is_empty() {
+                if !want.is_empty() && should_read() {
                     if let Some(v) = read_blocking(&want) {
                         eprintln!("[batt] 蓝牙读到 {v}%（{want}）");
                     } else {

@@ -149,4 +149,4 @@ cargo build --release -p firevibe-cli  # 产物叫 firectl
 cp target/release/firectl "$(dirname "$APP")/firectl"
 
 echo "好了：$APP"
-echo "拖到 /Applications，然后到 系统设置 › 隐私与安全性 › 输入监控 里勾上它。"
+echo "拖到 /Applications，然后到 系统设置 › 隐私与安全性 › 辅助功能 里勾上它。"

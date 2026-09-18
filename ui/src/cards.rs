@@ -14,8 +14,10 @@ use gpui_component::input::InputState;
 impl FireVibe {
     pub fn action_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let l = self.l();
-        let slots: Vec<Slot> =
+        let mut slots: Vec<Slot> =
             self.rt.cfg.read().profile().actions.iter().map(|a| a.slot).collect();
+        // 按遥控器上的实体顺序排（自上而下），不管当初添加的先后。
+        slots.sort_by_key(|s| s.order());
 
         let mut grid = div().flex().flex_col().gap(px(14.));
         // 设计稿是 2 列等宽等高栅格 —— gpui 没有 grid，按两两一行铺，
@@ -320,8 +322,18 @@ impl FireVibe {
             );
         }
 
-        // 淡入淡出：t 极小就干脆不画，避免看不见还能点
-        let mut acts = div().flex().items_center().gap(px(4.)).flex_none().opacity(t);
+        // 淡入淡出：t 极小就干脆不画，避免看不见还能点。
+        // ⚠️ 宽度**固定**（两颗 26px 按钮 + gap = 56）、内容右对齐：操作按钮平时透明
+        // 但照样占位，`body` 的可用宽度就不随 hover 抖动了 —— 否则 hover 一出按钮、
+        // body 骤然变窄，第二行 text_ellipsis 会把短文本（如方案名 Tank）截成 Tan。
+        let mut acts = div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(4.))
+            .flex_none()
+            .w(px(56.))
+            .opacity(t);
         if t > 0.02 {
             if !empty {
                 acts = acts.child(
@@ -621,14 +633,39 @@ pub fn kind_icon(k: ActionType) -> Option<&'static str> {
         ActionType::VoiceDictate => "mic",
         ActionType::Record => "mic",
         ActionType::IrBlast => "tv",
+        ActionType::SwitchProfile => "copy",
     })
 }
 
 /// 卡片上两行文案：(主行, 副行)。跟设计稿逐字对齐。
 /// 按键名 → 好看的符号。卡片上写 `rightcontrol` 太丑，写「右⌃」一眼就懂。
+/// 标点类键名 → 键面符号。配置里 `]` 和 `rightbracket` 两种写法都可能出现。
+pub fn punct_label(key: &str) -> Option<&'static str> {
+    Some(match key.to_ascii_lowercase().as_str() {
+        "leftbracket" | "[" => "[",
+        "rightbracket" | "]" => "]",
+        "semicolon" | ";" => ";",
+        "quote" | "'" => "'",
+        "comma" | "," => ",",
+        "period" | "." => ".",
+        "slash" | "/" => "/",
+        "backslash" | "\\" => "\\",
+        "grave" | "`" => "`",
+        "minus" | "-" => "-",
+        "equal" | "=" => "=",
+        _ => return None,
+    })
+}
+
 pub fn key_label(key: &str, l: crate::i18n::L) -> String {
     let ml = l.mod_left();
     let mr = l.mod_right();
+    // 标点键：配置里可能存 `]` 字面量，也可能存 `rightbracket`（注入层两种都认，
+    // 见 inject/macos.rs 的别名表）。显示统一成键面上印的符号 —— 不然同一个键
+    // 会一会儿显示 `]`、一会儿显示 `RIGHTBRACKET`。
+    if let Some(sym) = punct_label(key) {
+        return sym.into();
+    }
     match key.to_ascii_lowercase().as_str() {
         "leftcmd" | "cmd" | "command" => format!("{ml}⌘"),
         "rightcmd" => format!("{mr}⌘"),
@@ -717,6 +754,14 @@ pub fn describe(a: &Action, l: crate::i18n::L) -> (String, String) {
                 l.dsc_dictate_tap().into()
             },
         ),
+        ActionType::SwitchProfile => (
+            l.switch_profile_target().into(),
+            match a.arg.as_str() {
+                "" | "next" => l.switch_profile_next().into(),
+                "prev" => l.switch_profile_prev().into(),
+                name => name.to_string(),
+            },
+        ),
         ActionType::VoiceHotkey => {
             let mode = match a.arg.as_str() {
                 "hold" => l.dsc_mode_hold(),
@@ -763,6 +808,19 @@ pub fn new_line_input(
 ) -> gpui::Entity<InputState> {
     let t = text.to_string();
     cx.new(|cx| InputState::new(window, cx).default_value(t))
+}
+
+/// 单行输入框 + 占位提示。占位在框空时显示灰字（如重试次数的「0」），
+/// 用户点进去直接输入，不用先删掉一个实心的默认值。
+pub fn new_line_input_ph(
+    text: &str,
+    placeholder: &str,
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+) -> gpui::Entity<InputState> {
+    let t = text.to_string();
+    let p = placeholder.to_string();
+    cx.new(|cx| InputState::new(window, cx).placeholder(p).default_value(t))
 }
 
 /// 给编辑弹窗用：从 EditState 造回 Action
