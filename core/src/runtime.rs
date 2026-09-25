@@ -997,6 +997,15 @@ impl Runtime {
                 // 「音频来了却没看到按下」= 睡醒后第一下按住、按下报文丢在重连空档里，
                 // 用音频这个事实把会话补开。热麦克风持续出流，绝不能跑这个（会卡住）。
                 let mut implied: Option<(crate::config::Action, Instant)> = None;
+                // 会话开始的时刻，配下面那条硬上限用
+                let mut implied_since: Option<Instant> = None;
+                // ⚠️⚠️ 隐式会话的**硬上限**。没有它，一台被**误判成 PTT 的热麦克风**会让
+                // 会话永远收不了针：收针条件是「音频停 400ms」，而热麦克风的流根本不停 ——
+                // 闸门就此永久打开，HUD 一直挂着「麦克风已开」、电平一直动；更糟的是判成
+                // PTT 还会**关掉自愈关麦**，没有任何人来救。用户实际撞上过
+                //（原厂 0x0421 被探测误判成 PTT）。
+                // 真的按住说话不会超过这个时长；超了就是判型错了，强制收针并关麦。
+                const IMPLIED_MAX: Duration = Duration::from_secs(30);
                 // 连按下报文带音频一起到的场景里，别抢在按下报文前面开会话：
                 // 攒满 3 帧（约 60ms）还没见到按下才算数
                 let mut implied_warmup: u8 = 0;
@@ -1101,11 +1110,31 @@ impl Runtime {
                     // （PTT 遥控器松键即停流，这个判据很硬）
                     if implied.as_ref().is_some_and(|(_, t)| Instant::now() >= *t) {
                         let (a, _) = implied.take().unwrap();
+                        implied_since = None;
                         implied_warmup = 0;
                         let r = implied_session(
                             &cfg, &status, &inj, &dictating, &tx, &voice, &prev_input, &a, false,
                         );
                         eprintln!("[firevibe] 音频停了 —— 隐式按住会话结束（{r}）");
+                    } else if implied_since.is_some_and(|t| t.elapsed() > IMPLIED_MAX) {
+                        // 音频一直不停 = 这台压根不是 PTT。强制收针 + 关麦，并把原因说清楚。
+                        let (a, _) = implied.take().unwrap();
+                        implied_since = None;
+                        implied_warmup = 0;
+                        let r = implied_session(
+                            &cfg, &status, &inj, &dictating, &tx, &voice, &prev_input, &a, false,
+                        );
+                        if let Err(e) = dev.write(&MIC_OFF) {
+                            eprintln!("[firevibe] 强制收针时关麦写失败：{e}");
+                        }
+                        let m = format!(
+                            "隐式按住会话超过 {}s 音频还没停 —— 已强制收针并关麦。\
+                             音频不停说明这台是热麦克风却被判成了「按住说话」，\
+                             去 设置 › 麦克风类型 改成「热麦克风」（{r}）",
+                            IMPLIED_MAX.as_secs()
+                        );
+                        eprintln!("[firevibe] {m}");
+                        let _ = tx.send(Event::Log(m));
                     }
                     // 外面递进来的 OUTPUT 报文（--probe-all 的三轮对照用来试开麦）
                     {
@@ -1330,6 +1359,7 @@ impl Runtime {
                                                 a,
                                                 Instant::now() + Duration::from_millis(400),
                                             ));
+                                            implied_since = Some(Instant::now());
                                         }
                                         implied_warmup = 0;
                                     }
