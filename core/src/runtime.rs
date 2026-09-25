@@ -972,6 +972,20 @@ impl Runtime {
                 const PROBE_WRITE_FAILS_MAX: u8 = 5;
                 let mut probe_until: Option<Instant> = None;
                 // 首轮和重试走同一条路：到点就试着写 MIC_ON，写成功才开窗口
+                // ⚠️ **原厂（0x0171/0x0421）不探测，直接按型号定成 Hot**：它支持发命令开麦，
+                // 是硬件事实。而冷发 MIC_ON（遥控器刚连上、没人碰过）常常测不到流 ——
+                // 探测会把它误判成 Ptt 并永久落盘，还连带关掉闲时自动断链。
+                // 探测只留给未知型号；用户手动指定永远优先（这里只在 Unknown 时才动）。
+                if cfg.read().settings.mic_model == crate::config::MicModel::Unknown
+                    && cfg.read().is_factory_remote()
+                {
+                    let mut c = cfg.write();
+                    c.settings.mic_model = crate::config::MicModel::Hot;
+                    let _ = c.save();
+                    drop(c);
+                    let _ = tx.send(Event::Log("开麦模型：原厂遥控器 —— 热麦克风（按型号直接判定，不探测）".into()));
+                    let _ = tx.send(Event::MicModelProbed);
+                }
                 let mut probe_next: Option<Instant> =
                     (cfg.read().settings.mic_model == crate::config::MicModel::Unknown)
                         .then(Instant::now);
@@ -999,13 +1013,15 @@ impl Runtime {
                 let mut implied: Option<(crate::config::Action, Instant)> = None;
                 // 会话开始的时刻，配下面那条硬上限用
                 let mut implied_since: Option<Instant> = None;
-                // ⚠️⚠️ 隐式会话的**硬上限**。没有它，一台被**误判成 PTT 的热麦克风**会让
-                // 会话永远收不了针：收针条件是「音频停 400ms」，而热麦克风的流根本不停 ——
-                // 闸门就此永久打开，HUD 一直挂着「麦克风已开」、电平一直动；更糟的是判成
-                // PTT 还会**关掉自愈关麦**，没有任何人来救。用户实际撞上过
-                //（原厂 0x0421 被探测误判成 PTT）。
-                // 真的按住说话不会超过这个时长；超了就是判型错了，强制收针并关麦。
-                const IMPLIED_MAX: Duration = Duration::from_secs(30);
+                // ⚠️ 隐式会话的**硬上限**：纯兜底。
+                // 收针条件是「音频停 400ms」—— 而**任何「等某个信号停下来」的条件，都要问
+                // 一句「那个信号会不会永远不停」**。真停不下来时（设备固件异常、判型判反、
+                // 或者哪天冒出个开着就一直吐流的型号），闸门会永久打开：HUD 一直挂着
+                // 「麦克风已开」、系统默认输入一直停在虚拟声卡上，而且没有任何人来救。
+                //
+                // ⚠️ 取值只按「不能误伤真实使用」来定，**别往短了调**：这是 PTT 的按住时长，
+                // 用户念一整段长文完全可能几十秒。2 分钟远超任何正常按住，又能兜住死锁。
+                const IMPLIED_MAX: Duration = Duration::from_secs(120);
                 // 连按下报文带音频一起到的场景里，别抢在按下报文前面开会话：
                 // 攒满 3 帧（约 60ms）还没见到按下才算数
                 let mut implied_warmup: u8 = 0;
@@ -1128,9 +1144,9 @@ impl Runtime {
                             eprintln!("[firevibe] 强制收针时关麦写失败：{e}");
                         }
                         let m = format!(
-                            "隐式按住会话超过 {}s 音频还没停 —— 已强制收针并关麦。\
-                             音频不停说明这台是热麦克风却被判成了「按住说话」，\
-                             去 设置 › 麦克风类型 改成「热麦克风」（{r}）",
+                            "按住说话会话超过 {}s 音频还没停 —— 已强制收针并关麦。\
+                             正常按住不会这么久；若反复出现，去 设置 › 麦克风类型 \
+                             拨回「自动」重新判一次（{r}）",
                             IMPLIED_MAX.as_secs()
                         );
                         eprintln!("[firevibe] {m}");
@@ -1161,10 +1177,16 @@ impl Runtime {
                         mic_was = mic_now;
                         last_ka = Instant::now();
                     }
-                    // keepalive：麦克风开着时每秒重发一次 MIC_ON。
-                    // 不补的话说着说着流会断。
+                    // keepalive：麦克风开着时每秒重发一次 MIC_ON。不补的话说着说着流会断。
+                    //
+                    // ⚠️ **必须保留**：第三方语音工具收尾有延时，中途断流会把尾音吃掉。
+                    // 它带来的副作用（设备被续命、音频不停）不在这儿解决 ——
+                    // 靠「麦克风键一松开就收会话」那条按键信号解决，见上面 released 那段。
                     if mic_now && last_ka.elapsed() >= Duration::from_secs(1) {
-                        let _ = dev.write(&MIC_ON);
+                        // 写失败要看得见（对设备的写一律看返回值）
+                        if let Err(e) = dev.write(&MIC_ON) {
+                            eprintln!("[mic] keepalive 开麦失败：{e}");
+                        }
                         last_ka = Instant::now();
                     }
                     // 实验保活（见上面 keepalive 的注释）。开麦期间不需要 ——
@@ -1448,6 +1470,29 @@ impl Runtime {
                                     } else {
                                         p.remove(&k);
                                     }
+                                }
+                                // ⚠️ 麦克风键一松开就**立刻**收掉隐式按住会话，
+                                // 不再等那个间接信号「音频停 400ms」。
+                                // 按键是最直接的信号；而等音频停是推断 —— 我们自己每秒补发的
+                                // MIC_ON keepalive（为第三方工具收尾延时而保留）会把设备续着命
+                                // 继续出流，那个推断就永远等不到：电平 HUD 一直挂着
+                                // 「麦克风已开」、音频还在动。用户实测撞上（2026-09-25）。
+                                // 「音频停 400ms」那条仍然留着兜底 —— 按下报文丢在重连空档里时
+                                // 我们同样看不到松开，那时只能靠它。
+                                if !down
+                                    && implied.is_some()
+                                    && cfg.read().slot_key(crate::layout::Slot::Mic) == Some(k)
+                                {
+                                    let (a, _) = implied.take().unwrap();
+                                    implied_since = None;
+                                    implied_warmup = 0;
+                                    let r = implied_session(
+                                        &cfg, &status, &inj, &dictating, &tx, &voice,
+                                        &prev_input, &a, false,
+                                    );
+                                    eprintln!(
+                                        "[firevibe] 麦克风键松开 —— 隐式按住会话结束（{r}）"
+                                    );
                                 }
                                 if learn.load(Ordering::Relaxed) {
                                     if down {

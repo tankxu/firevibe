@@ -625,7 +625,7 @@ impl Default for Settings {
 // ---------------- 顶层配置 ----------------
 /// 配置结构版本。加一次就会触发一次迁移。
 /// 1 = 21 个 HID usage 全部实测完成，旧文件里的猜测值必须刷掉
-pub const SCHEMA: u32 = 4;
+pub const SCHEMA: u32 = 5;
 /// 使用统计（持久化在配置里）。动作真执行时累加，按天记活跃。
 /// 一台遥控器的电量历史。统计页按设备各画一条曲线。
 ///
@@ -817,6 +817,18 @@ pub fn config_path() -> PathBuf {
 impl Config {
     /// 要打开的遥控器 USB 标识。配置里填了就用配置的，否则用实测那款的默认值。
     /// 容忍 "0x0171" / "0171" / "371"（十进制）几种写法。
+    /// 这台是不是**原厂**遥控器（`0x0171/0x0421`）。
+    ///
+    /// 原厂支持「发命令直接开麦」，不是按住才出流 —— 这是硬件事实，不需要探测。
+    /// ⚠️ 探测那条路在原厂上会误判成 PTT：`MIC_ON` 冷发（遥控器刚连上、没人碰过）
+    /// 常常测不到流，于是一次误判定终身，还会连带关掉闲时自动断链。
+    /// 所以原厂直接按型号给结论，探测只留给未知型号。
+    /// ⚠️ 仿品会借用合法 PID —— 但仿品借的是 `0x0425`，和这条不冲突；
+    /// 真撞上了用户可以在设置里手动指定，手动永远优先。
+    pub fn is_factory_remote(&self) -> bool {
+        self.device_ids() == (crate::device::VID, crate::device::PID)
+    }
+
     pub fn device_ids(&self) -> (u16, u16) {
         fn parse(v: &Option<String>, fallback: u16) -> u16 {
             let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
@@ -947,6 +959,13 @@ impl Config {
                         c.active += 1;
                     }
                 }
+            }
+            // schema 5：原厂遥控器（0x0171/0x0421）支持发命令开麦，不是 PTT。
+            // 旧版的探测会在「冷发 MIC_ON」时测到 0 帧、把它判成 Ptt 并永久落盘 ——
+            // 那不只让麦克风提示语说错话，还把**闲时自动断链**整个关掉了
+            //（那条判据是 `is_ptt` 就跳过）。这里一次性纠正。
+            if c.schema < 5 && c.settings.mic_model == MicModel::Ptt && c.is_factory_remote() {
+                c.settings.mic_model = MicModel::Hot;
             }
             c.schema = SCHEMA;
         }

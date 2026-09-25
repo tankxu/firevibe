@@ -1791,11 +1791,14 @@ impl FireVibe {
     /// - 断开后**必须保持自动重连**（`want_retry` 恒为 true）——否则用户按键唤醒、
     ///   macOS 都把它连回来了，FireVibe 那边还是「未连接」，只能手动点
     fn poll_idle_sleep(&mut self) {
-        let (mins, is_ptt) = {
-            let c = self.rt.cfg.read();
-            (c.settings.idle_sleep_min, c.settings.mic_model.is_ptt())
-        };
-        if mins == 0 || is_ptt || !self.connected() {
+        let mins = self.rt.cfg.read().settings.idle_sleep_min;
+        // ⚠️ 这里**不再看 `mic_model`**。当初加 `is_ptt` 跳过，理由是「仿品 8 秒就自己断链、
+        // 不用我们管」—— 但那是拿「开麦方式」去代理「会不会自己断链」，两件不相干的事。
+        // 后果：原厂遥控器一旦被探测误判成 Ptt，这个功能就**整个静默关掉**，
+        // 界面上还照样显示着「30 分钟」。用户实测撞上（几小时不动，链路一直在）。
+        // 现在由 `idle_sleep_min`（0 = 不休眠）单独决定；对真会自己断链的遥控器也无害 ——
+        // 下面 `!self.connected()` 已经挡住了，真断了 `btlink::disconnect` 也只回 `Already`。
+        if mins == 0 || !self.connected() {
             return;
         }
         if !firevibe_core::tray::is_hidden() {
