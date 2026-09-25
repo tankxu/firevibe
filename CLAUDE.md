@@ -39,13 +39,63 @@
 - **验证「装的是不是刚构建的」**。`open -a` 遇到已在运行的实例只会激活它，
   不会重启 —— 我据此误判过。用 `ps -o lstart` 看进程启动时间。
 - **`strings` 找不到中文字面量**（macOS 的 `strings` 对这个二进制不管用），
-  用 `grep -a` 做字节级搜索。
+  用 **`LC_ALL=C grep -a`** 做字节级搜索。⚠️ **`LC_ALL=C` 不能省**：UTF-8 locale 下
+  grep 碰到二进制里的非法字节序列会跳过整段，中文字面量**一个都搜不到、还静默返回 0**
+  —— 看着就像「改动没进去」。判据：先拿一个**你确定存在**的老字符串试一次，
+  它要是也搜不到，那就是 locale 的问题，不是构建的问题。（栽过一次。）
 - **窗口不在前台时 gpui 暂停绘制**，`CGWindowListCreateImage` 会返回**旧帧**。
   截图前先激活窗口，否则会误判「改动没生效」。
 - **合成点击对这个 app 不稳**，别在上面耗时间。项目里有 `FIREVIBE_BOOT=`
   启动开关，直接把界面摆到目标状态再截图。
 
 ## 三、TCC / 权限（错一次就白折腾半天）
+
+- **「辅助功能」这一项在 macOS 27 上已经改名**：英文 `Accessibility` →
+  **`Device Control and Data Access`**，中文「辅助功能」→**「设备控制和数据访问」**。
+  内部标识全都没变（URL 锚点仍是 `Privacy_Accessibility`，`tccutil` 服务名仍是
+  `Accessibility`，API 仍是 `AXIsProcessTrusted`）—— 变的只有给用户看的那个词。
+  用户按我们旧文案在设置里**找不到那一项**，真卡住过。
+  → **别在文案里写死名字，也别写「旧版叫 X」那种括注**。`core/src/syslabel.rs`
+  直接问系统要：`plutil -extract <lang>.ACCESSIBILITY raw -o - <隐私面板的 Localizable.loctable>`。
+  这样和用户屏幕上永远一致，系统再改名也自动跟上，**且不用猜改名发生在哪个大版本**
+  （阈值猜错就又错一轮）。
+  ⚠️ **别去查 `AccessibilitySettingsExtension.appex`** —— 那是 VoiceOver/缩放那个
+  *辅助功能设置面板*（它确实叫「无障碍」），和隐私里这一行是两回事。我按它得出过
+  「改叫无障碍」的错误结论。要查就查 `SecurityPrivacyExtension.appex` 的
+  `Localizable.loctable`，key 是 `ACCESSIBILITY`。
+  顺带：该面板的锚点全集用 `LC_ALL=C strings -a … | grep ^Privacy_` 能列出来，
+  `Privacy_ListenEvent`（输入监控）**已不在其中**。
+
+- **授权给上之后，app 会自己重启，别再让用户「完全退出再重开」**
+  （`ui/src/main.rs::poll_perm_granted` + `relaunch_after_quit`）。
+  为什么非重启不可：`AXIsProcessTrusted()` 是**实时**的（首次引导那个对勾就靠它），
+  但 **HID 通路的 TCC 判定是进程打开设备时定下的**，被拒过的进程再重试还是拒。
+  ⚠️ **触发条件必须是「本进程亲眼见过被拒 → 现在有了」这个跃迁**，且要求本进程确实
+  因权限报过错（`HID_NOT_PERMITTED`）。**不能**写成「有授权却还在报缺权限就重启」——
+  哪天报错另有原因，那条件每次启动都成立，就是**无限重启循环**。
+  ⚠️ 重启走 `open <app路径>`，且**必须先 `kill -0` 轮询等旧进程真的没了**：
+  `open` 碰到还在跑的实例只激活不重启，会变成「退出了但没起来」。
+  也不能 exec 自己 —— TCC 归责到发起进程，得让 LaunchServices 以 app 身份拉起。
+  （从 `target/debug/firevibe-ui` 裸跑时没有 bundle，会跳过自动重启。）
+
+- ★★★ **撤销授权会把整机输入卡死 —— CGEventTap 必须主动退出事件链**（2026-09-25，用户撞上）。
+  症状：在系统设置里关掉 FireVibe 的授权，**点击和键盘立刻全失灵、只有光标还能动**，
+  强杀 app 才恢复。看着像触控板坏了，其实是我们的 tap。
+  机制：tap 的 mach port 注册在 WindowServer 会话链的**队首**（要 `PLACE_HEAD` 才能吞
+  事件）。本进程一旦服务不了它（授权没了 / run loop 停了），WindowServer 等不到回复，
+  **整条会话事件队列就卡住**；光标照动是因为它由 WindowServer 自己画。
+  三处都修了，缺一不可：
+  1. `Tap::stop()` 以前**只调 `CFRunLoopStop`**，port 还挂在链上没人服务 —— 现在先
+     `CGEventTapEnable(false)`（任何线程都能调，立刻退出事件链），再停 run loop，
+     再在 tap 线程上 `CFRunLoopRemoveSource` + `CFMachPortInvalidate` + `CFRelease`。
+     ⚠️ `rl` 要 `take()`：线程退出后那个 CFRunLoopRef 就失效了，而 `Drop` 还会再调一次
+     `stop()` —— 留着就是对已释放的 run loop 再来一发。
+  2. 回调里 `kCGEventTapDisabledByTimeout/UserInput` 以前只写「调用方应重新 enable」，
+     **而根本没有调用方会做** → 一超时按键屏蔽就静默永久失效（麦克风键重新弹 Spotlight）。
+     现在自己 re-enable，**但没授权时绝不 re-enable**（那等于把上面那个卡死再造一次）。
+  3. `ui/src/main.rs::poll_perm_lost()`：`AXIsProcessTrusted()` 一变 false 就
+     `rt.stop_tap()`。不用记「之前有没有授权」——`stop_tap()` 拿不到 tap 时返回 false，
+     天然只做一次。
 
 - **绝不从 shell 直接跑 `.app/Contents/MacOS/` 里的可执行文件。**
   TCC 把权限归责到**父进程**（shell），进程会被 `__TCC_CRASHING_DUE_TO_PRIVACY_VIOLATION__`
@@ -333,9 +383,30 @@ AppKit 透明标题栏的真实拖拽区，不是 window_control_area 起作用�
 开麦模型只能连上后实测 —— 两件 FireVibe 都自己做。
 
 ### app 自己认型号
-`Runtime` 的 HID 线程起来时，若 `settings.mic_model == Unknown` 就探一次：
-**没人碰遥控器时发 `MIC_ON`，看 1.5 秒内出不出流**。出流 = `Hot`，不出 = `Ptt`。
+`Runtime` 的 HID 线程起来时，若 `settings.mic_model == Unknown` 就探：
+**没人碰遥控器时发 `MIC_ON`，看 1.5 秒内出不出流**。出流 = `Hot`，不出 = 再试。
 结果存 `settings.mic_model`，换设备时（`pick_device`）置回 `Unknown` 重探。
+
+❗ **证据是不对称的，逻辑必须跟着不对称**（2026-09-25 修，栽过）：
+
+| 观察 | 能推出什么 |
+|---|---|
+| 收到帧 | **热麦克风的确证** —— PTT 没人按住绝不出流。一轮就能定论 |
+| 收不到帧 | **什么都推不出** —— 可能是 PTT，也可能遥控器睡着、`MIC_ON` 没写出去、没授权被 TCC 拒 |
+
+早先是「一个 1.5 秒窗口收不到帧就判 `Ptt` 并立刻落盘」，而落盘后永不重探
+（只有换设备才清）—— **一次误判定终身**。真实事故：授权还没给全时 `SetReport`
+被拒（`0xE00002E2`），`MIC_ON` 压根没发出去，**原厂 0x0421 热麦克风被判成了 PTT**，
+界面上「麦克风类型」和「闲置后让遥控器休眠」两处跟着一起说错话
+（后者那句「你这支遥控器会自己休眠」也是按 `mic_model` 给的）。
+
+现在的规则：**写失败不开窗口**（`dev.write(&MIC_ON)` 的返回值必须看 —— 又一次印证
+「对设备的写一律看返回值」）、**探测期间有按键就作废重来**（按住时 PTT 也出流，
+会被误判成 Hot）、**连着 3 轮干净的 0 帧才判 `Ptt`**；`MIC_ON` 一直写不出去就
+**保持 `Unknown`**（界面显示「自动」），绝不拿写失败当 PTT 的证据。
+
+⚠️ 用户手动在设置里指定的类型是权威的，会直接覆盖探测结果 —— 判错了先让用户点一下，
+别让他等重探。
 
 ⚠️ 判成 Ptt 之后**照样继续发 MIC_ON/keepalive** —— 对 PTT 无害，万一判错
 （探测时遥控器正好睡着）也不会把热麦克风弄瘫。判型只用来：关掉那个没意义的
@@ -803,6 +874,45 @@ not connected），而且**不碰遥控器它就一直断着**，macOS 不会自
    重连 2s + 检查 4s），而 battprobe 原来沿用读电量那个 **8 秒**兜底，会抢在流程完成前
    `exit(5)` —— 表现成**「报失败但设备其实断开了」**，极具误导性。现在断链模式单独用
    18 秒（父进程 `btlink.rs` 超时 20 秒）。
+
+## ★★★ 菜单栏那颗黄点：环回声卡的**输出**流就会点亮它（2026-09-25 结案）
+
+**症状**：用户没说话，隐私指示器却一直亮着，还「一缩小马上又放大」。
+
+**机制**：FireVibe Mic 是 BlackHole 那种**输入输出同在一台设备**的环回声卡。
+我们一开它的**输出**流，驱动的输入侧跟着在跑，coreaudiod 就判定这个进程在用麦克风。
+而 `VoiceSink` 以前是建好就用专属线程**永久持有**那条流（`while !stop { sleep }`），
+于是 app 开着黄点就一直亮，跟用不用语音完全无关。
+
+**对照实验**（`core/examples/micdot.rs`，换遥控器/查指示器都能复用）：
+
+```
+cargo run --release -p firevibe-core --example micdot -- sink    # ← 只有它点亮
+cargo run --release -p firevibe-core --example micdot -- enum    # 纯设备枚举，不亮
+cargo run --release -p firevibe-core --example micdot -- switch  # 切默认输入，不亮
+```
+
+**修法**：流改成**按需开**，闸门用 `sink.passing`（它本来就是「该不该往声卡送音频」，
+`push_pcm` 在它为假时直接丢弃）。关流带 3 秒宽限期 —— 说话中的停顿反复拆建的话，
+指示器一闪一闪比常亮还碍眼。开流期间进来的 PCM 落在 ring 里（250ms 上限、
+溢出丢最旧），所以开头不会被丢。
+
+⚠️ **启动时会闪一下黄点，是故意的**：`VoiceSink::start` 里先真开一次流再立刻关掉，
+用来确认设备打得开。不这么做，`ensure_voice()` 就会在开不了流的情况下也报
+「语音链路已建立」—— 这种谎报的就绪状态在这个项目里栽过好几次。
+
+⚠️ **「停摆」判据必须用 `sink.passing()`，不能用 `mic_on || dictating`**：
+听写走的是另一条路（直接吃遥控器 PCM 做识别，不往声卡送），但它**也会置 `mic_on`**。
+流按需开之后，用 mic_on 当判据会让听写期间 `out_frames` 不动 → 800ms 后误判停摆
+→ 每 3 秒把语音链路拆了重建。同理，不送流期间必须把 `out_frames_at` 一直往前推，
+否则刚开口那一瞬 elapsed 已经是几分钟，当场被判停摆。
+
+⚠️ **别再把「每 N 秒轮询一次设备」当成无害的**。`loopback_status()` 那条轮询
+（cpal `host.devices()` + 逐个 `default_output_config()`）**本身不开流、不点亮指示器**
+（cpal 0.15.3 的 `default_config` 只有一次 `AudioObjectGetPropertyData`），但它会让
+指示器胶囊跟着重绘，看着像在闪，把人往错误方向带。现在声卡就绪后轮询间隔放到 30 秒
+（没就绪仍是 3 秒，好让用户装完驱动尽快看到变化）。要更干净就上
+`AudioObjectAddPropertyListener` 监听 `kAudioHardwarePropertyDevices`。
 
 ## 配置文件必须原子写
 

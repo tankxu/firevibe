@@ -296,12 +296,16 @@ impl Injector for MacInjector {
     }
 
     fn why(&self) -> String {
+        // 这一项的显示名跟系统走：macOS 27 起它叫「设备控制和数据访问」
+        // (Device Control and Data Access)。见 crate::syslabel。
+        let name = crate::syslabel::accessibility().unwrap_or("辅助功能");
         if self.available() {
-            "辅助功能权限已授予".into()
+            format!("「{name}」权限已授予")
         } else {
-            "缺少「辅助功能」(Accessibility) 权限。\n\
-             系统设置 > 隐私与安全性 > 辅助功能 > 勾上本应用，然后完全退出再打开。"
-                .into()
+            format!(
+                "缺少「{name}」权限。\n\
+                 系统设置 > 隐私与安全性 > {name} > 勾上本应用，然后完全退出再打开。"
+            )
         }
     }
 

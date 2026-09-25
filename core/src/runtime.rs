@@ -782,6 +782,9 @@ impl Runtime {
             *self.descriptor.lock() = dbuf[..n].to_vec();
         }
         self.status.connected.store(true, Ordering::Relaxed);
+        // ⚠️ serial 要留着给读线程记电量曲线用（按设备分开存），所以这里 clone
+        let batt_sn = serial.clone();
+        let batt_name = product.clone();
         let _ = self.tx.send(Event::Connected {
             product: product.clone(),
             serial,
@@ -884,6 +887,8 @@ impl Runtime {
         let recording = self.recording.clone();
         let stop = self.stop.clone();
         let tx = self.tx.clone();
+        let batt_sn = batt_sn.clone();
+        let batt_name = batt_name.clone();
         // 计数在 spawn 之前加 —— 线程体里才加的话，spawn 到跑起来之间
         // 下一次 start() 会以为没人活着，又开一遍同一个设备。
         self.hid_threads.fetch_add(1, Ordering::SeqCst);
@@ -953,14 +958,28 @@ impl Runtime {
                 // ⚠️ 判成 PTT 之后**照样继续发 MIC_ON/keepalive** —— 对 PTT 无害，
                 // 而万一判错（比如探测时遥控器正好睡着了）也不会把热麦克风弄瘫。
                 // 判型只用来关掉那个没意义的自愈关麦、和在界面上提醒绑定方式。
-                let mut probe_until: Option<Instant> =
-                    if cfg.read().settings.mic_model == crate::config::MicModel::Unknown {
-                        let _ = dev.write(&MIC_ON);
-                        Some(Instant::now() + Duration::from_millis(1500))
-                    } else {
-                        None
-                    };
+                // ⚠️⚠️ **证据是不对称的，逻辑必须跟着不对称**：
+                //   收到帧   = 热麦克风的**确证**（PTT 没人按住绝不出流）→ 立刻定论
+                //   收不到帧 = **没有证据**，可能是 PTT，也可能是遥控器睡着了、
+                //              MIC_ON 根本没写出去、或者没授权被 TCC 拒
+                // 以前这里是「一个 1.5 秒窗口收不到帧就判 PTT 并立刻落盘」，
+                // 而落盘之后永远不再重探（只在换设备时清）—— 一次误判定终身。
+                // 真实事故：授权还没给全的时候 SetReport 被拒（0xE00002E2），
+                // MIC_ON 压根没发出去，原厂 0x0421 热麦克风被判成了 PTT，
+                // 界面上「麦克风类型」和「闲置休眠」两处跟着一起说错话。
+                // 现在：写失败不开窗口、期间有按键作废重来、连着 3 轮干净的 0 帧才判 PTT。
+                const PROBE_TRIES: u8 = 3;
+                const PROBE_WRITE_FAILS_MAX: u8 = 5;
+                let mut probe_until: Option<Instant> = None;
+                // 首轮和重试走同一条路：到点就试着写 MIC_ON，写成功才开窗口
+                let mut probe_next: Option<Instant> =
+                    (cfg.read().settings.mic_model == crate::config::MicModel::Unknown)
+                        .then(Instant::now);
                 let mut probe_frames = 0u32;
+                let mut probe_tries = 0u8;
+                let mut probe_write_fails = 0u8;
+                // 探测期间有人碰遥控器 → 这轮作废：PTT 被按住时也出流，会被误判成热麦克风
+                let mut probe_tainted = false;
 
                 // 实验开关：FIREVIBE_KEEPALIVE=<秒> 时每隔几秒发一条无害命令
                 //（关麦，两派遥控器闲置时都等于空操作），试试 ATT 流量能不能
@@ -997,32 +1016,86 @@ impl Runtime {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    // 探测窗口到点：收针、判型、落盘
+                    // 开一轮探测（首轮和重试同一条路）。
+                    // ⚠️ **必须看 write 的返回值**：没授权时 SetReport 会被 TCC 拒，
+                    // 命令根本没到遥控器 —— 这时候开窗口必然 0 帧，等于凭空造出
+                    // 一个「PTT」的假证据。（对设备的写一律看返回值，这条栽过两次了。）
+                    if probe_next.is_some_and(|t| Instant::now() >= t) {
+                        probe_next = None;
+                        match dev.write(&MIC_ON) {
+                            Ok(_) => {
+                                probe_frames = 0;
+                                probe_tainted = false;
+                                probe_until = Some(Instant::now() + Duration::from_millis(1500));
+                            }
+                            Err(e) => {
+                                probe_write_fails += 1;
+                                eprintln!(
+                                    "[firevibe] 判开麦模型：MIC_ON 写失败（{e}），                                     第 {probe_write_fails} 次，不开窗口"
+                                );
+                                if probe_write_fails < PROBE_WRITE_FAILS_MAX {
+                                    probe_next = Some(Instant::now() + Duration::from_secs(3));
+                                } else {
+                                    // 一直写不出去就**保持 Unknown**（界面显示「自动」），
+                                    // 绝不拿写失败当 PTT 的证据。下次连上会重探。
+                                    let m = "开麦模型：开麦命令一直写不出去，暂不判型 ——                                              多半是权限没给全".to_string();
+                                    eprintln!("[firevibe] {m}");
+                                    let _ = tx.send(Event::Log(m));
+                                }
+                            }
+                        }
+                    }
+                    // 探测期间有人碰遥控器 → 作废（PTT 被按住时也出流）
+                    if probe_until.is_some() && !active.is_empty() {
+                        probe_tainted = true;
+                    }
+                    // 探测窗口到点：收针、判型
                     if probe_until.is_some_and(|t| Instant::now() >= t) {
                         probe_until = None;
-                        let _ = dev.write(&MIC_OFF);
-                        let model = if probe_frames > 3 {
-                            crate::config::MicModel::Hot
-                        } else {
-                            crate::config::MicModel::Ptt
-                        };
-                        {
-                            let mut c = cfg.write();
-                            c.settings.mic_model = model;
-                            let _ = c.save();
+                        if let Err(e) = dev.write(&MIC_OFF) {
+                            eprintln!("[firevibe] 判开麦模型：收针的关麦写失败（{e}）");
                         }
-                        let _ = tx.send(Event::Log(format!(
-                            "开麦模型：{}（静默发 MIC_ON 收到 {probe_frames} 帧）",
-                            match model {
-                                crate::config::MicModel::Hot => "热麦克风 —— 发命令就一直出流",
-                                crate::config::MicModel::Ptt =>
-                                    "按住才出流 —— 麦克风键要绑「按住」模式",
-                                _ => "未知",
+                        let mut decided: Option<crate::config::MicModel> = None;
+                        if probe_tainted {
+                            eprintln!(
+                                "[firevibe] 判开麦模型：这轮期间有按键，作废重来                                 （按住时 PTT 也出流，会被误判成热麦克风）"
+                            );
+                            probe_next = Some(Instant::now() + Duration::from_secs(3));
+                        } else if probe_frames > 3 {
+                            // 出流 = 确证，一轮就够
+                            decided = Some(crate::config::MicModel::Hot);
+                        } else {
+                            probe_tries += 1;
+                            if probe_tries >= PROBE_TRIES {
+                                decided = Some(crate::config::MicModel::Ptt);
+                            } else {
+                                eprintln!(
+                                    "[firevibe] 判开麦模型：第 {probe_tries}/{PROBE_TRIES} 轮 0 帧                                      —— 还不足以判 PTT（可能只是睡着了），过几秒再试"
+                                );
+                                probe_next = Some(Instant::now() + Duration::from_secs(4));
                             }
-                        )));
-                        // 通知 UI：连上那一刻模型还是 Unknown，
-                        // 顶栏「写入红外」的判断这时才有效（UI 收到后会刷新提示）
-                        let _ = tx.send(Event::MicModelProbed);
+                        }
+                        if let Some(model) = decided {
+                            {
+                                let mut c = cfg.write();
+                                c.settings.mic_model = model;
+                                let _ = c.save();
+                            }
+                            let _ = tx.send(Event::Log(format!(
+                                "开麦模型：{}（静默发 MIC_ON，{} 轮共收到 {probe_frames} 帧）",
+                                match model {
+                                    crate::config::MicModel::Hot =>
+                                        "热麦克风 —— 发命令就一直出流",
+                                    crate::config::MicModel::Ptt =>
+                                        "按住才出流 —— 麦克风键要绑「按住」模式",
+                                    _ => "未知",
+                                },
+                                probe_tries.max(1)
+                            )));
+                            // 通知 UI：连上那一刻模型还是 Unknown，
+                            // 顶栏「写入红外」的判断这时才有效（UI 收到后会刷新提示）
+                            let _ = tx.send(Event::MicModelProbed);
+                        }
                     }
                     // 隐式按住会话收针：音频停了 400ms = 实体麦克风键已松开
                     // （PTT 遥控器松键即停流，这个判据很硬）
@@ -1293,7 +1366,7 @@ impl Runtime {
                         }
                         RID_BATTERY => {
                             if let Some(&b) = payload.first() {
-                                record_battery(&status, &cfg, b as i32, "上报");
+                                record_battery(&status, &cfg, b as i32, "上报", &batt_sn, &batt_name);
                             }
                         }
                         RID_KEYBOARD | RID_CONSUMER | RID_VENDOR_EF => {
@@ -1853,6 +1926,20 @@ impl Runtime {
     /// 可能干出不可逆的事（GATT 那边就有 WIPE）。
     pub fn send_report(&self, bytes: Vec<u8>) {
         self.pending_writes.lock().push(bytes);
+    }
+
+    /// 立刻把事件 tap 拆出系统事件链。返回是否真的拆了一个。
+    ///
+    /// ⚠️ 这是**安全措施**，不只是清理：CGEventTap 挂在 WindowServer 会话链的队首，
+    /// 一旦本进程服务不了它（最典型：用户在系统设置里把授权关掉），
+    /// **整机的点击和键盘都会被吞掉**，只有光标还能动。见 `tap::Tap::stop` 上面那段。
+    #[cfg(target_os = "macos")]
+    pub fn stop_tap(&self) -> bool {
+        self.tap.lock().take().is_some() // Drop 里会 stop()，且 stop 是单次生效的
+    }
+    #[cfg(not(target_os = "macos"))]
+    pub fn stop_tap(&self) -> bool {
+        false
     }
 
     pub fn stop(&self) {
@@ -2674,7 +2761,14 @@ fn double_stroke(inj: &Arc<dyn Injector>, key: &str, mods: &[String]) -> Result<
 }
 
 /// 记下电量。变了才落盘 —— 下次启动界面上立刻有值，不用干等遥控器上报。
-fn record_battery(status: &Arc<Status>, cfg: &Arc<RwLock<Config>>, b: i32, how: &str) {
+fn record_battery(
+    status: &Arc<Status>,
+    cfg: &Arc<RwLock<Config>>,
+    b: i32,
+    how: &str,
+    serial: &str,
+    name: &str,
+) {
     if !(1..=100).contains(&b) {
         return; // 0 或越界当无效，别把界面刷成 0%
     }
@@ -2682,6 +2776,9 @@ fn record_battery(status: &Arc<Status>, cfg: &Arc<RwLock<Config>>, b: i32, how: 
     if was != b {
         eprintln!("[batt] {how} {b}%");
         let mut g = cfg.write();
+        // 电量曲线（统计页按设备画）。这条是 HID 0x03 被动上报那路 ——
+        // 设备想发才发，来得稀稀拉拉，但免费，有就记上
+        g.stats.log_battery(serial, name, b);
         if g.settings.last_battery != Some(b) {
             g.settings.last_battery = Some(b);
             let _ = g.save();

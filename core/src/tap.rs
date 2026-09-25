@@ -52,7 +52,15 @@ unsafe extern "C" {
     fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
     fn CFRunLoopRun();
     fn CFRunLoopStop(rl: CFRunLoopRef);
+    fn CFRunLoopRemoveSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+    fn CFMachPortInvalidate(port: CFMachPortRef);
+    fn CFRelease(cf: *const c_void);
     static kCFRunLoopCommonModes: CFStringRef;
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrusted() -> bool;
 }
 
 // kCGSessionEventTap = 1；插在队首才能吞掉
@@ -110,6 +118,8 @@ type Decide = Box<dyn Fn(Ev) -> bool + Send + Sync>;
 struct Ctx {
     decide: Decide,
     log: Option<Box<dyn Fn(Ev) + Send + Sync>>,
+    /// 自己那个 mach port，回调里被系统禁用后要拿它重新 enable
+    port: std::sync::atomic::AtomicUsize,
 }
 
 extern "C" fn on_event(
@@ -118,12 +128,24 @@ extern "C" fn on_event(
     event: CGEventRef,
     user: *mut c_void,
 ) -> CGEventRef {
-    // 被系统禁用了就原样放过（调用方应重新 enable）
-    if kind == 0xFFFF_FFFE || kind == 0xFFFF_FFFF {
-        return event;
-    }
     // SAFETY: user 是 spawn 时泄漏的 Ctx，生命周期与进程同长
     let ctx = unsafe { &*(user as *const Ctx) };
+    // 系统把 tap 禁用了（0xFFFF_FFFE 超时 / 0xFFFF_FFFF 被用户输入打断）。
+    // ⚠️ **必须自己重新 enable** —— 以前这里只写「调用方应重新 enable」，
+    // 而根本没有调用方会做，于是一旦超时，按键屏蔽就**静默永久失效**
+    //（麦克风键重新开始弹 Spotlight，还查不出为什么）。
+    // ⚠️ 但**没授权时绝不重新 enable**：一个没人服务得了的 tap 挂在链头，
+    // 会把整条会话事件队列卡住（见 stop() 上面那段）。
+    if kind == 0xFFFF_FFFE || kind == 0xFFFF_FFFF {
+        let port = ctx.port.load(Ordering::Relaxed);
+        let trusted = unsafe { AXIsProcessTrusted() };
+        eprintln!("[tap] 被系统禁用（kind={kind:#x}，授权={trusted}）—— {}",
+                  if trusted { "重新启用" } else { "没授权，保持关闭" });
+        if trusted && port != 0 {
+            unsafe { CGEventTapEnable(port as CFMachPortRef, true) };
+        }
+        return event;
+    }
     let flags = unsafe { CGEventGetFlags(event) };
     let raw = unsafe { CGEventGetIntegerValueField(event, FIELD_KEYCODE) };
     let (code, nx_down) = if kind == EV_SYSTEM_DEFINED {
@@ -156,12 +178,31 @@ extern "C" fn on_event(
 pub struct Tap {
     stop: Arc<AtomicBool>,
     rl: Arc<parking_lot::Mutex<Option<usize>>>,
+    /// mach port。停的时候要**先**在这儿把 tap 关掉，见 stop()
+    port: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Tap {
+    /// ⚠️⚠️ **停 tap 不能只 `CFRunLoopStop`。**
+    ///
+    /// CGEventTap 是**进程外系统状态**：mach port 注册在 WindowServer 的会话 tap 链
+    /// **队首**（我们要 PLACE_HEAD 才能吞事件）。run loop 一停就没人再服务这个 port，
+    /// 而它还在链上 —— WindowServer 等不到回复，**整条会话事件队列卡住**：
+    /// 点击和键盘全被吞，只有光标还能动（光标是 WindowServer 自己画的）。
+    /// 表现得像触控板/键盘坏了。用户真撞上过（撤销授权那次）。
+    ///
+    /// 所以顺序是：**先 `CGEventTapEnable(false)` 让它立刻退出事件链**（任何线程都能调，
+    /// 不用等 run loop 醒），再停 run loop，剩下的 remove source / invalidate / release
+    /// 在 tap 线程上 `CFRunLoopRun()` 返回之后做。
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(p) = *self.rl.lock() {
+        let p = self.port.swap(0, Ordering::Relaxed);
+        if p != 0 {
+            unsafe { CGEventTapEnable(p as CFMachPortRef, false) };
+        }
+        // ⚠️ `take()` 而不是读一眼：tap 线程退出后这个 CFRunLoopRef 就失效了，
+        // 而 `Drop` 还会再调一次 stop() —— 留着就是对已释放的 run loop 再来一发。
+        if let Some(p) = self.rl.lock().take() {
             unsafe { CFRunLoopStop(p as CFRunLoopRef) };
         }
     }
@@ -183,11 +224,17 @@ pub fn spawn(
     let m = mask(types);
     let stop = Arc::new(AtomicBool::new(false));
     let rl = Arc::new(parking_lot::Mutex::new(None));
+    let port_out = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let rl2 = rl.clone();
+    let port_out2 = port_out.clone();
     std::thread::spawn(move || {
         // Ctx 故意泄漏：回调的生命周期跟着 run loop，进程退出才结束
-        let ctx = Box::leak(Box::new(Ctx { decide, log }));
+        let ctx = Box::leak(Box::new(Ctx {
+            decide,
+            log,
+            port: std::sync::atomic::AtomicUsize::new(0),
+        }));
         let port = unsafe {
             CGEventTapCreate(
                 TAP_SESSION,
@@ -206,18 +253,37 @@ pub fn spawn(
             let _ = tx.send(Err("EVENT_TAP_FAILED".into()));
             return;
         }
-        unsafe {
+        ctx.port.store(port as usize, Ordering::Relaxed);
+        port_out2.store(port as usize, Ordering::Relaxed);
+        let (src, cur) = unsafe {
             let src = CFMachPortCreateRunLoopSource(std::ptr::null(), port, 0);
             let cur = CFRunLoopGetCurrent();
             *rl2.lock() = Some(cur as usize);
             CFRunLoopAddSource(cur, src, kCFRunLoopCommonModes);
             CGEventTapEnable(port, true);
-        }
+            (src, cur)
+        };
         let _ = tx.send(Ok(()));
         unsafe { CFRunLoopRun() };
+        // run loop 退出 = 有人调了 stop()。**必须在这儿把 tap 彻底拆出事件链** ——
+        // 只停 run loop 的话 port 还挂在 WindowServer 的链头没人服务，整机输入会卡死。
+        // （stop() 已经先 disable 过一次，这里是把 port 真正作废并释放。）
+        unsafe {
+            CGEventTapEnable(port, false);
+            CFRunLoopRemoveSource(cur, src, kCFRunLoopCommonModes);
+            CFMachPortInvalidate(port);
+            CFRelease(src);
+            CFRelease(port);
+        }
+        ctx.port.store(0, Ordering::Relaxed);
+        eprintln!("[tap] 已拆除（run loop 退出、mach port 已作废）");
     });
     match rx.recv_timeout(std::time::Duration::from_secs(3)) {
-        Ok(Ok(())) => Ok(Tap { stop, rl }),
+        Ok(Ok(())) => Ok(Tap {
+            stop,
+            rl,
+            port: port_out,
+        }),
         Ok(Err(e)) => Err(anyhow!(e)),
         Err(_) => Err(anyhow!("event tap 启动超时")),
     }

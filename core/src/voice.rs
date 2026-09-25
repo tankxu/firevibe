@@ -187,13 +187,16 @@ impl VoiceSink {
             std::thread::Builder::new()
                 .name("firevibe-audio".into())
                 .spawn(move || {
-                    let sh_err = sh.clone();
+                    // ⚠️ 每次调用都要重新 clone 进回调 —— 这个闭包会被反复调用
+                    // （按需开流），把 `sh` move 进去就只能建一次。
                     let build = || -> Result<cpal::Stream> {
                         let ch = out_ch as usize;
+                        let sh_cb = sh.clone();
+                        let sh_err = sh.clone();
                         let s = dev.build_output_stream(
                             &cfg.config(),
                             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                                let mut ring = sh.ring.lock();
+                                let mut ring = sh_cb.ring.lock();
                                 let mut n = 0u64;
                                 for frame in out.chunks_mut(ch) {
                                     let v = ring.pop_front().unwrap_or(0.0);
@@ -203,7 +206,7 @@ impl VoiceSink {
                                     }
                                     n += 1;
                                 }
-                                sh.out_frames.fetch_add(n, Ordering::Relaxed);
+                                sh_cb.out_frames.fetch_add(n, Ordering::Relaxed);
                             },
                             move |e| {
                                 eprintln!("音频流错误: {e}");
@@ -214,18 +217,71 @@ impl VoiceSink {
                         s.play()?;
                         Ok(s)
                     };
+
+                    // 先真开一次，确认这台设备打得开，再立刻关掉。
+                    // 为什么要这一下：`ensure_voice()` 的返回值就是界面上「语音链路已建立」
+                    // 的依据，不实际开一次流就报成功 = 骗人的就绪状态（这类谎报
+                    // CLAUDE.md 里栽过好几次）。代价是启动时隐私指示器会闪一下。
                     match build() {
-                        Ok(stream) => {
+                        Ok(s) => {
+                            drop(s);
                             let _ = ready_tx.send(Ok(()));
-                            while !stop.load(Ordering::Relaxed) {
-                                std::thread::sleep(std::time::Duration::from_millis(50));
-                            }
-                            drop(stream);
                         }
                         Err(e) => {
                             let _ = ready_tx.send(Err(e.to_string()));
+                            return;
                         }
                     }
+
+                    // ⚠️⚠️ 流是**按需**开的，不是常开。
+                    //
+                    // FireVibe Mic 是环回声卡（输入输出同在一台设备上），我们一开它的
+                    // 输出流，驱动的输入侧就跟着在跑，coreaudiod 判定「这个进程在用
+                    // 麦克风」→ 菜单栏那颗黄点**全程亮着**。以前这里是建好就
+                    // `while !stop { sleep }` 一直握着，于是 app 开着黄点就一直亮，
+                    // 跟用不用语音无关 —— 用户会以为我们在偷听（实测被问到了）。
+                    // 对照实验：`cargo run -p firevibe-core --example micdot -- sink`
+                    // 能点亮，`-- enum`（纯设备枚举）和 `-- switch`（切默认输入）都不能。
+                    //
+                    // 闸门用 `passing`：它本来就是「该不该往声卡送音频」的开关，
+                    // `push_pcm` 在它为假时直接丢弃 —— 流关着的那段本来也没音频要送。
+                    // 开流期间进来的 PCM 落在 ring 里（250ms 上限），不会丢开头。
+                    //
+                    // 关流带宽限期：说话中的停顿、连续两句之间别反复拆建
+                    // （每拆建一次指示器就闪一下，比常亮还碍眼）。
+                    const GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+                    let mut stream: Option<cpal::Stream> = None;
+                    let mut idle_since: Option<std::time::Instant> = None;
+                    while !stop.load(Ordering::Relaxed) {
+                        match (sh.passing.load(Ordering::Relaxed), stream.is_some()) {
+                            (true, false) => match build() {
+                                Ok(s) => {
+                                    stream = Some(s);
+                                    idle_since = None;
+                                }
+                                Err(e) => {
+                                    // 开不起来就置 dead，让上层那条重建路径接手
+                                    eprintln!("[voice] 按需开输出流失败: {e}");
+                                    sh.dead.store(true, Ordering::Relaxed);
+                                }
+                            },
+                            (true, true) => idle_since = None,
+                            (false, true) => {
+                                if idle_since.get_or_insert_with(std::time::Instant::now).elapsed()
+                                    > GRACE
+                                {
+                                    stream = None; // drop = 关流 = 黄点灭
+                                    idle_since = None;
+                                }
+                            }
+                            (false, false) => {}
+                        }
+                        // 10ms：这是开口到真正出声之间多出来的等待上限。ring 只有
+                        // 250ms 且溢出丢**最旧**的，所以这一段不能长 —— 建流本身
+                        // 几十毫秒，加上这 10ms 仍远在 250ms 内，开头不会被丢。
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    drop(stream);
                 })?;
         }
         match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {

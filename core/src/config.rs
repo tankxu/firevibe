@@ -627,6 +627,31 @@ impl Default for Settings {
 /// 1 = 21 个 HID usage 全部实测完成，旧文件里的猜测值必须刷掉
 pub const SCHEMA: u32 = 4;
 /// 使用统计（持久化在配置里）。动作真执行时累加，按天记活跃。
+/// 一台遥控器的电量历史。统计页按设备各画一条曲线。
+///
+/// ⚠️ **只在电量变化时追加**，不是定时采样 —— 电量本来就变得很慢（GATT 半小时
+/// 才读一次，而且要「连着且近期用过」才读），定时采样会存一堆重复值。
+/// 所以点与点之间的时间间隔是不均匀的，画图时按**时间**定位横坐标，别按下标均分。
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct BatteryLog {
+    /// 界面上显示的名字（产品名；取不到就退回 vid/pid）
+    #[serde(default)]
+    pub name: String,
+    /// 最后一次见到这台设备 `YYYY-MM-DD HH:MM`。排序和「长期没用」都看它
+    #[serde(default)]
+    pub last_seen: String,
+    /// 采样点 `(YYYY-MM-DD HH:MM, 电量)`，按时间升序
+    #[serde(default)]
+    pub points: Vec<(String, i32)>,
+    /// 用户手动收起的设备（换掉的旧遥控器之类），不在主列表里占地方
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+/// 每台设备最多留多少个采样点。电量变化才记，400 点够画很久了；
+/// 超了从最旧的丢，免得配置文件无限长（它每按一次键就要整份写盘一次）。
+const BATTERY_POINTS_MAX: usize = 400;
+
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub struct Stats {
     /// 各键位触发次数：slot id -> 次数
@@ -647,6 +672,10 @@ pub struct Stats {
     /// 各天是否活跃：YYYY-MM-DD -> 当天触发次数
     #[serde(default)]
     pub by_day: std::collections::BTreeMap<String, u64>,
+    /// 每台遥控器的电量历史：**HID 序列号** -> 记录。
+    /// 用序列号而不是 vid/pid —— 同型号的两支遥控器也要分开画。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub battery: std::collections::BTreeMap<String, BatteryLog>,
     /// 开始统计的日期 YYYY-MM-DD（第一次记录时写入）
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub since: String,
@@ -663,7 +692,56 @@ fn today() -> String {
         .unwrap_or_default()
 }
 
+/// 现在 `YYYY-MM-DD HH:MM`（同样走 `date`，别自己算时区）
+fn now_min() -> String {
+    std::process::Command::new("date")
+        .arg("+%Y-%m-%d %H:%M")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
 impl Stats {
+    /// 记一条电量采样。**只在电量真的变了的时候调** —— 调用方负责去重
+    /// （`poll_battery` 本来就只在 `was != v` 时才落盘）。
+    ///
+    /// `serial` 空的时候直接不记：那说明不知道这读数是哪台设备的，
+    /// 记进去会把两支遥控器的曲线混在一起。
+    pub fn log_battery(&mut self, serial: &str, name: &str, level: i32) {
+        if serial.trim().is_empty() || !(1..=100).contains(&level) {
+            return;
+        }
+        let e = self.battery.entry(serial.to_string()).or_default();
+        if !name.trim().is_empty() {
+            e.name = name.to_string();
+        }
+        let t = now_min();
+        e.last_seen = t.clone();
+        // 同一分钟内重复读到就覆盖，不新增点
+        match e.points.last_mut() {
+            Some((lt, lv)) if *lt == t => *lv = level,
+            _ => e.points.push((t, level)),
+        }
+        if e.points.len() > BATTERY_POINTS_MAX {
+            let cut = e.points.len() - BATTERY_POINTS_MAX;
+            e.points.drain(..cut);
+        }
+    }
+
+    /// 只更新「最后见到」——连上设备时调，这样没读到电量的设备也能正确排序
+    pub fn touch_device(&mut self, serial: &str, name: &str) {
+        if serial.trim().is_empty() {
+            return;
+        }
+        let e = self.battery.entry(serial.to_string()).or_default();
+        if !name.trim().is_empty() {
+            e.name = name.to_string();
+        }
+        e.last_seen = now_min();
+    }
+
     /// 记一次动作触发：slot、动作类型是否语音、（可选）语音秒数。
     pub fn record(&mut self, slot_id: &str, action_dbg: &str, is_voice: bool, voice_secs: f64) {
         let d = today();

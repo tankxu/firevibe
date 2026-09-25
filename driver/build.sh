@@ -78,7 +78,13 @@ DEFS="$DEFS kTransportType=kAudioDeviceTransportTypeUSB"
 
 echo "▸ 编译"
 rm -rf "$WORK/BlackHole/build"
-xcodebuild -project BlackHole.xcodeproj -configuration Release \
+# 编译会执行上游的构建脚本 —— 按 LocalDev 的约定放进断网沙箱（~/.local/bin/safe-build）。
+# 只有这一步进沙箱：上面的 clone 要联网、下面的 codesign 要读钥匙串，
+# 而 build.sb 把网络和 ~/Library/Keychains 都挡了。
+# 没装 safe-build 就用 env 当空前缀 —— macOS 自带 bash 3.2，配 set -u 时
+# 展开空数组会报 unbound variable，所以这里不能留空。
+if command -v safe-build >/dev/null 2>&1; then BOX=(safe-build --); else BOX=(env); fi
+"${BOX[@]}" xcodebuild -project BlackHole.xcodeproj -configuration Release \
   CONFIGURATION_BUILD_DIR="$WORK/BlackHole/build" \
   PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
   PRODUCT_NAME="$DRIVER_NAME" \

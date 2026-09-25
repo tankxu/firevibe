@@ -4,7 +4,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.2.3"
+version = "0.2.4"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -12,12 +12,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 parking_lot = "0.12"
 
-# arrayref 0.3.10 在 crates.io 索引里声明了一个不存在的依赖 proc-macro1（^1.0.107），
-# 而它更早的版本全被 yank —— 任何需要 arrayref 的依赖图都解不开。
-# 源码本体已审计：504 行纯宏，无 build.rs、无 proc-macro、无进程/网络调用，
-# 全文不引用 proc-macro1。所以 vendor 一份并去掉那行假依赖。
-[patch.crates-io]
-arrayref = { path = "vendor/arrayref" }
+# 2026-08-20 的 arrayref 供应链投毒事件：攻击者劫持维护者账号发布 0.3.10，
+# 在依赖声明里塞入 typosquat 包 proc-macro1（^1.0.107），并 yank 掉全部旧版本。
+# 当时的缓解措施是 vendor 一份 arrayref 并去掉那行假依赖。
+#
+# 2026-09-22 解除：crates.io 已彻底下架 0.3.10，0.3.9 也已取消 yank
+# （checksum 76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb）。
+# 移除 [patch.crates-io] 回到 crates.io 解析 —— patch 指向本地 path 时该依赖
+# 不参与 checksum 校验，去掉它反而恢复了完整性校验。
+# 注意：Cargo.lock 仍锁在已下架的 0.3.10，需执行 `cargo update -p arrayref`。
 
 [profile.release]
 opt-level = 3

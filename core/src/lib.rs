@@ -18,6 +18,7 @@ pub mod layout;
 pub mod recorder;
 pub mod runtime;
 pub mod stt;
+pub mod syslabel;
 pub mod tap;
 pub mod tray;
 pub mod update;

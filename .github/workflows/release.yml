@@ -1,0 +1,134 @@
+name: Release
+
+# 为什么构建要放在 CI 而不是本机：
+#   本机会执行第三方依赖的 build.rs / proc-macro（firevibe 有 811 个 crate）。
+#   2026-08-20 的 arrayref 供应链投毒就是从这条路进来的。CI 是一次性的干净环境，
+#   分发给用户的产物不应该来自跑过这些代码的开发机。
+#
+# 没有 Developer ID 证书，所以走 ad-hoc 签名 + 构建溯源证明（见 attest 步骤）。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '打包用的版本标签（不发布 Release，只产出构件）'
+        required: false
+
+permissions:
+  contents: write      # 创建 Release
+  id-token: write      # 溯源证明签名
+  attestations: write  # 写入证明
+
+jobs:
+  build:
+    # macos-latest 是 Apple Silicon 标准 runner，公开仓库免费
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装 Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version && cargo --version
+
+      - name: 缓存 cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      # --locked：Cargo.lock 是唯一权威，依赖版本不允许在 CI 里被悄悄改写。
+      # 这是防供应链投毒的关键一条 —— 攻击者 yank 旧版本逼迫重新解析时会在这里失败，
+      # 而不是静默换成恶意版本。
+      - name: 拉取依赖（锁定版本）
+        run: cargo fetch --locked
+
+      - name: 校验 Cargo.lock 未被改动
+        run: |
+          git diff --exit-code Cargo.lock || {
+            echo "::error::cargo fetch 改动了 Cargo.lock —— 依赖解析发生了意外变化，中止"
+            exit 1
+          }
+
+      # 不在 CI 编虚拟声卡：runner 上没有代码签名证书，而 driver/build.sh 会直接拒绝编
+      #（HAL 驱动必须有有效签名，coreaudiod 才肯加载）。改用仓库里提交的
+      # driver/prebuilt/ —— 实测 `codesign --deep` 不会重签 Contents/Resources/ 里的
+      # bundle，所以即便这里 app 走 ad-hoc 签名，驱动仍带着真证书签名进到产物里。
+      #
+      # ⚠️ 它**必须在位**：缺了就是「装上去没有虚拟声卡、语音完全不可用」，
+      # 而且用户只在运行时才发现。所以这里硬失败，不给 warning 蒙混过去。
+      - name: 确认虚拟声卡驱动在位
+        run: |
+          [ -d driver/prebuilt/FireVibeMic.driver ] || {
+            echo "::error::缺 driver/prebuilt/FireVibeMic.driver —— 产物会没有虚拟声卡"
+            exit 1
+          }
+          codesign -dv --verbose=2 driver/prebuilt/FireVibeMic.driver 2>&1 | \
+            grep -E 'Identifier|TeamIdentifier|Signature' || true
+
+      # package.sh 内部会 cargo build --release、生成图标、组装 .app、
+      # 编译 Swift 辅助程序、codesign（无证书时自动退回 ad-hoc）
+      - name: 打包 FireVibe.app
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'   # audiopus_sys 内嵌的 libopus 声明的最低版本过老
+        run: ./package.sh
+
+      - name: 读取版本号
+        id: ver
+        run: |
+          V=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ -n "$V" ] || { echo "::error::读不到版本号"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "zip=FireVibe-$V-macos-arm64.zip" >> "$GITHUB_OUTPUT"
+
+      - name: 压缩产物
+        run: |
+          cd target
+          ditto -c -k --keepParent --sequesterRsrc FireVibe.app "../${{ steps.ver.outputs.zip }}"
+          cd ..
+          shasum -a 256 "${{ steps.ver.outputs.zip }}" | tee "${{ steps.ver.outputs.zip }}.sha256"
+
+      # 没有 Developer ID 的替代方案：GitHub 出具的构建溯源证明。
+      # 它把「这个二进制」和「哪个 commit、哪条 workflow、哪次运行」用 Sigstore 绑死，
+      # 任何人都能用 `gh attestation verify <文件> -R tankxu/firevibe` 验证。
+      # 这证明不了「Apple 认可这个开发者」，但证明了「产物确实由这份公开源码构建而来」——
+      # 对供应链防护而言，后者其实更有意义。
+      - name: 生成构建溯源证明
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ steps.ver.outputs.zip }}
+
+      - name: 上传构件
+        uses: actions/upload-artifact@v7
+        with:
+          name: firevibe-${{ steps.ver.outputs.version }}-macos-arm64
+          path: |
+            ${{ steps.ver.outputs.zip }}
+            ${{ steps.ver.outputs.zip }}.sha256
+
+      - name: 发布 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            ${{ steps.ver.outputs.zip }}
+            ${{ steps.ver.outputs.zip }}.sha256
+          body: |
+            ## FireVibe ${{ steps.ver.outputs.version }}
+
+            **本产物由 GitHub Actions 在一次性干净环境中构建**，未经过任何开发者本机。
+
+            验证来源：
+            ```bash
+            gh attestation verify FireVibe-${{ steps.ver.outputs.version }}-macos-arm64.zip -R ${{ github.repository }}
+            ```
+
+            ⚠️ 本应用使用 ad-hoc 签名（无 Apple Developer ID），首次打开需要
+            右键 →「打开」，或执行 `xattr -dr com.apple.quarantine FireVibe.app`。

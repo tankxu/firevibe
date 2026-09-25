@@ -134,7 +134,9 @@ dependencies = [
 
 [[package]]
 name = "arrayref"
-version = "0.3.10"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
 
 [[package]]
 name = "arrayvec"
@@ -1819,7 +1821,7 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "firevibe-cli"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "firevibe-core",
@@ -1830,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "firevibe-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "block2",
@@ -1857,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "firevibe-ui"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "firevibe-core",

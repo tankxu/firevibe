@@ -32,7 +32,7 @@ if [ ! -s "$PNG" ] || [ "$(wc -c < "$PNG")" -lt 100000 ]; then
   echo "  icon-1024.png 缺失/异常，尝试用 Chrome 从 SVG 生成…"
   CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
   if [ -x "$CHROME" ]; then
-    CHROME_TMP=$(mktemp -d)
+    CHROME_TMP=$(mktemp -d "${TMPDIR:-/tmp}/firevibe-chrome.XXXXXX")
     OUT="$PNG.new"
     timeout 60 "$CHROME" --headless --disable-gpu --hide-scrollbars \
       --no-first-run --no-default-browser-check \
@@ -53,14 +53,23 @@ else
   echo "  用现有 icon-1024.png（$(wc -c < "$PNG") 字节）"
 fi
 
-ICONSET=$(mktemp -d)/icon.iconset; mkdir -p "$ICONSET"
-for spec in "16 16x16" "32 16x16@2x" "32 32x32" "64 32x32@2x" \
-            "128 128x128" "256 128x128@2x" "256 256x256" "512 256x256@2x" \
-            "512 512x512" "1024 512x512@2x"; do
-  set -- $spec
-  sips -Z "$1" design/icon/icon-1024.png --out "$ICONSET/icon_$2.png" >/dev/null
-done
-iconutil -c icns "$ICONSET" -o design/icon/FireVibe.icns
+# 图标没改就沿用现成的 .icns —— 10 次 sips + iconutil 每次打包都重跑纯属浪费，
+# 而且 sips 会往 darwin 的 per-user 临时目录写中间文件，受限环境里直接失败。
+# 判据：.icns 比源 png 新。要强制重做就 `rm design/icon/FireVibe.icns`。
+if [ -s design/icon/FireVibe.icns ] && [ design/icon/FireVibe.icns -nt "$PNG" ]; then
+  echo "  图标未变，沿用现有 FireVibe.icns"
+else
+  # ⚠️ 不写不带模板的 `mktemp -d`：macOS 自带的那个**不认 TMPDIR**，固定落在
+  # /var/folders/… 那个 per-user 临时目录，沙箱里常常不可写。
+  ICONSET=$(mktemp -d "${TMPDIR:-/tmp}/firevibe-icon.XXXXXX")/icon.iconset; mkdir -p "$ICONSET"
+  for spec in "16 16x16" "32 16x16@2x" "32 32x32" "64 32x32@2x" \
+              "128 128x128" "256 128x128@2x" "256 256x256" "512 256x256@2x" \
+              "512 512x512" "1024 512x512@2x"; do
+    set -- $spec
+    sips -Z "$1" design/icon/icon-1024.png --out "$ICONSET/icon_$2.png" >/dev/null
+  done
+  iconutil -c icns "$ICONSET" -o design/icon/FireVibe.icns
+fi
 
 echo "▸ 组装 $APP"
 rm -rf "$APP"
@@ -107,13 +116,46 @@ SIGN=${IDENT:--}   # 没证书就退回 ad-hoc
 # 带上我们自己那块虚拟声卡（driver/build.sh 编的）。第三方语音输入工具会把
 # 传输类型为「虚拟」的设备滤掉，所以必须用自建的这块（自称 USB）。
 # 没编过就跳过 —— 界面上会提示去编。
-if [ -d "driver/out/FireVibeMic.driver" ]; then
+#
+# ⚠️ 缺驱动必须**当场失败**，不能只打一行提示就接着打包。
+# driver/out/ 在 .gitignore 里（源码是构建时从上游 clone 的），所以换一台机器
+# clone 下来第一次打包必然没有它 —— 以前这里只 echo 一句，包照打，装上去之后
+# 才在界面上报「应用里没有带驱动」，而那时已经分发出去了。踩过一次（0.2.3）。
+# 来源优先级：本地刚编的 driver/out/ > 仓库里提交的 driver/prebuilt/。
+#
+# 为什么仓库里要提交一份编好的：CI（GitHub runner）上**没有代码签名证书**，
+# `driver/build.sh` 会直接拒绝编（HAL 驱动得有有效签名 coreaudiod 才肯加载）。
+# 而实测 **`codesign --deep` 不会重签 `Contents/Resources/` 里的 bundle**
+#（把证书签的驱动拷进去、再用 ad-hoc 签整个 app，驱动的 TeamIdentifier 原样保留）——
+# 所以提交的这一份即使产物走 ad-hoc 签名，驱动仍然带着真证书进到用户手里。
+#
+# 要更新它（上游 BlackHole 升级、或换了签名证书时）：
+#   ./driver/build.sh && ditto driver/out/FireVibeMic.driver driver/prebuilt/FireVibeMic.driver
+# ⚠️ 这里必须用 if，不能写 `[ -d "$cand" ] && { ...; }` —— 脚本开头是 `set -e`，
+# 第一个候选不存在时整条 && 列表返回 1，会**当场把脚本干掉**。
+# 本地有 driver/out 时第一个就命中，所以这个坑只在 CI（只有 prebuilt）上才炸。
+DRIVER_SRC=""
+for cand in driver/out/FireVibeMic.driver driver/prebuilt/FireVibeMic.driver; do
+  if [ -d "$cand" ]; then
+    DRIVER_SRC="$cand"
+    break
+  fi
+done
+if [ -n "$DRIVER_SRC" ]; then
   mkdir -p "$APP/Contents/Resources"
   rm -rf "$APP/Contents/Resources/FireVibeMic.driver"
-  cp -R "driver/out/FireVibeMic.driver" "$APP/Contents/Resources/"
-  echo "▸ 已带上虚拟声卡驱动"
+  cp -R "$DRIVER_SRC" "$APP/Contents/Resources/"
+  # ⚠️ 必须写 ${} —— 后面紧跟中文全角括号时，bash 会把那几个字节算进变量名，
+  # 配 `set -u` 直接报 unbound variable 把脚本干掉。
+  echo "▸ 已带上虚拟声卡驱动（${DRIVER_SRC}）"
+elif [ "${FIREVIBE_NO_DRIVER:-0}" = "1" ]; then
+  echo "▸ ⚠ FIREVIBE_NO_DRIVER=1：这个包不带虚拟声卡，语音输入用不了，别拿去分发"
 else
-  echo "▸ 没找到 driver/out/FireVibeMic.driver，跳过（先跑 ./driver/build.sh）"
+  echo "✗ driver/out/ 和 driver/prebuilt/ 里都没有 FireVibeMic.driver —— 这样打出来的包"
+  echo "  装上去会报「应用里没有带驱动」，语音输入完全用不了。先编驱动："
+  echo "      ./driver/build.sh"
+  echo "  （确实只想要个不带声卡的包：FIREVIBE_NO_DRIVER=1 ./package.sh）"
+  exit 1
 fi
 
   # 电量辅助程序：独立进程读 GATT 电池服务（进程内的 CoreBluetooth 起不来，
@@ -149,4 +191,4 @@ cargo build --release -p firevibe-cli  # 产物叫 firectl
 cp target/release/firectl "$(dirname "$APP")/firectl"
 
 echo "好了：$APP"
-echo "拖到 /Applications，然后到 系统设置 › 隐私与安全性 › 辅助功能 里勾上它。"
+echo "拖到 /Applications，然后到 系统设置 › 隐私与安全性 里把它勾上（macOS 27 上那一项叫「设备控制和数据访问」，旧系统上叫「辅助功能」）。"

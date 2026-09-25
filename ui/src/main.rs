@@ -36,6 +36,41 @@ use remote::COL_LEFT_W;
 /// 顶部拖拽条高度。红绿灯浮在这条里，内容从它下面开始 ——
 /// 不能把状态卡也塞进这条：窗口窄的时候居中容器的左边缘会撞上红绿灯。
 const TOPBAR_H: f32 = 40.;
+
+/// 排一个「等本进程退干净了，再把自己重新打开」的后台任务，然后由调用方 `cx.quit()`。
+///
+/// ⚠️ **必须等旧进程真的没了再 `open`**：`open` 碰到还在跑的实例只会激活它、不会重启
+/// （CLAUDE.md 二、验证纪律里那条），那就变成「退出了但没起来」。这里用 `kill -0`
+/// 轮询等它消失。
+/// ⚠️ **走 `open` 而不是 exec 自己**：TCC 把权限归责到发起进程，必须让 LaunchServices
+/// 以 app 的身份拉起来，否则新进程的授权主体就不是 FireVibe.app 了。
+/// ⚠️ 开发时直接跑 `target/debug/firevibe-ui` 没有 bundle —— 那种情况不自动重启。
+fn relaunch_after_quit() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    // …/FireVibe.app/Contents/MacOS/firevibe -> …/FireVibe.app
+    let Some(app) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent()) else {
+        return;
+    };
+    let app = app.to_string_lossy().to_string();
+    if !app.ends_with(".app") || app.contains('"') || app.contains('\\') {
+        eprintln!("[firevibe] 不是从 .app 里跑的，跳过自动重启：{app}");
+        return;
+    }
+    let pid = std::process::id();
+    let _ = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open \"{app}\""
+        ))
+        .spawn();
+}
+
+/// 虚拟声卡状态的轮询间隔。没就绪时勤快点（用户刚装完驱动要尽快看到状态变化），
+/// 就绪之后放慢 —— 每 3 秒起一条线程全量枚举一遍 CoreAudio 设备纯属浪费，
+/// 而且会让菜单栏的隐私指示器胶囊跟着重绘（看着像在一闪一闪）。
+fn loopback_poll_every(ready: bool) -> Duration {
+    if ready { Duration::from_secs(30) } else { Duration::from_secs(3) }
+}
 /// 内容整体最大宽度，超过就居中留白
 const CONTENT_MAX_W: f32 = 1280.;
 /// 卡片 hover 过渡时长
@@ -231,6 +266,11 @@ pub struct FireVibe {
     /// 上次见到的方案切换代数：pump 里比对，变了就刷 tray/映射/界面。
     profile_gen_seen: u64,
     pub product: String,
+    /// 当前连上那台设备的 HID 序列号。电量曲线按它分设备存 ——
+    /// 同型号的两支遥控器 vid/pid 一样，只有序列号能分开。
+    pub serial: String,
+    /// 统计页：是否展开「已隐藏的设备」那一栏
+    pub show_hidden_batt: bool,
     pub err: Option<String>,
     /// 自检用：`FIREVIBE_BOOT=settings` 或 `FIREVIBE_BOOT=dialog:app1:long`
     /// 直接把界面拉到某一屏，方便截图核对设计稿。首帧消费掉。
@@ -241,6 +281,10 @@ pub struct FireVibe {
     err_sticky: bool,
     /// 首次引导弹窗（权限/声卡）
     onboarding: bool,
+    /// 「授权给上了就自己重启」用的三个状态，见 poll_perm_granted()
+    perm_seen_denied: bool,
+    perm_err_seen: bool,
+    perm_relaunch_at: Option<Instant>,
 }
 
 impl FireVibe {
@@ -383,6 +427,7 @@ impl FireVibe {
                 cx.background_executor().timer(Duration::from_millis(ms)).await;
                 match this.update(cx, |v, cx| {
                     v.pump();
+                    v.poll_perm_granted(cx);
                     // 开/关悬浮窗必须在绘制过程之外做，
                     // 在 render() 里调 open_window 会重入 GPUI 的绘制、直接把进程带走
                     v.sync_hud(cx);
@@ -474,11 +519,16 @@ impl FireVibe {
             ir_pending_at: Instant::now() - Duration::from_secs(60),
             profile_gen_seen: firevibe_core::config::profile_gen(),
             product: String::new(),
+            serial: String::new(),
+            show_hidden_batt: false,
             err: None,
             boot: std::env::var("FIREVIBE_BOOT").ok(),
             boot_update_checked: false,
             err_sticky: false,
             onboarding: show_onb,
+            perm_seen_denied: false,
+            perm_err_seen: false,
+            perm_relaunch_at: None,
         }
     }
 
@@ -685,7 +735,74 @@ impl FireVibe {
         self.hover_at = Instant::now();
     }
 
+    /// 授权刚给上 → **自己重启**，不要让用户手动「完全退出再重开」。
+    ///
+    /// 为什么非重启不可：`AXIsProcessTrusted()` 是**实时**的，用户在系统设置里一勾，
+    /// 当前进程立刻就能读到 true（首次引导那个对勾就靠它）；但 **HID 那条通路的 TCC
+    /// 判定是在进程打开设备时定下的**，被拒过的进程再怎么重试还是拒。这就是 README
+    /// 里那句「勾完要完全退出再重开」的由来 —— 既然 app 自己看得见授权到手了，
+    /// 这一步就该它自己做，而不是甩给用户。
+    ///
+    /// ⚠️ **触发条件必须是「本进程亲眼见过被拒 → 现在有了」这个跃迁**，
+    /// 不能写成「现在有授权却还在报缺权限就重启」：万一哪天报错另有原因，
+    /// 那个条件每次启动都成立 → **无限重启循环**。加上 `perm_err_seen`（确实因为
+    /// 权限报过错）和一次性的 `perm_relaunch_at`，三重保险。
+    fn poll_perm_granted(&mut self, cx: &mut Context<Self>) {
+        // 已经排上队：等提示条让用户看清再退，别一声不响地闪
+        if let Some(t) = self.perm_relaunch_at {
+            if t.elapsed() > Duration::from_millis(900) {
+                self.perm_relaunch_at = None;
+                relaunch_after_quit();
+                cx.quit();
+            }
+            return;
+        }
+        if self
+            .err
+            .as_deref()
+            .is_some_and(|m| m.starts_with("HID_NOT_PERMITTED"))
+        {
+            self.perm_err_seen = true;
+        }
+        if !self.rt.inj.available() {
+            self.perm_seen_denied = true;
+            return;
+        }
+        if !(self.perm_seen_denied && self.perm_err_seen) {
+            return;
+        }
+        eprintln!("[firevibe] 授权已到手 —— 自动重启应用（HID 的 TCC 判定只认新进程）");
+        self.perm_relaunch_at = Some(Instant::now());
+        self.err = None;
+        self.err_sticky = false;
+        let m = self.l().toast_perm_relaunch();
+        self.toast(m);
+    }
+
+    /// 授权被撤（用户在系统设置里把开关关掉）→ **立刻把事件 tap 拆掉**。
+    ///
+    /// ⚠️ 这不是「我们的功能失效」那种程度的问题，是**整机输入卡死**：
+    /// CGEventTap 挂在 WindowServer 会话链的**队首**（要 PLACE_HEAD 才能吞事件），
+    /// 授权没了之后本进程服务不了它，WindowServer 等不到回复 —— 点击和键盘全被吞，
+    /// 只有光标还能动（光标是 WindowServer 自己画的），看着就像触控板坏了。
+    /// 用户真撞上过：关掉授权那一刻输入就没了，只能强杀 app 才恢复。
+    ///
+    /// 不需要记「之前有没有授权」：`stop_tap()` 拿不到 tap 时返回 false，天然只做一次。
+    fn poll_perm_lost(&mut self) {
+        if self.rt.inj.available() {
+            return;
+        }
+        if self.rt.stop_tap() {
+            eprintln!("[firevibe] 授权被撤 —— 已立刻拆掉事件 tap（留着会把整机输入吞掉）");
+            self.err = Some("HID_NOT_PERMITTED".into());
+            // sticky：后台重连不许把它清掉。授权回来时 poll_perm_granted 会自动重启，
+            // 那条路正好要靠这个错误存在过（perm_err_seen）。
+            self.err_sticky = true;
+        }
+    }
+
     fn pump(&mut self) {
+        self.poll_perm_lost();
         self.poll_runtime_start();
         self.poll_idle_sleep();
         self.poll_hotkey_grab();
@@ -837,10 +954,18 @@ impl FireVibe {
                     self.out_frames_last = of;
                     self.out_frames_at = Instant::now();
                 }
-                let streaming = self.rt.status.mic_on.load(Ordering::Relaxed)
-                    || self.rt.dictating.lock().is_some();
-                // dead:立刻重建。停摆:送流中且输出帧数 800ms 没动才算(空闲时回调本就慢)。
-                let stalled = streaming && self.out_frames_at.elapsed() > Duration::from_millis(800);
+                // ⚠️ 判据用 sink 自己的 `passing`，**不要**用 `mic_on || dictating`：
+                // 听写走的是另一条路（直接吃遥控器 PCM 做识别，不往声卡送），
+                // 而它也会把 `mic_on` 置位 —— 拿 mic_on 当判据，听写期间会被误判成停摆。
+                // ⚠️ 输出流是**按需**开的（见 voice.rs 里那段长注释）：不送流时它是关的，
+                // out_frames 本来就不动。所以不送流期间要把计时一直往前推 —— 否则刚开口
+                // 那一瞬 elapsed 已经是几分钟，立刻被判「停摆」，链路当场被拆了重建。
+                let passing = sink.passing();
+                if !passing {
+                    self.out_frames_at = Instant::now();
+                }
+                // dead:立刻重建。停摆:在送流却 800ms 没出帧才算(空闲时回调本就慢)。
+                let stalled = passing && self.out_frames_at.elapsed() > Duration::from_millis(800);
                 if (sink.dead() || stalled)
                     && self.voice_rebuild_at.elapsed() > Duration::from_secs(3)
                 {
@@ -917,7 +1042,7 @@ impl FireVibe {
                 self.loopback_rx = None;
                 self.loopback_at = Instant::now();
             }
-        } else if self.loopback_at.elapsed() > Duration::from_secs(3) {
+        } else if self.loopback_at.elapsed() > loopback_poll_every(self.loopback.is_ready()) {
             let dev = self.rt.cfg.read().voice.device.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             self.loopback_rx = Some(rx);
@@ -975,10 +1100,17 @@ impl FireVibe {
                         self.toast(result);
                     }
                 }
-                Event::Connected { product, .. } => {
+                Event::Connected { product, serial } => {
                     // 电量按连上的这台设备的名字读 —— 换了遥控器要跟着换目标，
                     // 否则一直读不到、界面显示上一台的陈旧电量
                     firevibe_core::battery::set_target(&product);
+                    // 连上就刷一次「最后见到」：还没读到电量的设备也要能正确排序
+                    {
+                        let mut g = self.rt.cfg.write();
+                        g.stats.touch_device(&serial, &product);
+                        let _ = g.save();
+                    }
+                    self.serial = serial;
                     self.product = product;
                     self.hid_ever_up = true;
                     self.last_conn_at = Some(Instant::now());
@@ -2074,9 +2206,9 @@ impl FireVibe {
                             .child(SharedString::from(if perm {
                                 l.hid_no_perm()
                             } else if not_found {
-                                l.hid_not_connected()
+                                l.hid_not_connected().to_string()
                             } else {
-                                l.hid_open_failed()
+                                l.hid_open_failed().to_string()
                             })),
                     )
                     .child(
@@ -2116,8 +2248,13 @@ impl FireVibe {
                         d.child(
                             mini2("open-tcc", l.open_settings()).h(px(32.)).on_click(cx.listener(
                                 |_, _, _, _| {
+                                    // ⚠️ 这里必须是**辅助功能**，不是输入监控 ——
+                                    // 判据是 `inj.available()` = `AXIsProcessTrusted()`，
+                                    // 查的就是辅助功能。以前跳 Privacy_ListenEvent，是
+                                    // 「读 HID 要开输入监控」那版旧结论的残留：文案让用户去
+                                    // 辅助功能，按钮却把他送进输入监控，勾了也不解决问题。
                                     let _ = std::process::Command::new("open")
-                                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+                                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
                                         .spawn();
                                 },
                             )),
@@ -2128,7 +2265,13 @@ impl FireVibe {
                         .child(
                             mini2("reset-tcc", l.reset_auth()).h(px(32.)).on_click(cx.listener(
                                 |this, _, _, cx| {
+                                    // 同上：要重置的是辅助功能那条记录。
+                                    // 顺手把 ListenEvent 也清一遍 —— 早期版本引导用户加过
+                                    // 输入监控，那条残留记录留着没用，成败都不影响结果。
                                     let out = std::process::Command::new("tccutil")
+                                        .args(["reset", "Accessibility", "com.tankxu.firevibe"])
+                                        .output();
+                                    let _ = std::process::Command::new("tccutil")
                                         .args(["reset", "ListenEvent", "com.tankxu.firevibe"])
                                         .output();
                                     match out {
@@ -2498,8 +2641,11 @@ impl FireVibe {
                 let mut g = self.rt.cfg.write();
                 if g.settings.last_battery != Some(v) {
                     g.settings.last_battery = Some(v);
-                    let _ = g.save();
                 }
+                // 电量曲线：只在变化时追加一个点（这个分支本来就只在变化时进）
+                let (sn, name) = (self.serial.clone(), self.product.clone());
+                g.stats.log_battery(&sn, &name, v);
+                let _ = g.save();
                 drop(g);
                 eprintln!("[batt] 蓝牙读到 {v}%");
             }
@@ -2608,6 +2754,8 @@ impl FireVibe {
             badge: (u32, u32, u32),
             title: &str,
             desc: &str,
+            // 需要逐步照做的（配对那步），空数组就只显示 desc
+            steps: &[&'static str],
             ready_label: &'static str,
             done: bool,
             action: Option<gpui::AnyElement>,
@@ -2658,7 +2806,37 @@ impl FireVibe {
                         .gap(px(2.))
                         .line_height(relative(1.5))
                         .child(div().text_size(px(13.5)).font_weight(w(600.)).text_color(c(INK)).child(SharedString::from(title.to_string())))
-                        .child(div().text_size(px(12.)).text_color(c(INK2)).child(SharedString::from(desc.to_string()))),
+                        .child(div().text_size(px(12.)).text_color(c(INK2)).child(SharedString::from(desc.to_string())))
+                        .when(!steps.is_empty(), |d| {
+                            d.child(div().mt(px(3.)).flex().flex_col().gap(px(3.)).children(
+                                steps.iter().enumerate().map(|(i, line)| {
+                                    div()
+                                        .flex()
+                                        .items_start()
+                                        .gap(px(7.))
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .size(px(15.))
+                                                .rounded(px(7.5))
+                                                .bg(c(LINE))
+                                                .text_size(px(9.5))
+                                                .font_weight(w(700.))
+                                                .text_color(c(INK2))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(SharedString::from((i + 1).to_string())),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .text_color(c(INK2))
+                                                .child(SharedString::from(line.to_string())),
+                                        )
+                                }),
+                            ))
+                        }),
                 )
                 // 弹性空白把右侧动作推到最右，文案不至于贴着按钮
                 .child(div().flex_1().min_w(px(24.)))
@@ -2708,6 +2886,7 @@ impl FireVibe {
                             "tv", BADGE_DEFAULT,
                             l.onb_pair(),
                             l.onb_pair_desc(),
+                            &l.onb_pair_steps(),
                             l.onb_ready(),
                             paired,
                             Some(open_url("onb-bt", l.onb_open_bt(), "x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth", cx)),
@@ -2722,8 +2901,9 @@ impl FireVibe {
                         // 以前这里写死 false，勾上了也永远不打勾。
                         .child(step(
                             "keyboard", BADGE_DEFAULT,
-                            l.onb_im(),
-                            l.onb_im_desc(),
+                            &l.onb_im(),
+                            &l.onb_im_desc(),
+                            &[],
                             l.onb_ready(),
                             self.rt.inj.available(),
                             Some(open_url("onb-im", l.onb_open_settings(), "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility", cx)),
@@ -2733,6 +2913,7 @@ impl FireVibe {
                             "mic", BADGE_DEFAULT,
                             l.onb_card(),
                             l.onb_card_desc(),
+                            &[],
                             l.onb_ready(),
                             card_ready,
                             Some(
@@ -2756,6 +2937,7 @@ impl FireVibe {
                             "battery-full", BADGE_DEFAULT,
                             l.onb_bt(),
                             l.onb_bt_desc(),
+                            &[],
                             l.onb_ready(),
                             false,
                             None,

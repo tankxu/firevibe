@@ -20,6 +20,14 @@ impl L {
         t!(self.0, "Fire TV 遥控器控制台", "Fire TV remote console")
     }
     pub fn settings(&self) -> &'static str { t!(self.0, "设置", "Settings") }
+
+    /// 「辅助功能」那一项在**当前系统**上的显示名 —— macOS 27 起它叫
+    /// 「设备控制和数据访问」(Device Control and Data Access)。
+    /// 名字问系统要（`syslabel`），不写死、也不在文案里括注「旧版叫 X」：
+    /// 用户只该看到自己屏幕上真实存在的那个词。读不到才退回旧名。
+    pub fn a11y(&self) -> &'static str {
+        firevibe_core::syslabel::accessibility().unwrap_or(t!(self.0, "辅助功能", "Accessibility"))
+    }
     // 菜单栏（tray）
     pub fn tray_show(&self) -> &'static str { t!(self.0, "显示窗口", "Show Window") }
     pub fn tray_quit(&self) -> &'static str { t!(self.0, "退出", "Quit") }
@@ -37,6 +45,19 @@ impl L {
     pub fn stats_recent(&self) -> &'static str { t!(self.0, "最近使用", "RECENT ACTIVITY") }
     pub fn stats_peak(&self) -> &'static str { t!(self.0, "峰值", "peak") }
     pub fn stats_voice(&self) -> &'static str { t!(self.0, "语音", "VOICE") }
+    // 电量曲线（按设备各一条）
+    pub fn stats_batt_curve(&self) -> &'static str { t!(self.0, "电量变化", "BATTERY") }
+    pub fn batt_hide(&self) -> &'static str { t!(self.0, "隐藏", "Hide") }
+    pub fn batt_show(&self) -> &'static str { t!(self.0, "取消隐藏", "Unhide") }
+    pub fn batt_hidden_n(&self, n: usize) -> String {
+        t!(self.0, format!("已隐藏 {n} 台"), format!("{n} hidden"))
+    }
+    pub fn batt_last_seen(&self, t: &str) -> String {
+        t!(self.0, format!("最近 {t}"), format!("last seen {t}"))
+    }
+    pub fn batt_one_point(&self) -> &'static str {
+        t!(self.0, "只有一个读数，再用几天就能看出变化了", "Only one reading so far — give it a few days")
+    }
     pub fn stats_voice_count(&self) -> String { t!(self.0, "语音次数", "Voice uses").into() }
     pub fn stats_voice_dur(&self) -> String { t!(self.0, "累计时长", "Total time").into() }
     pub fn stats_battery(&self) -> String { t!(self.0, "当前电量", "Battery").into() }
@@ -106,8 +127,8 @@ impl L {
     pub fn toast_block_failed(&self, e: &str) -> String {
         if e.contains("EVENT_TAP_FAILED") {
             return t!(self.0,
-                "无法屏蔽系统默认行为 —— 多半是缺「辅助功能」权限".to_string(),
-                "Couldn't suppress system default keys — likely missing Accessibility permission".to_string());
+                format!("无法屏蔽系统默认行为 —— 多半是缺「{}」权限", self.a11y()),
+                format!("Couldn't suppress system default keys — likely missing {} permission", self.a11y()));
         }
         t!(self.0, format!("屏蔽系统默认行为失败: {e}"), format!("Couldn't block the system default action: {e}"))
     }
@@ -360,13 +381,28 @@ impl L {
     }
     pub fn onb_pair(&self) -> &'static str { t!(self.0, "配对遥控器", "Pair the remote") }
     pub fn onb_pair_desc(&self) -> &'static str {
-        t!(self.0, "系统设置 › 蓝牙 里把遥控器和 Mac 配上（长按遥控器 home 键进配对）。",
-           "Pair the remote in System Settings › Bluetooth (hold the remote's home key to enter pairing).")
+        t!(self.0, "遥控器一次只能配一台设备 —— 先把 Fire TV Stick 断电，再按下面三步：",
+           "The remote pairs with one device at a time — unplug the Fire TV Stick first, then:")
     }
-    pub fn onb_im(&self) -> &'static str { t!(self.0, "开启「辅助功能」权限", "Enable Accessibility") }
-    pub fn onb_im_desc(&self) -> &'static str {
-        t!(self.0, "系统设置 › 隐私与安全性 › 辅助功能 → 勾上 FireVibe。读遥控器按键、帮你按快捷键都要它。",
-           "System Settings › Privacy & Security › Accessibility → enable FireVibe. Needed to read the remote and to press keys for you.")
+    /// 配对三步。顺序别改：不先解绑，遥控器会被 Fire TV 抢回去、根本进不了配对模式。
+    /// 和 README「第一步：把遥控器配对到 Mac」是同一份说明，改一处要跟着改另一处。
+    pub fn onb_pair_steps(&self) -> [&'static str; 3] {
+        [
+            t!(self.0, "按住 ← + ↺ 返回 + ☰ 菜单 共 12 秒，解除它和 Fire TV 的配对",
+               "Hold ← + ↺ Back + ☰ Menu together for 12s to unpair it from the Fire TV"),
+            t!(self.0, "按住 ⌂ 主页键 10 秒 —— 指示灯由慢闪变快闪即进入配对模式",
+               "Hold ⌂ Home for 10s — the LED goes from slow to fast blinking: pairing mode"),
+            t!(self.0, "系统设置 › 蓝牙 里找到它点「连接」，连上后指示灯闪蓝",
+               "Find it in System Settings › Bluetooth and click Connect — the LED blinks blue"),
+        ]
+    }
+    pub fn onb_im(&self) -> String {
+        t!(self.0, format!("开启「{}」权限", self.a11y()), format!("Enable {}", self.a11y()))
+    }
+    pub fn onb_im_desc(&self) -> String {
+        t!(self.0,
+           format!("系统设置 › 隐私与安全性 › {} → 勾上 FireVibe。读遥控器按键、帮你按快捷键都要它。", self.a11y()),
+           format!("System Settings › Privacy & Security › {} → enable FireVibe. Needed to read the remote and to press keys for you.", self.a11y()))
     }
     pub fn onb_card(&self) -> &'static str { t!(self.0, "安装虚拟声卡「FireVibe Mic」", "Install the \"FireVibe Mic\" virtual device") }
     pub fn onb_card_desc(&self) -> &'static str {
@@ -430,7 +466,12 @@ impl L {
     pub fn toast_link_not_ready(&self) -> &'static str { t!(self.0, "语音链路还没建起来，稍等一下", "Voice link isn't ready yet, hold on") }
 
     // 错误条（HID / 权限）
-    pub fn hid_no_perm(&self) -> &'static str { t!(self.0, "遥控器打不开：缺「辅助功能」权限", "Can't open the remote: missing Accessibility") }
+    // ⚠️ macOS 27 把中文名从「辅助功能」改成了「无障碍」（英文仍是 Accessibility，
+    // 锚点仍是 Privacy_Accessibility）。文案跟着系统走，否则用户在设置里找不到那一项。
+    // 旧版 macOS 仍显示「辅助功能」，所以长文案里带一句括注。
+    pub fn hid_no_perm(&self) -> String {
+        t!(self.0, format!("遥控器打不开：缺「{}」权限", self.a11y()), format!("Can't open the remote: missing {}", self.a11y()))
+    }
     pub fn hid_not_connected(&self) -> &'static str { t!(self.0, "遥控器没连上", "Remote isn't connected") }
     pub fn hid_not_found_hint(&self) -> &'static str {
         t!(self.0,
@@ -539,10 +580,15 @@ impl L {
            "Run in Terminal: firectl --probe-all (follow the prompts to set up the new remote)")
     }
     pub fn hid_open_failed(&self) -> &'static str { t!(self.0, "遥控器打不开", "Can't open the remote") }
-    pub fn hid_perm_hint(&self) -> &'static str {
+    pub fn hid_perm_hint(&self) -> String {
         t!(self.0,
-           "到 系统设置 › 隐私与安全性 › 辅助功能 勾上本应用，然后完全退出重开。（「输入监控」不用单独开，辅助功能已经覆盖它。）已经勾着还报这个，就点「重置授权」再勾一次",
-           "In System Settings › Privacy & Security › Accessibility, enable this app, then fully quit and reopen. (Input Monitoring doesn't need a separate entry — Accessibility covers it.) If it's already on and you still see this, hit Reset access and enable it again.")
+           format!("到 系统设置 › 隐私与安全性 › {} 勾上本应用就行 —— 勾上后本应用会自动重启生效，不用你手动退出重开。（「输入监控」不用单独开，这一项已经覆盖它。）已经勾着还报这个，就点「重置授权」再勾一次", self.a11y()),
+           format!("Just enable this app in System Settings › Privacy & Security › {a} — it restarts itself to pick the grant up, no need to quit and reopen manually. (Input Monitoring doesn't need a separate entry — {a} covers it.) If it's already on and you still see this, hit Reset access and enable it again.", a = self.a11y()))
+    }
+    /// 授权到手、自动重启前那一下提示
+    pub fn toast_perm_relaunch(&self) -> String {
+        t!(self.0, "授权已生效 —— 正在重启应用".to_string(),
+           "Access granted — restarting the app".to_string())
     }
     pub fn retry(&self) -> &'static str { t!(self.0, "重试", "Retry") }
     pub fn open_settings(&self) -> &'static str { t!(self.0, "打开设置", "Open Settings") }

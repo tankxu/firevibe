@@ -9,6 +9,7 @@ use firevibe_core::layout::Slot;
 use gpui::{
     canvas, div, point, prelude::*, px, relative, AnyElement, Context, PathBuilder, SharedString,
 };
+use gpui_component::tooltip::Tooltip;
 
 /// 最近 N 天用来画折线图。`by_day` 只存有活动的日子，这里从最后一天往回补齐
 /// 连续 N 个自然日（没活动的天补 0），这样折线才反映真实的「用/没用」。
@@ -201,6 +202,173 @@ fn usage_chart(days: &[(String, u64)]) -> AnyElement {
         .into_any_element()
 }
 
+/// `YYYY-MM-DD HH:MM` -> 以天为单位的连续坐标（含小数）。
+///
+/// 用 Howard Hinnant 那个 civil→days 算法，闰年和月长都是对的。
+/// ⚠️ 必须按**真实时间**定位横坐标，不能按点的下标均分 —— 电量采样是
+/// 「变了才记」，点与点的间隔天差地别（可能几分钟，也可能好几天），
+/// 均分会把一段几天没动的平台期画得和一次急跌一样宽。
+fn day_coord(t: &str) -> f64 {
+    let b = t.as_bytes();
+    if b.len() < 10 {
+        return 0.0;
+    }
+    let num = |a: usize, z: usize| t[a..z].parse::<i64>().unwrap_or(0);
+    let (y, m, d) = (num(0, 4), num(5, 7), num(8, 10));
+    if m == 0 {
+        return 0.0;
+    }
+    // days_from_civil
+    let y2 = y - i64::from(m <= 2);
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = y2 - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    // 时分（有就用，没有当 0 点）
+    let frac = if b.len() >= 16 {
+        (num(11, 13) * 60 + num(14, 16)) as f64 / 1440.0
+    } else {
+        0.0
+    };
+    days as f64 + frac
+}
+
+/// 把 `YYYY-MM-DD HH:MM` 缩成 `MM-DD`
+fn short_stamp(t: &str) -> String {
+    if t.len() >= 10 { t[5..10].to_string() } else { t.to_string() }
+}
+
+/// 一台设备的电量曲线。y 轴固定 0–100%（电量本来就是百分比，
+/// 用峰值当上限会让「从 95 掉到 90」看起来像悬崖）。
+///
+/// ⚠️ **坐标用「占整块区域的比例」算，不用像素 padding**：canvas 里画线和上面那层
+/// hover 区必须严丝合缝地对齐，而 hover 区是用 `relative()` 百分比定位的 ——
+/// 两边只要有一边掺了像素 padding 就会错位。所以留白也做成比例（上下各 8%、
+/// 左右各 3%），两处共用 `xfrac` / `yfrac` 同一个公式。
+fn battery_chart(points: &[(String, i32)]) -> AnyElement {
+    let n = points.len();
+    let xs: Vec<f64> = points.iter().map(|(t, _)| day_coord(t)).collect();
+    let (x0, x1) = (xs[0], xs[n - 1]);
+    let span = (x1 - x0).max(1.0 / 24.0); // 全挤在一小时内也别除零
+    // 点在整块区域里的相对位置（0~1），canvas 和 hover 区共用
+    let xfrac: Vec<f32> = xs
+        .iter()
+        .map(|x| 0.03 + 0.94 * ((x - x0) / span) as f32)
+        .collect();
+    let yfrac: Vec<f32> = points
+        .iter()
+        .map(|(_, v)| 0.08 + 0.84 * (1.0 - *v as f32 / 100.0))
+        .collect();
+
+    let (fx, fy) = (xfrac.clone(), yfrac.clone());
+    let plot = canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            if n < 2 {
+                return;
+            }
+            let o = bounds.origin;
+            let w = f32::from(bounds.size.width);
+            let h = f32::from(bounds.size.height);
+            let pt = |i: usize| point(o.x + px(w * fx[i]), o.y + px(h * fy[i]));
+            let base = |i: usize| point(o.x + px(w * fx[i]), o.y + px(h));
+
+            let mut area = PathBuilder::fill();
+            area.move_to(base(0));
+            for i in 0..n {
+                area.line_to(pt(i));
+            }
+            area.line_to(base(n - 1));
+            area.close();
+            if let Ok(p) = area.build() {
+                window.paint_path(p, hsla_of(ACCENT, 0.13));
+            }
+            let mut line = PathBuilder::stroke(px(2.0));
+            line.move_to(pt(0));
+            for i in 1..n {
+                line.line_to(pt(i));
+            }
+            if let Ok(p) = line.build() {
+                window.paint_path(p, hsla_of(ACCENT, 1.0));
+            }
+            // 数据点：采样是「变了才记」，标出来才看得清哪几天在掉电
+            for i in 0..n {
+                let c = pt(i);
+                let r = px(2.2);
+                let mut dot = PathBuilder::fill();
+                dot.move_to(point(c.x - r, c.y));
+                dot.line_to(point(c.x, c.y - r));
+                dot.line_to(point(c.x + r, c.y));
+                dot.line_to(point(c.x, c.y + r));
+                dot.close();
+                if let Ok(p) = dot.build() {
+                    window.paint_path(p, hsla_of(ACCENT, 1.0));
+                }
+            }
+        },
+    )
+    // ⚠️ 少了 `.size_full()`，canvas 读到的 bounds 是 0×0、所有点被压到顶部 ——
+    // 画出来就是一条贴着 100% 的水平直线。CLAUDE.md 记过这个坑，还是漏过一次。
+    .size_full();
+
+    // hover 层：每个数据点铺一块透明的命中区，鼠标放上去用 Tooltip 报具体数值。
+    // 命中区做得比点大（18px），不然 2.2px 的点根本对不准。
+    let mut layer = div().absolute().size_full();
+    for i in 0..n {
+        let (t, v) = (points[i].0.clone(), points[i].1);
+        let tip = SharedString::from(format!("{}  {}%", stamp_label(&t), v));
+        layer = layer.child(
+            div()
+                .id(SharedString::from(format!("bp-{i}-{t}")))
+                .absolute()
+                .left(relative(xfrac[i]))
+                .top(relative(yfrac[i]))
+                .ml(px(-9.))
+                .mt(px(-9.))
+                .size(px(18.))
+                .rounded_full()
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)),
+        );
+    }
+
+    let chart = div()
+        .relative()
+        .h(px(88.))
+        .w_full()
+        .child(plot)
+        .child(layer)
+        .child(
+            div().absolute().top(px(-2.)).left(px(0.))
+                .text_size(px(10.5)).text_color(c(INK3)).child("100%"),
+        )
+        .child(
+            div().absolute().bottom(px(-2.)).left(px(0.))
+                .text_size(px(10.5)).text_color(c(INK3)).child("0"),
+        );
+
+    let axis = div()
+        .flex()
+        .justify_between()
+        .mt(px(8.))
+        .text_size(px(11.))
+        .text_color(c(INK3))
+        .child(SharedString::from(short_stamp(&points[0].0)))
+        .child(SharedString::from(short_stamp(&points[n - 1].0)));
+
+    div().child(chart).child(axis).into_any_element()
+}
+
+/// tooltip 里的时间写法：`09-20 03:15`（去掉年份，年份在这种图上没信息量）
+fn stamp_label(t: &str) -> String {
+    if t.len() >= 16 {
+        t[5..16].to_string()
+    } else {
+        t.to_string()
+    }
+}
+
 /// slot id -> 界面显示名（用当前语言）
 fn slot_name(l: &crate::i18n::L, id: &str) -> String {
     Slot::ALL
@@ -362,6 +530,116 @@ impl FireVibe {
             .child(group().p(px(16.)).child(act_rows))
             .child(section_lab(l.stats_voice()).mt(px(22.)).mb(px(8.)))
             .child(voice)
+            .children(self.battery_section(cx))
+    }
+
+    /// 电量变化：**每台设备一条曲线**，最近用过的排在上面。
+    ///
+    /// 为什么按设备分开：换过遥控器的人，两支的电量曲线混在一条线里毫无意义
+    /// （一支 20% 一支 90%，看起来像反复充电）。key 用 HID 序列号 ——
+    /// 同型号两支的 vid/pid 一模一样，只有序列号能分开。
+    ///
+    /// 用不上的设备（换掉的旧遥控器）可以「隐藏」，收进底部一栏，随时能展开取消。
+    fn battery_section(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let l = self.l();
+        let cfg = self.rt.cfg.read();
+        if cfg.stats.battery.is_empty() {
+            return Vec::new();
+        }
+        // 最近见到的排前面
+        let mut all: Vec<(String, firevibe_core::config::BatteryLog)> =
+            cfg.stats.battery.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        drop(cfg);
+        all.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
+        let hidden_n = all.iter().filter(|(_, v)| v.hidden).count();
+        let show_hidden = self.show_hidden_batt;
+
+        let card = |sn: String, log: &firevibe_core::config::BatteryLog, cx: &mut Context<Self>| {
+            let now = log.points.last().map(|(_, v)| *v).unwrap_or(0);
+            let title = if log.name.trim().is_empty() { sn.clone() } else { log.name.clone() };
+            let hide_label = if log.hidden { l.batt_show() } else { l.batt_hide() };
+            let sn2 = sn.clone();
+            let head = div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .mb(px(6.))
+                .child(
+                    div().min_w(px(0.)).overflow_hidden()
+                        .text_size(px(13.)).font_weight(w(600.)).text_color(c(INK))
+                        .child(SharedString::from(title)),
+                )
+                // 隐藏按钮紧挨设备名（那是它作用的对象），电量数字推到最右边
+                .child(
+                    div()
+                        .id(SharedString::from(format!("batt-hide-{sn2}")))
+                        .px(px(8.)).py(px(3.)).rounded(px(6.))
+                        .border_1().border_color(c(LINE))
+                        .text_size(px(11.)).text_color(c(INK3))
+                        .cursor_pointer()
+                        .child(SharedString::from(hide_label.to_string()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            {
+                                let mut g = this.rt.cfg.write();
+                                if let Some(e) = g.stats.battery.get_mut(&sn2) {
+                                    e.hidden = !e.hidden;
+                                }
+                                let _ = g.save();
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(div().flex_1().min_w(px(0.)))
+                .child(
+                    div().text_size(px(13.)).font_weight(w(680.)).text_color(c(INK))
+                        .child(SharedString::from(if now > 0 { format!("{now}%") } else { "—".into() })),
+                );
+            let body: AnyElement = if log.points.len() >= 2 {
+                battery_chart(&log.points)
+            } else {
+                div().py(px(14.)).text_size(px(12.)).text_color(c(INK3))
+                    .child(SharedString::from(l.batt_one_point().to_string()))
+                    .into_any_element()
+            };
+            group()
+                .p(px(14.))
+                .mb(px(8.))
+                .child(head)
+                .child(body)
+                .child(
+                    div().mt(px(6.)).text_size(px(11.)).text_color(c(INK3))
+                        .child(SharedString::from(l.batt_last_seen(&short_stamp(&log.last_seen)))),
+                )
+                .into_any_element()
+        };
+
+        let mut out: Vec<AnyElement> = vec![section_lab(l.stats_batt_curve()).mt(px(22.)).mb(px(8.)).into_any_element()];
+        for (sn, log) in all.iter().filter(|(_, v)| !v.hidden) {
+            out.push(card(sn.clone(), log, cx));
+        }
+        if hidden_n > 0 {
+            out.push(
+                div()
+                    .id("batt-hidden-toggle")
+                    .mt(px(2.)).mb(px(6.))
+                    .text_size(px(11.5)).text_color(c(INK3))
+                    .cursor_pointer()
+                    .child(SharedString::from(format!(
+                        "{} {}", if show_hidden { "▾" } else { "▸" }, l.batt_hidden_n(hidden_n)
+                    )))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_hidden_batt = !this.show_hidden_batt;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            if show_hidden {
+                for (sn, log) in all.iter().filter(|(_, v)| v.hidden) {
+                    out.push(card(sn.clone(), log, cx));
+                }
+            }
+        }
+        out
     }
 }
 
