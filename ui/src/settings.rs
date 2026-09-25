@@ -154,6 +154,13 @@ impl FireVibe {
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.rt.cfg.write().settings.mic_model = MicModel::Unknown;
                                                 this.save();
+                                                // ⚠️ 光写配置没用：探测只在 HID 线程**启动时**开窗口
+                                                //（`mic_model == Unknown` 才开），而这会儿线程早就在跑了。
+                                                // 以前点「自动」什么都不会发生、也没人告诉用户，
+                                                // 看着就像这个选项没用。所以顺手重起一次 runtime 当场重探。
+                                                this.start_runtime(crate::StartWhy::Manual);
+                                                let m = this.l().toast_mic_reprobe();
+                                                this.toast(m);
                                                 cx.notify();
                                             })),
                                     )

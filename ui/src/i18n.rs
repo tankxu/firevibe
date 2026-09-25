@@ -586,6 +586,11 @@ impl L {
            format!("Just enable this app in System Settings › Privacy & Security › {a} — it restarts itself to pick the grant up, no need to quit and reopen manually. (Input Monitoring doesn't need a separate entry — {a} covers it.) If it's already on and you still see this, hit Reset access and enable it again.", a = self.a11y()))
     }
     /// 授权到手、自动重启前那一下提示
+    /// 点「自动」后立刻重探的提示。探测窗口 1.5 秒，期间碰遥控器会作废重来
+    pub fn toast_mic_reprobe(&self) -> String {
+        t!(self.0, "正在重新探测遥控器类型 —— 这两秒先别碰遥控器".to_string(),
+           "Re-detecting the remote type — don't touch the remote for a couple of seconds".to_string())
+    }
     pub fn toast_perm_relaunch(&self) -> String {
         t!(self.0, "授权已生效 —— 正在重启应用".to_string(),
            "Access granted — restarting the app".to_string())

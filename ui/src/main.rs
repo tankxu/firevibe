@@ -1841,7 +1841,8 @@ impl FireVibe {
         });
     }
 
-    fn start_runtime(&mut self, why: StartWhy) {
+    // pub：设置页点「自动」要靠它当场重探一次开麦模型
+    pub fn start_runtime(&mut self, why: StartWhy) {
         if self.start_rx.is_some() {
             return; // 已经有一次在路上，别叠
         }
